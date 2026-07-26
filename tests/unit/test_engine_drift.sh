@@ -368,4 +368,114 @@ else
   fail "could not get two applies into one UTC second after 10 tries"
 fi
 
+# --- FIFOs at the managed paths must not hang root (denial of service) ------
+# O_NOFOLLOW refuses a symlink but says nothing about a FIFO: without
+# O_NONBLOCK, opening one for read or write blocks until the other end shows
+# up, wedging root's single job worker for the full subprocess timeout (30
+# minutes in jobd). `timeout` wraps every one of these: a regression here
+# should fail in a few seconds, not hang the whole suite.
+rm -f "$WORK/backups"/Engine.ini.*
+printf '[/Script/OnlineSubsystemUtils.IpNetDriver]\nNetServerMaxTickRate=30\n' > "$INI"
+rm -f "$PRETTY"; mkfifo "$PRETTY"
+out="$(timeout 5 env \
+  PALWORLD_ENGINE_INI="$INI" PALWORLD_ENGINE_ENV="$ENV_FILE" \
+  PALWORLD_BACKUP_DIR="$WORK/backups" PALWORLD_ENGINE_PRETTY_INI="$PRETTY" \
+  PALWORLD_FPS_BIN=/bin/true python3 "$ENGINE" apply 2>&1)"; rc=$?
+assert_ne "$rc" "0" "a FIFO at Engine.pretty.ini is refused, not followed"
+assert_ne "$rc" "124" "the FIFO refusal happens well before the timeout fires"
+assert_contains "$out" "Engine.pretty.ini" "the FIFO refusal names the file"
+assert_contains "$out" "regular file" "the FIFO refusal says it is not a regular file"
+assert_not_contains "$out" "Traceback" "the FIFO refusal is a message, not a crash"
+rm -f "$PRETTY"
+
+rm -f "$INI"; mkfifo "$INI"
+out="$(timeout 5 env \
+  PALWORLD_ENGINE_INI="$INI" PALWORLD_ENGINE_ENV="$ENV_FILE" \
+  PALWORLD_BACKUP_DIR="$WORK/backups" PALWORLD_ENGINE_PRETTY_INI="$PRETTY" \
+  PALWORLD_FPS_BIN=/bin/true python3 "$ENGINE" apply 2>&1)"; rc=$?
+assert_ne "$rc" "0" "a FIFO at Engine.ini is refused, not followed"
+assert_ne "$rc" "124" "the FIFO refusal happens well before the timeout fires"
+assert_contains "$out" "Engine.ini" "the FIFO refusal names the file"
+assert_not_contains "$out" "Traceback" "the FIFO refusal is a message, not a crash"
+rm -f "$INI"
+
+# --- the Engine.pretty.ini FIFO, but with a reader already attached --------
+# With no reader, O_NONBLOCK|O_WRONLY fails at open() with ENXIO before fstat
+# ever runs. If the attacker keeps a reader attached instead, the open
+# succeeds and it is the fstat/S_ISREG rejection that has to catch it —
+# exercise that path explicitly, not just the ENXIO one.
+printf '[/Script/OnlineSubsystemUtils.IpNetDriver]\nNetServerMaxTickRate=30\n' > "$INI"
+rm -f "$PRETTY"; mkfifo "$PRETTY"
+( timeout 8 cat "$PRETTY" >/dev/null & )
+sleep 0.3
+out="$(timeout 5 env \
+  PALWORLD_ENGINE_INI="$INI" PALWORLD_ENGINE_ENV="$ENV_FILE" \
+  PALWORLD_BACKUP_DIR="$WORK/backups" PALWORLD_ENGINE_PRETTY_INI="$PRETTY" \
+  PALWORLD_FPS_BIN=/bin/true python3 "$ENGINE" apply 2>&1)"; rc=$?
+assert_ne "$rc" "0" "a FIFO at Engine.pretty.ini with a reader attached is still refused"
+assert_ne "$rc" "124" "the refusal with a reader attached happens well before the timeout fires"
+assert_contains "$out" "Engine.pretty.ini" "the refusal names the file even with a reader attached"
+assert_contains "$out" "regular file" "the refusal (via fstat, not ENXIO) says it is not a regular file"
+assert_not_contains "$out" "Traceback" "the refusal is a message, not a crash"
+wait
+rm -f "$PRETTY"
+
+# --- a partial apply still leaves an audit trail -----------------------------
+# The pretty-write refusal above happens *after* Engine.ini was already
+# rewritten. The operator must be told the primary change stands, and the
+# audit trail (notify/mark_event) must still fire for the change that actually
+# happened — otherwise jobd records a failed job with no evidence at all of
+# what landed on Engine.ini. Uses the real palworld-fps (as
+# test_service_events.sh does) against a private DB so the marker can be read
+# back, rather than the /bin/true stub used everywhere else in this file.
+FPS="$DIR/../../sbin/palworld-fps"
+METRICS_DB="$WORK/metrics.sqlite3"
+markers() { python3 "$FPS" --db "$METRICS_DB" events --window 24h --json 2>/dev/null; }
+
+# timeout here too: this scenario plants a FIFO at $PRETTY, so a regression in
+# the O_NONBLOCK/S_ISREG handling must fail in seconds, not hang the suite.
+apply_cfg_marked() {
+  timeout 5 env \
+  PALWORLD_ENGINE_INI="$INI" PALWORLD_ENGINE_ENV="$ENV_FILE" \
+  PALWORLD_BACKUP_DIR="$WORK/backups" PALWORLD_ENGINE_PRETTY_INI="$PRETTY" \
+  PALWORLD_FPS_BIN="$FPS" PALWORLD_METRICS_DB="$METRICS_DB" \
+    python3 "$ENGINE" apply 2>&1
+}
+
+rm -f "$WORK/backups"/Engine.ini.* "$METRICS_DB"
+printf '[/Script/OnlineSubsystemUtils.IpNetDriver]\nNetServerMaxTickRate=30\n' > "$INI"
+rm -f "$PRETTY"; mkfifo "$PRETTY"
+out="$(apply_cfg_marked)"; rc=$?
+assert_ne "$rc" "0" "a partial apply (pretty write refused) still exits nonzero"
+assert_ne "$rc" "124" "the partial apply fails promptly, not via the timeout"
+assert_file_contains "$INI" "NetServerMaxTickRate=60" "Engine.ini still got the new value despite the pretty-write failure"
+assert_contains "$out" "the Engine.ini change stands" "apply's message says the primary change stands"
+assert_contains "$(markers)" "partially applied" "a marker records the partial apply"
+rm -f "$PRETTY"
+
+# --- a partial rollback: same shape, and no opaque refusal on its own -------
+# timeout here too: this scenario plants a FIFO at $PRETTY, so a regression in
+# the O_NONBLOCK/S_ISREG handling must fail in seconds, not hang the suite.
+rollback_marked() {
+  timeout 5 env \
+  PALWORLD_ENGINE_INI="$INI" PALWORLD_ENGINE_ENV="$ENV_FILE" \
+  PALWORLD_BACKUP_DIR="$WORK/backups" PALWORLD_ENGINE_PRETTY_INI="$PRETTY" \
+  PALWORLD_FPS_BIN="$FPS" PALWORLD_METRICS_DB="$METRICS_DB" \
+    python3 "$ENGINE" rollback "$@" 2>&1
+}
+
+rm -f "$METRICS_DB"
+printf '[/Script/OnlineSubsystemUtils.IpNetDriver]\nNetServerMaxTickRate=42\n' \
+  > "$WORK/backups/Engine.ini.20260710T182037Z"
+printf '[/Script/OnlineSubsystemUtils.IpNetDriver]\nNetServerMaxTickRate=60\n' > "$INI"
+rm -f "$PRETTY"; mkfifo "$PRETTY"
+out="$(rollback_marked -- Engine.ini.20260710T182037Z)"; rc=$?
+assert_ne "$rc" "0" "a partial rollback (pretty write refused) still exits nonzero"
+assert_ne "$rc" "124" "the partial rollback fails promptly, not via the timeout"
+assert_file_contains "$INI" "NetServerMaxTickRate=42" "Engine.ini was still restored despite the pretty-write failure"
+assert_contains "$out" "rollback stands" "rollback's message says the rollback itself stands"
+assert_contains "$out" "Engine.pretty.ini" "rollback's message names the file it could not write"
+assert_contains "$(markers)" "rollback partially applied" "a marker records the partial rollback"
+rm -f "$PRETTY"
+
 assert_report

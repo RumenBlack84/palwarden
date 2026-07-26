@@ -83,4 +83,37 @@ assert_eq "$rc" "0" "an unknown PALWORLD_USER does not fail the render"
 assert_contains "$out" "definitely-no-such-user" "names the owner it could not resolve"
 assert_file_contains "$DST" "Human-readable reference only" "the render still happened"
 
+# --- a FIFO at the destination must not hang root (denial of service) ------
+# O_NOFOLLOW refuses a symlink but says nothing about a FIFO: without
+# O_NONBLOCK, opening one for write blocks until a reader attaches, wedging
+# root's job worker for the full subprocess timeout. `timeout` wraps this call
+# so a regression fails in a few seconds instead of hanging the suite.
+rm -f "$DST"; mkfifo "$DST"
+# shellcheck disable=SC2016  # $1/$2/$3 expand in the inner bash -c, not here
+out="$(timeout 5 bash -c 'PALWORLD_CONFIG_FILE="$1" PALWORLD_CONFIG_PRETTY_INI="$2" bash "$3"' _ "$SRC" "$DST" "$TOOL" 2>&1)"; rc=$?
+assert_ne "$rc" "0" "a FIFO at the destination is refused, not followed"
+assert_ne "$rc" "124" "the FIFO refusal happens well before the timeout fires"
+assert_contains "$out" "PalWorldSettings.pretty.ini" "the FIFO refusal names the file"
+assert_contains "$out" "regular file" "the FIFO refusal says it is not a regular file"
+assert_not_contains "$out" "Traceback" "the FIFO refusal is a message, not a crash"
+rm -f "$DST"
+
+# --- the same FIFO, but with a reader already attached ----------------------
+# With no reader, O_NONBLOCK|O_WRONLY fails at open() with ENXIO before the
+# fstat check ever runs. That is not the only guard: if the attacker keeps a
+# reader attached (so the open succeeds), the fstat/S_ISREG rejection is what
+# still catches it. Exercise that path explicitly, not just the ENXIO one.
+mkfifo "$DST"
+( timeout 8 cat "$DST" >/dev/null & )
+sleep 0.3
+# shellcheck disable=SC2016  # $1/$2/$3 expand in the inner bash -c, not here
+out="$(timeout 5 bash -c 'PALWORLD_CONFIG_FILE="$1" PALWORLD_CONFIG_PRETTY_INI="$2" bash "$3"' _ "$SRC" "$DST" "$TOOL" 2>&1)"; rc=$?
+assert_ne "$rc" "0" "a FIFO with a reader attached is still refused"
+assert_ne "$rc" "124" "the refusal with a reader attached happens well before the timeout fires"
+assert_contains "$out" "PalWorldSettings.pretty.ini" "the refusal names the file even with a reader attached"
+assert_contains "$out" "regular file" "the refusal (via fstat, not ENXIO) says it is not a regular file"
+assert_not_contains "$out" "Traceback" "the refusal is a message, not a crash"
+wait
+rm -f "$DST"
+
 assert_report

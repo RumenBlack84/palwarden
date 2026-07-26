@@ -16,21 +16,39 @@ dst="${PALWORLD_CONFIG_PRETTY_INI:-$cfg_dir/PalWorldSettings.pretty.ini}"
 # just wrote, which no later rename can redirect. O_EXCL is deliberately not used:
 # this file is legitimately rewritten on every run.
 python3 - "$src" "$dst" "$PALWORLD_USER" "$PALWORLD_GROUP" <<"PY"
-import errno, grp, os, pwd, sys
+import errno, grp, os, pwd, stat, sys
 
 src, dst, user, group = sys.argv[1:5]
 
 
 def open_nofollow(path, flags, mode=0o644):
+    # O_NONBLOCK guards against a FIFO planted at either name: without it, an
+    # O_WRONLY open blocks until a reader attaches (hanging root for the full
+    # jobd subprocess timeout), and a read-only open would wait on a writer.
+    # With it: a write-only open with no reader fails immediately with ENXIO;
+    # a read-only open always returns immediately regardless of a writer. It is
+    # left set on the returned descriptor — per open(2) it has no effect on a
+    # regular file's subsequent read()/write(), and the stat.S_ISREG check just
+    # below confirms that is exactly what we opened.
     try:
-        return os.open(path, flags | os.O_NOFOLLOW, mode)
+        fd = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK, mode)
     except OSError as exc:
         # Linux reports ELOOP for O_NOFOLLOW on a symlink; some BSDs use EMLINK.
         # Raw, that reads as "Too many levels of symbolic links" — a filesystem
         # fault — when it is really us refusing a planted link, so name the file.
         if exc.errno in (errno.ELOOP, errno.EMLINK):
             sys.exit(f"{path} must not be a symlink; refused")
+        # ENXIO is O_NONBLOCK|O_WRONLY hitting a FIFO with no reader attached —
+        # the non-hanging counterpart of the fstat check below, for the case
+        # where the open itself is what refuses rather than succeeding first.
+        if exc.errno == errno.ENXIO:
+            sys.exit(f"{path} must be a regular file; refused")
         sys.exit(f"cannot open {path}: {exc.strerror}")
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        os.close(fd)
+        sys.exit(f"{path} must be a regular file; refused")
+    return fd
 
 
 fd = open_nofollow(src, os.O_RDONLY)

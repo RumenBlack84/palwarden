@@ -32,6 +32,9 @@ PRETTY_INI = Path(os.environ.get(
     "/opt/palworld/server/Pal/Saved/Config/LinuxServer/Engine.pretty.ini"))
 NOTIFY = "/usr/local/lib/palworld-notify"
 FPS_BIN = os.environ.get("PALWORLD_FPS_BIN", "/usr/local/sbin/palworld-fps")
+# palworld-service-events passes this same override to the same binary; without
+# it mark_event always targets the real host DB, which a test cannot read back.
+METRICS_DB = os.environ.get("PALWORLD_METRICS_DB", "/var/lib/palworld/metrics.sqlite3")
 # Owner of the managed files; the container overrides these to steam.
 PALWORLD_USER = os.environ.get("PALWORLD_USER", "palworld")
 PALWORLD_GROUP = os.environ.get("PALWORLD_GROUP", "palworld")
@@ -294,7 +297,7 @@ def notify(message: str) -> None:
 
 def mark_event(label: str, category: str = "config", details: str | None = None) -> None:
     """Record an FPS event marker. Purely decorative: never break a config apply."""
-    cmd = [FPS_BIN, "mark", label, "--category", category]
+    cmd = [FPS_BIN, "--db", METRICS_DB, "mark", label, "--category", category]
     if details:
         cmd.extend(["--details", details])
     try:
@@ -449,6 +452,40 @@ def refuse_symlink(exc: OSError, path: Path, what: str) -> None:
         raise ValueError(f"{what} must not be a symlink; refused: {path}") from exc
 
 
+def refuse_special_open(exc: OSError, path: Path, what: str) -> None:
+    """Translate the ENXIO from an O_NONBLOCK|O_WRONLY open hitting a FIFO.
+
+    A FIFO with no reader already attached fails *at open()* with ENXIO when
+    O_NONBLOCK is set, instead of blocking forever waiting for one — which is
+    exactly the point of setting it (see reject_nonregular). Left raw, ENXIO
+    reads as "No such device or address", which is as opaque as the bare ELOOP
+    refuse_symlink translates; report it the same way, naming the file.
+    """
+    if exc.errno == errno.ENXIO:
+        raise ValueError(f"{what} must be a regular file; refused: {path}") from exc
+
+
+def reject_nonregular(fd: int, path: Path, what: str) -> os.stat_result:
+    """Raise if the open descriptor is not a regular file, naming the offender.
+
+    Closes the FIFO denial-of-service the O_NONBLOCK on the open() call above
+    does not fully cover by itself: O_NONBLOCK stops the *open* from blocking,
+    but if a reader/writer happens to already be attached to a planted FIFO (or
+    it is some other non-blocking special file) the open can still succeed. This
+    is the same backstop read_nofollow always had for the read side; callers on
+    the write side need it too, so it lives here for both.
+
+    O_NONBLOCK stays set on the returned descriptor rather than being cleared:
+    per open(2), it "generally has no effect" on a regular file's subsequent
+    read()/write() calls, and by the time this returns we have confirmed via
+    fstat that the descriptor is exactly that.
+    """
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        raise ValueError(f"{what} must be a regular file; refused: {path}")
+    return st
+
+
 def owner_ids() -> tuple[int, int]:
     """Numeric uid/gid for PALWORLD_USER/PALWORLD_GROUP.
 
@@ -569,13 +606,22 @@ def write_dest_nofollow(path: Path, data: bytes, what: str, mode: int = 0o644) -
     are legitimately rewritten on every apply — so `O_NOFOLLOW` alone is what
     refuses a link planted at the name, and it does so in the same syscall that
     creates the file. Owner/mode go on the descriptor, never the path.
+
+    `O_NONBLOCK` guards against a different plant: a FIFO at the name. Without
+    it, opening a FIFO for write blocks until a reader attaches — root then
+    hangs here for the full subprocess timeout instead of failing fast. With it,
+    the open either fails immediately with ENXIO (no reader attached; the common
+    case for a freshly `mkfifo`'d name) or succeeds and reject_nonregular catches
+    it via fstat right after.
     """
     try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, mode)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_NONBLOCK, mode)
     except OSError as exc:
         refuse_symlink(exc, path, what)
+        refuse_special_open(exc, path, what)
         raise
     try:
+        reject_nonregular(fd, path, what)
         write_all(fd, data)
         set_owner_mode_fd(fd, path, mode)
     finally:
@@ -588,16 +634,19 @@ def read_nofollow(path: Path, what: str) -> tuple[bytes, os.stat_result]:
     Returns the contents plus the fstat of the descriptor we actually read, so
     the caller can carry over metadata from the file it really read rather than
     re-stat'ing the (possibly since-swapped) path.
+
+    `O_NONBLOCK` guards against a FIFO planted at the name: a read-only open
+    with O_NONBLOCK returns immediately regardless of whether a writer is
+    attached (unlike the write side, this can never fail with ENXIO), so the
+    only backstop needed afterwards is reject_nonregular's fstat check.
     """
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError as exc:
         refuse_symlink(exc, path, what)
         raise FileNotFoundError(f"{what} not readable: {path} ({exc.strerror})") from exc
     try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            raise ValueError(f"{what} must be a regular file: {path}")
+        st = reject_nonregular(fd, path, what)
         data = read_fd_all(fd)
     finally:
         os.close(fd)
@@ -622,6 +671,29 @@ def resolve_backup(name: str, backup_dir: Path) -> Path:
     return backup
 
 
+class PrettyWriteError(ValueError):
+    """Engine.ini was already restored; only the reference copy failed to write.
+
+    Raised by rollback_engine so command_rollback can tell this apart from a
+    failure that means nothing happened. A bare ValueError from write_pretty
+    would read exactly like the "backup must not be a symlink" refusal that
+    aborts *before* touching Engine.ini — but by the time write_pretty runs
+    here, root has already overwritten Engine.ini with the restored bytes.
+    Subclassing ValueError means the existing `except (ValueError,
+    FileNotFoundError, OSError)` callers (and the test that calls
+    rollback_engine directly) still catch it without change; command_rollback
+    adds a more specific `except PrettyWriteError` ahead of that to react to it
+    differently.
+    """
+
+    def __init__(self, restored: Path, pretty_path: Path, original: Exception):
+        super().__init__(f"restored {restored} to Engine.ini, but could not write "
+                          f"the reference copy {pretty_path}: {original}")
+        self.restored = restored
+        self.pretty_path = pretty_path
+        self.original = original
+
+
 def rollback_engine(name: str, ini_path: Path, backup_dir: Path, pretty_path: Path, save_current: bool = True) -> Path:
     backup = resolve_backup(name, backup_dir)
     # Read the source *before* touching anything, and through a descriptor the
@@ -640,18 +712,28 @@ def rollback_engine(name: str, ini_path: Path, backup_dir: Path, pretty_path: Pa
     # Engine.ini would otherwise send the backup's bytes (and root's chown/chmod)
     # to a file of the attacker's choosing.
     try:
-        ini_fd = os.open(ini_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+        ini_fd = os.open(ini_path,
+                          os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_NONBLOCK,
+                          0o644)
     except OSError as exc:
         refuse_symlink(exc, ini_path, ini_path.name)
+        refuse_special_open(exc, ini_path, ini_path.name)
         raise
     try:
+        reject_nonregular(ini_fd, ini_path, ini_path.name)
         write_all(ini_fd, data)
         os.utime(ini_fd, ns=(src_st.st_atime_ns, src_st.st_mtime_ns))
         set_owner_mode_fd(ini_fd, ini_path, 0o644)
     finally:
         os.close(ini_fd)
-    # write_pretty applies the same owner/mode through its own descriptor.
-    write_pretty(ini_path, pretty_path)
+    # write_pretty applies the same owner/mode through its own descriptor. By
+    # this point Engine.ini has already been overwritten with the restored
+    # bytes, so its failure must not look like the rollback itself failed —
+    # wrap it so command_rollback can report the two things separately.
+    try:
+        write_pretty(ini_path, pretty_path)
+    except (ValueError, OSError) as exc:
+        raise PrettyWriteError(backup, pretty_path, exc) from exc
     return backup
 
 
@@ -822,6 +904,24 @@ def command_rollback(args: argparse.Namespace) -> int:
     # a ValueError. Report it the same way as a failed pre-flight, not a traceback.
     try:
         restored = rollback_engine(args.backup, ini_path, backup_dir, pretty_path)
+    except PrettyWriteError as exc:
+        # Engine.ini has already been overwritten with exc.restored's contents by
+        # this point — only the reference copy failed. Printing exc.original's raw
+        # refusal alone would read like the rollback itself failed; say plainly
+        # that it stands, and still audit the change that did happen (jobd must
+        # see this as a failed job, but the record should not be silent about
+        # what actually landed on Engine.ini).
+        print(f"Restored {exc.restored} to {ini_path}", file=sys.stderr)
+        print(f"but could not write the reference copy {pretty_path}: {exc.original}",
+              file=sys.stderr)
+        print("The rollback stands; only the reference copy is missing. "
+              "Restart palworld.service for the rollback to take effect.", file=sys.stderr)
+        notify(f"Engine.ini rollback PARTIALLY completed: restored `{exc.restored.name}`, "
+               f"but the reference copy {pretty_path.name} could not be written "
+               f"({exc.original}). Restart palworld.service for rollback to take effect.")
+        mark_event("Engine.ini rollback partially applied",
+                   details=f"restored={exc.restored.name}; pretty_write_failed={pretty_path.name}")
+        return 1
     except (ValueError, FileNotFoundError, OSError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -854,18 +954,24 @@ def command_apply(args: argparse.Namespace) -> int:
     # root writes attacker-authored bytes to an attacker-chosen path. O_NOFOLLOW
     # refuses a link that is there already, and reusing the descriptor means no
     # window exists for one to appear. --dry-run needs no write access.
-    flags = (os.O_RDONLY if args.dry_run else os.O_RDWR) | os.O_NOFOLLOW
+    flags = (os.O_RDONLY if args.dry_run else os.O_RDWR) | os.O_NOFOLLOW | os.O_NONBLOCK
     try:
         ini_fd = os.open(ini_path, flags)
     except OSError as exc:
         try:
             refuse_symlink(exc, ini_path, ini_path.name)
+            refuse_special_open(exc, ini_path, ini_path.name)
         except ValueError as refusal:
             print(str(refusal), file=sys.stderr)
             return 1
         print(f"Cannot read {ini_path}: {exc.strerror}", file=sys.stderr)
         return 1
     try:
+        try:
+            reject_nonregular(ini_fd, ini_path, ini_path.name)
+        except ValueError as refusal:
+            print(str(refusal), file=sys.stderr)
+            return 1
         return _apply_with_fd(args, ini_fd, ini_path, backup_dir, pretty_path, env_values)
     finally:
         os.close(ini_fd)
@@ -903,12 +1009,27 @@ def _apply_with_fd(args: argparse.Namespace, ini_fd: int, ini_path: Path,
             # write_pretty applies the same owner/mode through its own descriptor.
             # A refusal here comes after Engine.ini is already updated, so say that
             # too: the apply itself stands, only the reference copy is missing.
+            # Returning early must not also skip the audit trail: Engine.ini did
+            # change, so notify()/mark_event() still have to fire here (they no-op
+            # cleanly when their helpers are absent — see notify()/mark_event()
+            # above), or a partially-applied change leaves no Discord message and
+            # no FPS marker even though jobd records the job as failed.
             try:
                 write_pretty(ini_path, pretty_path)
             except (ValueError, OSError) as exc:
+                summary = format_changes(changes)
+                print(summary)
                 print(str(exc), file=sys.stderr)
-                print(f"Updated {ini_path} (backup: {backup}), but could not write "
-                      f"the reference copy {pretty_path}", file=sys.stderr)
+                print(f"Updated {ini_path} (backup: {backup.name}), but could not write "
+                      f"the reference copy {pretty_path}: the Engine.ini change stands, "
+                      f"only the reference copy is missing.", file=sys.stderr)
+                notify(f"Engine.ini performance config PARTIALLY applied; backup: "
+                       f"`{backup.name}`. The change to Engine.ini stands, but the "
+                       f"reference copy {pretty_path.name} could not be written ({exc}). "
+                       f"Restart palworld.service for changes to take effect.\n\n{summary}")
+                mark_event("Engine.ini performance config partially applied",
+                           details=f"backup={backup.name}; changes={len(changes)}; "
+                                   f"pretty_write_failed={pretty_path.name}")
                 return 1
     summary = format_changes(changes)
     print(summary)
