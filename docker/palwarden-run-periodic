@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Brian Grant
+#
+# palwarden-run-periodic <interval_seconds> <label> <command> [args...]
+#
+# Minimal periodic runner for the container's background jobs: run the command,
+# sleep, repeat. Replaces the systemd timers that drive these on bare metal.
+# Intended to be launched by an s6 service (already dropped to the steam user).
+# Command failures are logged, never fatal, so one bad tick doesn't stop the job.
+set -u
+
+interval="${1:?usage: palwarden-run-periodic <interval> <label> <command...>}"; shift
+label="${1:?usage: palwarden-run-periodic <interval> <label> <command...>}"; shift
+
+# Exit promptly when s6 stops the service.
+trap 'exit 0' TERM INT
+
+printf '[periodic:%s] every %ss: %s\n' "$label" "$interval" "$*"
+while true; do
+  "$@" || printf '[periodic:%s] command exited %s\n' "$label" "$?"
+  # background sleep + wait so the trap can interrupt it immediately on stop
+  sleep "$interval" & wait $!
+done

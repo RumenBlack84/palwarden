@@ -59,19 +59,23 @@ COPY lib/   /usr/local/lib/
 COPY bin/   /usr/local/bin/
 COPY webui/ /opt/palworld/tools/config-webui/
 COPY docker/entrypoint.sh /usr/local/bin/palwarden-entrypoint
+COPY docker/palwarden-run-periodic /usr/local/bin/palwarden-run-periodic
 COPY docker/s6-rc.d/ /etc/s6-overlay/s6-rc.d/
 
-# Make our scripts executable, and pre-create the server/save trees owned by
-# `steam` so freshly-mounted named volumes inherit the right ownership (see
+# Make our scripts executable, and pre-create the server/save/state trees owned
+# by `steam` so freshly-mounted named volumes inherit the right ownership (see
 # runbook §11 — we never recursively chown a mounted volume at runtime).
 RUN chmod +x \
         /usr/local/bin/palwarden-entrypoint \
+        /usr/local/bin/palwarden-run-periodic \
         /etc/s6-overlay/s6-rc.d/palworld-server/run \
         /etc/s6-overlay/s6-rc.d/config-webui/run \
+        /etc/s6-overlay/s6-rc.d/fps-sample/run \
     && (chmod +x /usr/local/sbin/palworld-* /usr/local/bin/palworld-config-parser 2>/dev/null || true) \
     && install -d -o steam -g steam \
         /opt/palworld/server/Pal/Saved/Config/LinuxServer \
         /opt/palworld/tools \
+        /var/lib/palworld \
         /var/log/palworld
 
 WORKDIR /opt/palworld/server

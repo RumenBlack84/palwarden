@@ -3,22 +3,21 @@
 #
 # palwarden compose stack.
 #
-# Two modes, selected with COMPOSE_PROFILES + PALWARDEN_MODE (see .env.example):
+# Two modes, selected with COMPOSE_PROFILES (see .env.example):
 #
-#   Embedded (self-contained): run the Palworld server in this stack.
-#     COMPOSE_PROFILES=embedded docker compose up -d
+#   Embedded (self-contained): run the Palworld server + tooling here.
+#     COMPOSE_PROFILES=embedded docker compose up -d --build
 #
-#   External (manage an existing server): do not start the server here; point the
-#     tooling at your existing box via PALWORLD_TARGET_HOST. The management
-#     service that consumes that target is added in the next increment.
+#   External (manage an existing server): run only the tooling, pointed at your
+#     existing box via PALWORLD_TARGET_HOST + ADMIN_PASSWORD.
+#     COMPOSE_PROFILES=external docker compose up -d --build
 #
 # Build context is the repository root so the image can bake in the tooling.
 name: palwarden
 
 services:
-  # The all-in-one image in embedded mode: s6 supervises the Palworld server and
-  # the config web UI in one container. Only started when the "embedded" profile
-  # is active.
+  # Embedded: s6 supervises the Palworld server, the config web UI, and (when
+  # ADMIN_PASSWORD is set) the telemetry sampler — all in one container.
   palwarden:
     build:
       context: ..
@@ -29,19 +28,22 @@ services:
     environment:
       PALWARDEN_MODE: embedded
       UPDATE_ON_START: ${UPDATE_ON_START:-true}
+      # Telemetry/management need the REST API admin password. For embedded, the
+      # server's PalWorldSettings.ini must also enable the REST API with this
+      # same password (server-config rendering lands in a later increment).
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      DISCORD_WEBHOOK: ${DISCORD_WEBHOOK:-}
+      PALWORLD_REST_PORT: ${PALWORLD_REST_PORT:-8212}
+      FPS_SAMPLE_INTERVAL: ${FPS_SAMPLE_INTERVAL:-15}
+      FPS_RETENTION_DAYS: ${FPS_RETENTION_DAYS:-7}
     ports:
       - "${PALWORLD_GAME_PORT:-8211}:8211/udp"
-      # Config web UI, published to host loopback only.
       - "127.0.0.1:${WEBUI_PORT:-8088}:8088"
-      # REST API (8212) is deliberately NOT published to the host. Tooling reaches
-      # it over localhost inside the container. Do not expose it publicly.
+      # REST API (8212) is deliberately NOT published to the host.
     volumes:
-      # Whole game install: persists SteamCMD downloads across restarts.
       - palworld-server:/opt/palworld/server
-      # Saves + config broken out for easy backup (nested submount of the above).
       - palworld-saved:/opt/palworld/server/Pal/Saved
-    # s6-overlay shuts down on SIGTERM (the default) and forwards SIGINT to the
-    # game so it saves; give it up to 120s before the daemon kills the container.
+      - palwarden-state:/var/lib/palworld
     stop_grace_period: 120s
     ulimits:
       nofile:
@@ -49,24 +51,28 @@ services:
         hard: 100000
     restart: on-failure
 
-  # --- NEXT INCREMENT: management tooling ---------------------------------
-  # The same image run in a management role. In embedded mode it targets the
-  # in-stack server; in external mode it targets PALWORLD_TARGET_HOST. Left
-  # commented until the tooling processes are wired under a supervisor.
-  #
-  # palwarden-tools:
-  #   image: palwarden:latest
-  #   container_name: palwarden-tools
-  #   environment:
-  #     PALWARDEN_MODE: ${PALWARDEN_MODE:-embedded}
-  #     PALWORLD_TARGET_HOST: ${PALWORLD_TARGET_HOST:-palworld-server}
-  #     PALWORLD_REST_PORT: ${PALWORLD_REST_PORT:-8212}
-  #   volumes:
-  #     - palworld-saved:/opt/palworld/server/Pal/Saved   # embedded: read config/saves
-  #     - palwarden-state:/var/lib/palworld               # telemetry DB, public-info
-  #   restart: unless-stopped
+  # External: the same image, tooling only, targeting an existing server.
+  palwarden-external:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: palwarden:latest
+    container_name: palwarden-external
+    profiles: ["external"]
+    environment:
+      PALWARDEN_MODE: external
+      # Required for external mode; validated by the entrypoint at start.
+      PALWORLD_TARGET_HOST: ${PALWORLD_TARGET_HOST:-}
+      PALWORLD_REST_PORT: ${PALWORLD_REST_PORT:-8212}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      DISCORD_WEBHOOK: ${DISCORD_WEBHOOK:-}
+      FPS_SAMPLE_INTERVAL: ${FPS_SAMPLE_INTERVAL:-15}
+      FPS_RETENTION_DAYS: ${FPS_RETENTION_DAYS:-7}
+    volumes:
+      - palwarden-state:/var/lib/palworld
+    restart: unless-stopped
 
 volumes:
   palworld-server:
   palworld-saved:
-  # palwarden-state:   # enabled with the tooling service next increment
+  palwarden-state:

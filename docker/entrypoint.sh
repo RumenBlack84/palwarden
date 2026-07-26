@@ -5,83 +5,128 @@
 # palwarden container entrypoint (PID 1).
 #
 # One image, two roles, selected by PALWARDEN_MODE:
-#   embedded  - install/update the Palworld server, seed its config, then hand
-#               off to the s6 supervisor which runs the server + config web UI
-#               (and, from the next increment, the background tooling).
-#   external  - do NOT run the server; the tooling targets an existing server at
-#               PALWORLD_TARGET_HOST. The active part of this mode lands in a
-#               later increment.
+#   embedded  - install/update the Palworld server, seed its config, then run it
+#               under s6 alongside the config web UI and (if configured) the
+#               telemetry sampler. Self-contained.
+#   external  - do NOT run the server; run only the tooling (telemetry sampler)
+#               targeting an existing server at PALWORLD_TARGET_HOST.
 #
-# Embedded server startup follows docs/palworld-service-runbook.md §12.
+# Which s6 services start is decided here at runtime by writing markers into the
+# s6 `user` bundle before handing off to /init. Runtime config (REST connection,
+# Discord webhook) is rendered from environment variables — no secrets in the
+# image. Embedded server startup follows docs/palworld-service-runbook.md §12.
 
 set -euo pipefail
 
 MODE="${PALWARDEN_MODE:-embedded}"
 INSTALL_DIR="${PALWORLD_INSTALL_DIR:-/opt/palworld/server}"
 APP_ID="${PALWORLD_APP_ID:-2394010}"
-# Drop to the unprivileged service account for any privileged-context work.
 AS_STEAM="/command/s6-setuidgid steam"
+S6_USER_CONTENTS="/etc/s6-overlay/s6-rc.d/user/contents.d"
 
 log() { printf '[palwarden] %s\n' "$*"; }
 
 case "$MODE" in
-  external)
-    log "MODE=external — managing an existing Palworld server."
-    log "Target: ${PALWORLD_TARGET_HOST:-<unset>}:${PALWORLD_REST_PORT:-8212}"
-    log "The management tooling is containerized in a later increment; there is"
-    log "nothing to run in external mode yet. Exiting cleanly."
-    exit 0
-    ;;
-  embedded)
-    : # fall through to server bootstrap + supervisor handoff below
-    ;;
-  *)
-    log "Unknown PALWARDEN_MODE='$MODE' (expected 'embedded' or 'external')." >&2
-    exit 64
-    ;;
+  embedded|external) ;;
+  *) log "Unknown PALWARDEN_MODE='$MODE' (expected 'embedded' or 'external')." >&2; exit 64 ;;
 esac
 
-# --- embedded: install/update the server (as steam) -------------------------
-STEAMCMD="${STEAMCMDDIR:-/home/steam/steamcmd}/steamcmd.sh"
-if [[ ! -f "$STEAMCMD" ]]; then
-  if command -v steamcmd >/dev/null 2>&1; then
-    STEAMCMD="$(command -v steamcmd)"
+# ---------------------------------------------------------------------------
+# Render runtime config from env (both modes). No secrets are baked in the image.
+# ---------------------------------------------------------------------------
+mkdir -p /etc/palworld
+install -d -o steam -g steam /var/lib/palworld   # telemetry DB lives here
+
+if [[ "$MODE" == "external" && -z "${PALWORLD_TARGET_HOST:-}" ]]; then
+  log "MODE=external requires PALWORLD_TARGET_HOST (the existing server's host)." >&2
+  exit 64
+fi
+
+TELEMETRY_READY=0
+if [[ -n "${ADMIN_PASSWORD:-}" ]]; then
+  # REST connection settings consumed by palworld-api (and thus the sampler).
+  rest_host="${PALWORLD_TARGET_HOST:-127.0.0.1}"
+  [[ "$MODE" == "embedded" ]] && rest_host="127.0.0.1"
+  ( umask 077
+    cat > /etc/palworld/settings.env <<EOF
+# Rendered by the palwarden entrypoint at container start. Do not edit by hand;
+# set the corresponding environment variables instead.
+REST_API_ENABLED=True
+REST_API_HOST=${rest_host}
+REST_API_PORT=${PALWORLD_REST_PORT:-8212}
+ADMIN_PASSWORD=${ADMIN_PASSWORD}
+EOF
+  )
+  chown steam:steam /etc/palworld/settings.env
+  TELEMETRY_READY=1
+else
+  log "ADMIN_PASSWORD not set — telemetry/management disabled (no REST access)."
+fi
+
+if [[ -n "${DISCORD_WEBHOOK:-}" ]]; then
+  ( umask 077
+    cat > /etc/palworld/notify.env <<EOF
+PALWORLD_DISCORD_WEBHOOK=${DISCORD_WEBHOOK}
+PALWORLD_NOTIFY_NAME=${PALWORLD_NOTIFY_NAME:-Palworld}
+EOF
+  )
+  chown steam:steam /etc/palworld/notify.env
+fi
+
+# ---------------------------------------------------------------------------
+# Select which s6 services run this boot (idempotent across restarts).
+# ---------------------------------------------------------------------------
+mkdir -p "$S6_USER_CONTENTS"
+rm -f "$S6_USER_CONTENTS"/palworld-server \
+      "$S6_USER_CONTENTS"/config-webui \
+      "$S6_USER_CONTENTS"/fps-sample
+enable_service() { : > "$S6_USER_CONTENTS/$1"; log "service enabled: $1"; }
+
+if [[ "$MODE" == "embedded" ]]; then
+  # --- bootstrap the server (as steam) ---
+  STEAMCMD="${STEAMCMDDIR:-/home/steam/steamcmd}/steamcmd.sh"
+  if [[ ! -f "$STEAMCMD" ]]; then
+    if command -v steamcmd >/dev/null 2>&1; then STEAMCMD="$(command -v steamcmd)"; else
+      log "steamcmd not found (looked for $STEAMCMD)." >&2; exit 1; fi
+  fi
+  if [[ "${UPDATE_ON_START:-true}" == "true" ]]; then
+    log "Updating Palworld dedicated server (Steam app ${APP_ID})..."
+    $AS_STEAM "$STEAMCMD" +force_install_dir "$INSTALL_DIR" +login anonymous \
+      +app_update "$APP_ID" validate +quit
   else
-    log "steamcmd not found (looked for $STEAMCMD)." >&2
+    log "UPDATE_ON_START=false — skipping SteamCMD update."
+  fi
+  if [[ ! -x "$INSTALL_DIR/PalServer.sh" ]]; then
+    log "PalServer.sh missing under $INSTALL_DIR — is the game volume mounted/installed?" >&2
+    log "Set UPDATE_ON_START=true for the first run so SteamCMD can install it." >&2
     exit 1
   fi
+  CFG_DIR="$INSTALL_DIR/Pal/Saved/Config/LinuxServer"
+  CFG="$CFG_DIR/PalWorldSettings.ini"
+  $AS_STEAM install -d "$CFG_DIR"
+  if [[ ! -s "$CFG" && -f "$INSTALL_DIR/DefaultPalWorldSettings.ini" ]]; then
+    log "Seeding PalWorldSettings.ini from DefaultPalWorldSettings.ini."
+    $AS_STEAM cp "$INSTALL_DIR/DefaultPalWorldSettings.ini" "$CFG"
+  fi
+  $AS_STEAM chmod +x "$INSTALL_DIR/PalServer.sh" || true
+  # NOTE: env-driven rendering of the server's own PalWorldSettings.ini (enabling
+  # the REST API, etc.) lands in a later increment. For embedded telemetry to
+  # collect data, enable the REST API in that file with a matching ADMIN_PASSWORD.
+
+  enable_service palworld-server
+  enable_service config-webui
 fi
 
-if [[ "${UPDATE_ON_START:-true}" == "true" ]]; then
-  log "Updating Palworld dedicated server (Steam app ${APP_ID})..."
-  $AS_STEAM "$STEAMCMD" +force_install_dir "$INSTALL_DIR" \
-    +login anonymous \
-    +app_update "$APP_ID" validate \
-    +quit
-else
-  log "UPDATE_ON_START=false — skipping SteamCMD update."
+if [[ "$TELEMETRY_READY" == "1" ]]; then
+  enable_service fps-sample
 fi
 
-if [[ ! -x "$INSTALL_DIR/PalServer.sh" ]]; then
-  log "PalServer.sh missing under $INSTALL_DIR — is the game volume mounted and installed?" >&2
-  log "Set UPDATE_ON_START=true for the first run so SteamCMD can install it." >&2
-  exit 1
+# Nothing to do (external mode without telemetry configured)?
+if [[ -z "$(ls -A "$S6_USER_CONTENTS" 2>/dev/null)" ]]; then
+  log "MODE=external and no telemetry configured — nothing to run."
+  log "Set ADMIN_PASSWORD (and PALWORLD_TARGET_HOST) to collect telemetry. Exiting."
+  exit 0
 fi
 
-# --- embedded: seed the live config if absent (as steam) --------------------
-CFG_DIR="$INSTALL_DIR/Pal/Saved/Config/LinuxServer"
-CFG="$CFG_DIR/PalWorldSettings.ini"
-$AS_STEAM install -d "$CFG_DIR"
-if [[ ! -s "$CFG" && -f "$INSTALL_DIR/DefaultPalWorldSettings.ini" ]]; then
-  log "Seeding PalWorldSettings.ini from DefaultPalWorldSettings.ini."
-  $AS_STEAM cp "$INSTALL_DIR/DefaultPalWorldSettings.ini" "$CFG"
-fi
-# NOTE: env-driven config rendering (palworld-config-apply-env) is wired in a
-# later increment; for now the server uses whatever is in PalWorldSettings.ini.
-$AS_STEAM chmod +x "$INSTALL_DIR/PalServer.sh" || true
-
-# --- hand off to the s6 supervisor ------------------------------------------
-# s6-overlay (/init) becomes PID 1 as root and supervises the server + web UI,
-# each of which drops to the steam user. See docker/s6-rc.d/.
-log "Bootstrap complete; handing off to s6 supervisor (server + config web UI)..."
+log "Bootstrap complete; handing off to s6 supervisor..."
 exec /init "$@"

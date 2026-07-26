@@ -1,128 +1,115 @@
 # palwarden in Docker
 
 An **all-in-one image** for Palworld: one artifact that can either **run the
-dedicated server itself** (self-contained) or **manage an existing server**
-elsewhere. Which role it plays is chosen at runtime, not at build time.
+dedicated server itself** (self-contained) or **manage/monitor an existing
+server** elsewhere. Which role it plays is chosen at runtime, not at build time.
 
-> **Status — increment 2:** the **embedded** container now runs under an
-> **s6-overlay** supervisor with two managed services: the **Palworld server**
-> and the **config web UI**. Background tooling (telemetry, timers, REST
-> wrappers) and the active side of **external** mode land in the next increment.
-> See [`../docs/docker-roadmap.md`](../docs/docker-roadmap.md).
+> **Status — increment 3:** **external mode is now functional for telemetry.**
+> Under s6, the embedded container runs the server + config web UI, and — in
+> either mode, when `ADMIN_PASSWORD` is set — the **FPS/player telemetry
+> sampler**. Remaining background jobs (update-check, memory watchdog,
+> public-info watcher, daily report) need the systemctl/cgroup host-isms
+> abstracted and land in the next increment. See
+> [`../docs/docker-roadmap.md`](../docs/docker-roadmap.md).
 
 ## Process model
 
 `s6-overlay` is PID 1 (as root) and supervises the workloads; **every workload
-runs unprivileged as the `steam` user** (uid/gid 1000). On stop, s6 receives
-SIGTERM and the server's service forwards **SIGINT** to the game so it saves
-before exiting (`S6_KILL_GRACETIME` gives it headroom under the 120s stop grace).
+runs unprivileged as `steam`** (uid/gid 1000). Which services run is decided at
+start by the entrypoint from `PALWARDEN_MODE` + config:
+
+| Service | embedded | external | Needs |
+|---------|:---:|:---:|-------|
+| `palworld-server` | ✅ | — | game volume |
+| `config-webui` | ✅ | — | — |
+| `fps-sample` (telemetry) | ✅ | ✅ | `ADMIN_PASSWORD` + reachable REST API |
+
+On stop, s6 receives SIGTERM and the server service forwards **SIGINT** to the
+game so it saves (within the 120s grace).
 
 ## The two modes
 
 | | `embedded` | `external` |
 |---|-----------|-----------|
-| **What runs** | s6 → Palworld server + config web UI (+ tooling, next increment) | Tooling only, targeting your existing server |
-| **Game files** | In a Docker volume | None (managed remotely) |
-| **Use when** | You want a self-contained server | You already run Palworld elsewhere and just want the tooling |
-| **Toggle** | `COMPOSE_PROFILES=embedded`, `PALWARDEN_MODE=embedded` | profile empty, `PALWARDEN_MODE=external`, set `PALWORLD_TARGET_HOST` |
+| **Runs** | server + web UI + telemetry | telemetry only, targeting your server |
+| **Game files** | Docker volume | none |
+| **Toggle** | `COMPOSE_PROFILES=embedded` | `COMPOSE_PROFILES=external` + `PALWORLD_TARGET_HOST` |
 
-Both come from the **same image**; the mode is a runtime env var. Because game
-files live in a volume (not the image), the external role stays lean.
+Both come from the **same image**; the mode is a runtime env var.
+
+## Credentials & notifications
+
+The tooling talks to the Palworld REST API, which authenticates with
+**`ADMIN_PASSWORD`** (HTTP Basic, user `admin`). Set it in `.env`:
+
+- `ADMIN_PASSWORD` — enables telemetry/management. Blank ⇒ tooling disabled.
+- `DISCORD_WEBHOOK` — optional, for notifications/reports.
+
+Rendered to `/etc/palworld/{settings,notify}.env` (mode 0600, owned `steam`) at
+start — **never baked into the image**. For **embedded**, the server's own
+`PalWorldSettings.ini` must also enable the REST API with the *same* password
+(server-config rendering lands in a later increment); until then, embedded
+telemetry records "error" rows until the API is reachable.
 
 ## Quick start — embedded (self-contained server)
 
 ```bash
 cd docker
-cp .env.example .env          # adjust ports / UPDATE_ON_START if you like
+cp .env.example .env          # set ADMIN_PASSWORD (+ DISCORD_WEBHOOK) if wanted
 COMPOSE_PROFILES=embedded docker compose up -d --build
 docker compose logs -f palwarden
 ```
 
-Wait for `Running Palworld dedicated server on :8211`. First boot downloads the
-game via SteamCMD (a few GB), so it takes a while. Players connect on
-`UDP 8211` (host port set by `PALWORLD_GAME_PORT`).
+Players connect on `UDP 8211`; the config web UI is at
+`http://127.0.0.1:8088/PalWorldSettingsEditor.html`. Stop gracefully with
+`docker compose down` (server saves via SIGINT).
 
-Stop gracefully (server saves via SIGINT, up to 120s):
+## Quick start — external (monitor an existing server)
 
 ```bash
-docker compose down            # or: docker compose stop
+cd docker
+cp .env.example .env
+#   PALWORLD_TARGET_HOST=<your server host/IP>
+#   ADMIN_PASSWORD=<its REST admin password>
+COMPOSE_PROFILES=external docker compose up -d --build
+docker compose exec palwarden-external palworld-fps report --window 60m
 ```
 
-## Config web UI
+The container samples the remote server's REST API on `FPS_SAMPLE_INTERVAL`
+(default 15s) into a persistent `palwarden-state` volume. Your server must have
+its REST API enabled and reachable by the container (private network / tunnel —
+never the public Internet).
 
-Served by the `config-webui` s6 service and published to **host loopback only**:
-
-```
-http://127.0.0.1:8088/PalWorldSettingsEditor.html
-http://127.0.0.1:8088/EngineIniPerformanceEditor.html
-```
-
-The live config is exposed read-only at `http://127.0.0.1:8088/current/` so the
-editors can load it. Change the host port with `WEBUI_PORT` in `.env`. The
-editors are client-side only — they generate INI/env text; they don't write back
-to the server (that's what the config tooling does).
-
-## Managing config and saves
-
-Persisted in named volumes:
+## Volumes
 
 | Volume | Mounted at | Holds |
 |--------|-----------|-------|
-| `palworld-server` | `/opt/palworld/server` | Full game install (SteamCMD downloads persist) |
-| `palworld-saved` | `/opt/palworld/server/Pal/Saved` | Worlds + `Config/LinuxServer/PalWorldSettings.ini` |
+| `palworld-server` | `/opt/palworld/server` | Game install (embedded) |
+| `palworld-saved` | `/opt/palworld/server/Pal/Saved` | Worlds + config (embedded) |
+| `palwarden-state` | `/var/lib/palworld` | `metrics.sqlite3` telemetry (both modes) |
 
-Edit the live config until env-driven rendering lands in a later increment:
-
-```bash
-docker compose exec palwarden \
-  sh -c 'vi /opt/palworld/server/Pal/Saved/Config/LinuxServer/PalWorldSettings.ini'
-docker compose restart palwarden
-```
-
-Prefer **bind mounts** (e.g. to back up saves with host tools)? Replace the
-volume entries in `compose.yaml`, e.g.:
-
-```yaml
-    volumes:
-      - /srv/palwarden/server:/opt/palworld/server
-      - /srv/palwarden/saved:/opt/palworld/server/Pal/Saved
-```
-
-Match host ownership to the container's `steam` user (uid/gid **1000**), and note
-the runbook's warning against blanket recursive `chown` of the volume.
-
-## External mode (preview)
-
-Set `PALWARDEN_MODE=external` and point `PALWORLD_TARGET_HOST` at your existing
-server. Today the container logs the target and exits (nothing to manage yet);
-a later increment gives it the tooling to actually drive that server. Your
-existing server must expose its REST API reachably (private network / SSH tunnel
-— never the public Internet).
+Bind mounts work too; match host ownership to `steam` (uid/gid **1000**).
 
 ## Security notes
 
-- The REST API (`8212/tcp`) is **not** published to the host; keep it that way.
-- The web UI is published to `127.0.0.1` only.
-- No secrets are baked into the image; `.env`, `settings.env`, and `notify.env`
-  are git-ignored and stay on the host / in volumes.
-- Workloads run as the non-root `steam` user (uid/gid 1000). The s6 supervisor
-  runs as PID 1 root only to manage services — a conventional, rootless-workload
-  posture. A fully rootless variant is a possible future option.
+- The REST API (`8212/tcp`) is **not** published to the host; the web UI is
+  published to `127.0.0.1` only.
+- Secrets are rendered at runtime from env; `.env`, `settings.env`, `notify.env`
+  are git-ignored and never in the image.
+- Workloads run non-root (`steam`); s6 is PID 1 root only to supervise.
 
 ## Configuration reference
 
-All knobs live in `.env` (see [`.env.example`](.env.example)):
-`COMPOSE_PROFILES`, `PALWARDEN_MODE`, `UPDATE_ON_START`, `PALWORLD_GAME_PORT`,
-`WEBUI_PORT`, `PALWORLD_TARGET_HOST`, `PALWORLD_REST_PORT`.
+`.env` (see [`.env.example`](.env.example)): `COMPOSE_PROFILES`,
+`PALWARDEN_MODE`, `UPDATE_ON_START`, `PALWORLD_GAME_PORT`, `WEBUI_PORT`,
+`ADMIN_PASSWORD`, `DISCORD_WEBHOOK`, `FPS_SAMPLE_INTERVAL`, `FPS_RETENTION_DAYS`,
+`PALWORLD_TARGET_HOST`, `PALWORLD_REST_PORT`.
 
 ## Image internals
 
-- Base: `cm2network/steamcmd` (SteamCMD + 32-bit libs + non-root `steam` user).
-- Supervisor: `s6-overlay` v3. Services live in
-  [`s6-rc.d/`](s6-rc.d/) (`palworld-server`, `config-webui`).
-- Entrypoint (`entrypoint.sh`) does the embedded bootstrap from
-  [`../docs/palworld-service-runbook.md`](../docs/palworld-service-runbook.md)
-  §12 — optional SteamCMD update, seed `PalWorldSettings.ini` — then `exec /init`
-  to hand off to s6.
-- Server launch flags, app id `2394010`, and the VM `LD_LIBRARY_PATH` are
-  preserved; stop forwards SIGINT for a clean save.
+- Base `cm2network/steamcmd`; supervisor `s6-overlay` v3; services in
+  [`s6-rc.d/`](s6-rc.d/) selected at runtime via the s6 `user` bundle.
+- Periodic jobs use [`palwarden-run-periodic`](palwarden-run-periodic) (a small
+  run-sleep loop) in place of systemd timers.
+- The sampler reaches the API via `palworld-api`, which now honors
+  `REST_API_HOST` (defaults to localhost, so bare-metal behavior is unchanged).

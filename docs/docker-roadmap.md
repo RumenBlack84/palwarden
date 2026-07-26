@@ -83,12 +83,21 @@ external-only users.
    Verified: image builds, both services start, web UI serves (HTTP 200),
    non-root workloads, graceful stop completes without SIGKILL. Full embedded
    game boot still not run E2E.
-3. **Port the timers** to cron/s6 one at a time, starting with `fps-sample` and
-   `update-check`. This is where **external** mode becomes functional.
-4. **Abstract host-isms** (`systemctl`/cgroup) behind a small status helper with
-   a container backend, so `status`/`memory-watch`/`health-report` work.
-5. **Entrypoint config rendering** from env → `settings.env` →
-   `palworld-config-apply-env` on boot (12-factor config).
+3. **Port the timers** to s6 — 🟡 **started**. The `fps-sample` telemetry job
+   now runs under s6 via `palwarden-run-periodic`, target-aware
+   (`REST_API_HOST`), which makes **external** mode functional for monitoring.
+   Minimal env→`settings.env`/`notify.env` rendering (REST connection + webhook)
+   is done in the entrypoint, and services are selected at runtime by mode +
+   config. Verified end-to-end: embedded (with/without telemetry) and external
+   sampling a live REST stub. **Deferred to increment 4** (need host-ism
+   abstraction): `update-check` (systemctl→s6 restart), `memory-watch` (cgroup),
+   `public-info-watch`, and the daily report (+ matplotlib for graphs).
+4. **Abstract host-isms** (`systemctl`/cgroup/`sudo`) behind small container
+   backends, then port the remaining timers and make `status`/`memory-watch`/
+   `health-report` work in-container.
+5. **Full server-config rendering** from env → `PalWorldSettings.ini` (enable
+   REST API, server name, limits, …) via `palworld-config-apply-env` on boot, so
+   embedded telemetry/management works without hand-editing the config.
 
 ## Open questions
 

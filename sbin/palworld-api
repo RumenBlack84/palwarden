@@ -7,6 +7,9 @@ if [[ ! -r "$config_env" ]]; then echo "Cannot read $config_env" >&2; exit 1; fi
 # shellcheck disable=SC1090
 source "$config_env"
 REST_API_PORT="${REST_API_PORT:-8212}"
+# Host of the Palworld REST API. Defaults to localhost (bare-metal behavior);
+# set REST_API_HOST to manage a remote/containerized server.
+REST_API_HOST="${REST_API_HOST:-127.0.0.1}"
 REST_API_ENABLED="${REST_API_ENABLED:-False}"
 ADMIN_PASSWORD="${ADMIN_PASSWORD:-}"
 if [[ "$REST_API_ENABLED" != "True" ]]; then echo "REST API is not enabled in $config_env" >&2; exit 2; fi
@@ -23,7 +26,7 @@ PY2
   metrics) method=GET; path=/v1/api/metrics; body='' ;;
   *) echo "Usage: $0 {save|stop [seconds] [message]|info|metrics}" >&2; exit 64 ;;
 esac
-PALWORLD_API_METHOD="$method" PALWORLD_API_URL="http://127.0.0.1:${REST_API_PORT}${path}" PALWORLD_API_PASSWORD="$ADMIN_PASSWORD" PALWORLD_API_BODY="$body" python3 - <<'PY2'
+PALWORLD_API_METHOD="$method" PALWORLD_API_URL="http://${REST_API_HOST}:${REST_API_PORT}${path}" PALWORLD_API_PASSWORD="$ADMIN_PASSWORD" PALWORLD_API_BODY="$body" python3 - <<'PY2'
 import base64, os, sys, urllib.error, urllib.request
 method=os.environ['PALWORLD_API_METHOD']; url=os.environ['PALWORLD_API_URL']; password=os.environ['PALWORLD_API_PASSWORD']; body=os.environ.get('PALWORLD_API_BODY','')
 headers={"User-Agent":"palworld-api-helper/1.0", "Authorization":"Basic "+base64.b64encode(("admin:"+password).encode()).decode()}

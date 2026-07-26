@@ -1,0 +1,12 @@
+#!/command/with-contenv bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Brian Grant
+#
+# FPS/player telemetry sampler, supervised by s6 and run as the unprivileged
+# steam user. Replaces palworld-fps-sample.timer. Works in both modes: it polls
+# the REST API at REST_API_HOST (localhost for embedded, PALWORLD_TARGET_HOST for
+# external) via palworld-api and stores samples in /var/lib/palworld/metrics.sqlite3.
+# The sampler records an error row (never crashes) when the API is unreachable.
+exec s6-setuidgid steam palwarden-run-periodic \
+  "${FPS_SAMPLE_INTERVAL:-15}" fps-sample \
+  palworld-fps sample --retention-days "${FPS_RETENTION_DAYS:-7}"
