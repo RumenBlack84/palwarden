@@ -12,6 +12,7 @@ set -u
 # s6 tools live in /command; ensure they're reachable regardless of caller PATH.
 PATH="/command:$PATH"
 S6_SVC_DIR="${PALWARDEN_S6_SVC_DIR:-/run/service}"
+CGROUP_MEM="${PALWARDEN_CGROUP_MEM:-/sys/fs/cgroup/memory.current}"
 
 map_svc() {
   case "$1" in
@@ -54,7 +55,7 @@ case "$cmd" in
   show)
     out=""
     case "$prop" in
-      MemoryCurrent) out="$(cat /sys/fs/cgroup/memory.current 2>/dev/null || echo 0)" ;;
+      MemoryCurrent) out="$(cat "$CGROUP_MEM" 2>/dev/null || echo 0)" ;;
       MainPID)       out="$(svc_pid)"; out="${out:-0}" ;;
       *) out="" ;;
     esac

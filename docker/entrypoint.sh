@@ -35,42 +35,28 @@ esac
 # Render runtime config from env (both modes). No secrets are baked in the image.
 # ---------------------------------------------------------------------------
 mkdir -p /etc/palworld
-install -d -o steam -g steam /var/lib/palworld   # telemetry DB lives here
+install -d -o steam -g steam /var/lib/palworld /opt/palworld/config-backups
+# Pre-create the telemetry DB owned by steam so root-context boot steps (e.g.
+# config-apply-env's event marker) don't leave it root-owned.
+[[ -e /var/lib/palworld/metrics.sqlite3 ]] \
+  || install -o steam -g steam -m 0644 /dev/null /var/lib/palworld/metrics.sqlite3
 
 if [[ "$MODE" == "external" && -z "${PALWORLD_TARGET_HOST:-}" ]]; then
   log "MODE=external requires PALWORLD_TARGET_HOST (the existing server's host)." >&2
   exit 64
 fi
 
+# Render settings.env (REST connection + any PALWORLD_CFG_* server settings) and
+# notify.env from env. No secrets are baked into the image.
+palwarden-render-config /etc/palworld/settings.env /etc/palworld/notify.env
+chown steam:steam /etc/palworld/settings.env 2>/dev/null || true
+[[ -f /etc/palworld/notify.env ]] && chown steam:steam /etc/palworld/notify.env 2>/dev/null || true
+
 TELEMETRY_READY=0
 if [[ -n "${ADMIN_PASSWORD:-}" ]]; then
-  # REST connection settings consumed by palworld-api (and thus the sampler).
-  rest_host="${PALWORLD_TARGET_HOST:-127.0.0.1}"
-  [[ "$MODE" == "embedded" ]] && rest_host="127.0.0.1"
-  ( umask 077
-    cat > /etc/palworld/settings.env <<EOF
-# Rendered by the palwarden entrypoint at container start. Do not edit by hand;
-# set the corresponding environment variables instead.
-REST_API_ENABLED=True
-REST_API_HOST=${rest_host}
-REST_API_PORT=${PALWORLD_REST_PORT:-8212}
-ADMIN_PASSWORD=${ADMIN_PASSWORD}
-EOF
-  )
-  chown steam:steam /etc/palworld/settings.env
   TELEMETRY_READY=1
 else
   log "ADMIN_PASSWORD not set — telemetry/management disabled (no REST access)."
-fi
-
-if [[ -n "${DISCORD_WEBHOOK:-}" ]]; then
-  ( umask 077
-    cat > /etc/palworld/notify.env <<EOF
-PALWORLD_DISCORD_WEBHOOK=${DISCORD_WEBHOOK}
-PALWORLD_NOTIFY_NAME=${PALWORLD_NOTIFY_NAME:-Palworld}
-EOF
-  )
-  chown steam:steam /etc/palworld/notify.env
 fi
 
 # ---------------------------------------------------------------------------
@@ -118,9 +104,16 @@ if [[ "$MODE" == "embedded" ]]; then
       "$INSTALL_DIR/Pal/Binaries/Linux/steamclient.so" 2>/dev/null || true
   fi
   $AS_STEAM chmod +x "$INSTALL_DIR/Pal/Binaries/Linux/PalServer-Linux-Shipping" 2>/dev/null || true
-  # NOTE: env-driven rendering of the server's own PalWorldSettings.ini (enabling
-  # the REST API, etc.) lands in a later increment. For embedded telemetry to
-  # collect data, enable the REST API in that file with a matching ADMIN_PASSWORD.
+
+  # Apply env-driven settings to the server's PalWorldSettings.ini before it
+  # starts: enables the REST API (so embedded telemetry works out of the box),
+  # sets passwords, and any PALWORLD_CFG_* server settings. Runs as root so it
+  # can chown to steam; best-effort so a parser hiccup never blocks boot.
+  if [[ -n "${ADMIN_PASSWORD:-}" ]] || compgen -e | grep -q '^PALWORLD_CFG_'; then
+    log "Applying settings.env to PalWorldSettings.ini..."
+    PALWORLD_USER=steam PALWORLD_GROUP=steam /usr/local/sbin/palworld-config-apply-env \
+      || log "config apply reported an issue (continuing)."
+  fi
 
   enable_service palworld-server
   enable_service config-webui

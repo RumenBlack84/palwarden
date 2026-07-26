@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Brian Grant
+#
+# Integration tests: build the palwarden image and exercise container scenarios
+# with a dummy server (tests/fixtures/fake-server) and a REST stub. Codifies the
+# behaviors verified by hand while building the Docker increments.
+#
+# Requires docker. Slow (builds the image + starts several containers).
+set -u
+DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO="$(cd "$DIR/../.." && pwd)"
+source "$DIR/../lib/assert.sh"
+
+IMG="palwarden:test"
+FAKE="$REPO/tests/fixtures/fake-server"
+STUB="$REPO/tests/fixtures/rest-stub.py"
+NET="palwarden-itest-net"
+CIDS=()
+
+cleanup() {
+  for c in "${CIDS[@]:-}"; do docker rm -f "$c" >/dev/null 2>&1 || true; done
+  docker network rm "$NET" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+run_c() { local name="$1"; shift; CIDS+=("$name"); docker rm -f "$name" >/dev/null 2>&1 || true; docker run -d --name "$name" "$@" >/dev/null; }
+wait_up() { docker exec "$1" sh -c 'i=0; until s6-svstat /run/service/'"$2"' 2>/dev/null | grep -q "^up"; do i=$((i+1)); [ $i -gt 25 ] && exit 1; sleep 1; done'; }
+services_of() { docker exec "$1" ls /etc/s6-overlay/s6-rc.d/user/contents.d/ 2>/dev/null | tr '\n' ' '; }
+
+echo "  building $IMG ..."
+if ! docker build -q -f "$REPO/docker/Dockerfile" -t "$IMG" "$REPO" >/dev/null 2>&1; then
+  fail "image build failed"; assert_report; exit 1
+fi
+
+# --- Scenario A: embedded, no ADMIN_PASSWORD --------------------------------
+run_c pw-it-a -e PALWARDEN_MODE=embedded -e UPDATE_ON_START=false -v "$FAKE":/opt/palworld/server "$IMG"
+wait_up pw-it-a palworld-server || fail "A: server did not come up"
+svcA="$(services_of pw-it-a)"
+assert_contains "$svcA" "palworld-server" "A: server enabled"
+assert_contains "$svcA" "config-webui" "A: webui enabled"
+assert_contains "$svcA" "memory-watch" "A: watchdog enabled"
+assert_not_contains "$svcA" "fps-sample" "A: no telemetry without password"
+assert_not_contains "$svcA" "daily-report" "A: no report without webhook"
+
+# systemctl shim reports the server active
+assert_eq "$(docker exec pw-it-a systemctl is-active palworld.service)" "active" "A: shim is-active"
+
+# --- Scenario B: embedded, ADMIN_PASSWORD + PALWORLD_CFG_* -------------------
+run_c pw-it-b -e PALWARDEN_MODE=embedded -e UPDATE_ON_START=false \
+  -e ADMIN_PASSWORD=secret123 -e "PALWORLD_CFG_SERVER_NAME=Yggdrasil" \
+  -v "$FAKE":/opt/palworld/server "$IMG"
+wait_up pw-it-b palworld-server || fail "B: server did not come up"
+docker exec pw-it-b sh -c 'sleep 2'
+svcB="$(services_of pw-it-b)"
+assert_contains "$svcB" "fps-sample" "B: telemetry enabled with password"
+# settings.env was rendered in-container from env (values are shell-quoted)
+assert_rc 0 docker exec pw-it-b grep -qF 'REST_API_ENABLED="True"' /etc/palworld/settings.env
+assert_rc 0 docker exec pw-it-b grep -qF 'SERVER_NAME="Yggdrasil"' /etc/palworld/settings.env
+assert_rc 0 docker exec pw-it-b grep -qF 'ADMIN_PASSWORD="secret123"' /etc/palworld/settings.env
+# and the config was actually applied to the server's INI (REST enabled)
+assert_rc 0 docker exec pw-it-b grep -qF 'RESTAPIEnabled=True' /opt/palworld/server/Pal/Saved/Config/LinuxServer/PalWorldSettings.ini
+# config apply was attempted at boot
+assert_contains "$(docker logs pw-it-b 2>&1)" "Applying settings.env" "B: config apply attempted"
+# telemetry DB is steam-owned (not root), so the sampler can write it
+owner="$(docker exec pw-it-b stat -c '%U' /var/lib/palworld/metrics.sqlite3 2>/dev/null)"
+assert_eq "$owner" "steam" "B: metrics DB owned by steam"
+
+# --- Scenario C: external mode against the REST stub ------------------------
+docker network create "$NET" >/dev/null 2>&1 || true
+CIDS+=(pw-it-stub); docker rm -f pw-it-stub >/dev/null 2>&1 || true
+docker run -d --name pw-it-stub --network "$NET" -v "$STUB":/stub.py:ro --entrypoint python3 "$IMG" /stub.py >/dev/null
+run_c pw-it-c --network "$NET" -e PALWARDEN_MODE=external -e PALWORLD_TARGET_HOST=pw-it-stub \
+  -e ADMIN_PASSWORD=secret123 -e FPS_SAMPLE_INTERVAL=1 "$IMG"
+svcC="$(services_of pw-it-c)"
+assert_contains "$svcC" "fps-sample" "C: telemetry enabled"
+assert_not_contains "$svcC" "palworld-server" "C: no server in external mode"
+docker exec pw-it-c sh -c 'sleep 6'
+okrows="$(docker exec pw-it-c python3 -c "import sqlite3;print(sqlite3.connect('/var/lib/palworld/metrics.sqlite3').execute('select count(*) from fps_samples where ok=1').fetchone()[0])" 2>/dev/null)"
+[ "${okrows:-0}" -gt 0 ] && pass || fail "C: expected ok telemetry rows from stub, got '${okrows:-0}'"
+
+# --- Scenario D: container graceful restart cycles the server ---------------
+rp1="$(docker exec pw-it-b s6-svstat /run/service/palworld-server | grep -oE 'pid [0-9]+' | grep -oE '[0-9]+')"
+docker exec pw-it-b palworld-graceful-restart --startup-timeout 3 >/dev/null 2>&1
+docker exec pw-it-b sh -c 'sleep 4'
+rp2="$(docker exec pw-it-b s6-svstat /run/service/palworld-server | grep -oE 'pid [0-9]+' | grep -oE '[0-9]+')"
+assert_ne "$rp1" "$rp2" "D: graceful restart cycled the server service"
+
+# --- Scenario E: graceful shutdown saves the world --------------------------
+run_c pw-it-e -e PALWARDEN_MODE=embedded -e UPDATE_ON_START=false -v "$FAKE":/opt/palworld/server "$IMG"
+wait_up pw-it-e palworld-server || fail "E: server did not come up"
+docker exec pw-it-e sh -c 'sleep 1'
+docker stop --time 60 pw-it-e >/dev/null 2>&1
+assert_eq "$(docker inspect -f '{{.State.ExitCode}}' pw-it-e)" "0" "E: clean exit (graceful, not SIGKILL)"
+assert_contains "$(docker logs pw-it-e 2>&1)" "world saved, exiting cleanly" "E: server saved on stop"
+
+assert_report

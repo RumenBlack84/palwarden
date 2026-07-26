@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+# Test fixture: stand-in for the real Palworld server binary. It handles SIGINT
+# the way the real game does — "saves" (briefly) then exits cleanly — so tests
+# can verify graceful save-on-stop and s6 restart behavior.
+import signal, sys, time
+
+def on_int(sig, frame):
+    print("[game] SIGINT received: saving world...", flush=True)
+    time.sleep(2)
+    print("[game] world saved, exiting cleanly", flush=True)
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, on_int)
+print("[game] dedicated server running", flush=True)
+while True:
+    time.sleep(1)

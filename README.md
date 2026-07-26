@@ -27,6 +27,8 @@ publishing.
 | `config/` | `settings.env.example` (config template) and `engine.env` (Engine.ini tuning state). |
 | `webui/` | Standalone client-side HTML editors for server settings and Engine.ini. |
 | `docs/` | Architecture, per-tool reference, config guide, backlog, Docker roadmap, and the original export artifacts. |
+| `docker/` | All-in-one container image, compose stack, and s6 service definitions. |
+| `tests/` | Unit + docker integration test suites (`./tests/run.sh`). |
 | `install.sh` | Deploys everything to the real filesystem paths and reloads systemd. |
 
 Start with **[`docs/architecture.md`](docs/architecture.md)** for how the pieces

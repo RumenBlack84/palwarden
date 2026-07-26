@@ -17,3 +17,6 @@ public-info.env
 
 # Docker local env
 docker/.env
+
+# Runtime state written into the test fixture by container runs
+tests/fixtures/fake-server/Pal/Saved/

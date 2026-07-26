@@ -4,12 +4,12 @@ An **all-in-one image** for Palworld: one artifact that can either **run the
 dedicated server itself** (self-contained) or **manage/monitor an existing
 server** elsewhere. Which role it plays is chosen at runtime, not at build time.
 
-> **Status — increment 4:** the maintenance loop now runs in-container. Under
-> s6: the server, config web UI, telemetry sampler, **memory watchdog**, and a
-> **daily Discord report** (with FPS/player graphs via matplotlib). Host-isms
-> (`systemctl`/cgroup/`sudo`) are handled by small shims so the tooling scripts
-> run unchanged. Still deferred: `update-check` (in-container self-update) and
-> `public-info-watch`, plus full server-config rendering — see
+> **Status — increment 5:** the server is now **configured from the environment
+> on boot** — `ADMIN_PASSWORD` enables the REST API and any `PALWORLD_CFG_<KEY>`
+> is applied to `PalWorldSettings.ini` via `palworld-config-apply-env`, so
+> embedded telemetry works out of the box with no hand-editing. Test suites
+> (unit + docker integration) live in [`../tests/`](../tests/). Still deferred:
+> `update-check` (in-container self-update) and `public-info-watch` — see
 > [`../docs/docker-roadmap.md`](../docs/docker-roadmap.md).
 
 ## Process model
@@ -77,10 +77,16 @@ The tooling talks to the Palworld REST API, which authenticates with
 - `DISCORD_WEBHOOK` — optional, for notifications/reports.
 
 Rendered to `/etc/palworld/{settings,notify}.env` (mode 0600, owned `steam`) at
-start — **never baked into the image**. For **embedded**, the server's own
-`PalWorldSettings.ini` must also enable the REST API with the *same* password
-(server-config rendering lands in a later increment); until then, embedded
-telemetry records "error" rows until the API is reachable.
+start — **never baked into the image**. For **embedded**, setting
+`ADMIN_PASSWORD` also **enables the REST API in the server's own
+`PalWorldSettings.ini`** on boot (via `palworld-config-apply-env`), so telemetry
+works with no hand-editing.
+
+### Server settings (embedded)
+
+Any `PALWORLD_CFG_<KEY>` env var is applied to `PalWorldSettings.ini` before the
+server starts — e.g. `PALWORLD_CFG_SERVER_NAME`, `PALWORLD_CFG_MAX_PLAYERS`,
+`PALWORLD_CFG_SERVER_PASSWORD`. See [`.env.example`](.env.example).
 
 ## Quick start — embedded (self-contained server)
 

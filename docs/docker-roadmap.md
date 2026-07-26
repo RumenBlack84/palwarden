@@ -103,10 +103,20 @@ external-only users.
    **Deferred to increment 5:** `update-check` (in-container self-update:
    s6 down → SteamCMD → up) and `public-info-watch` (needs a configurable
    hostname + IP source).
-5. **Full server-config rendering** from env → `PalWorldSettings.ini` (enable
-   REST API, server name, limits, …) via `palworld-config-apply-env` on boot, so
-   embedded telemetry/management works without hand-editing the config; then
-   finish porting `update-check` and `public-info-watch`.
+5. **Server-config rendering + test suites** — ✅ **done**. The entrypoint
+   renders `settings.env`/`notify.env` from env via `palwarden-render-config`
+   (values shell-quoted so spaces/metacharacters survive) and applies them to
+   `PalWorldSettings.ini` with `palworld-config-apply-env` on boot: setting
+   `ADMIN_PASSWORD` enables the REST API and any `PALWORLD_CFG_<KEY>` becomes a
+   server setting. `config-apply-env`/`config-pretty` gained `PALWORLD_USER/GROUP`
+   overrides (default `palworld`; container uses `steam`). Added unit + docker
+   integration test suites under `tests/`. Verified end-to-end: env →
+   `settings.env` → `RESTAPIEnabled=True` + `ServerName`/`AdminPassword` applied.
+
+6. **Finish the last timers** (deferred): `update-check` (in-container
+   self-update — s6 down → SteamCMD → up, with a lock) and `public-info-watch`
+   (needs a configurable hostname + IP source). Optional: a slim tools-only image
+   variant for external-only users.
 
 ## Open questions
 

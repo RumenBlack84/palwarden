@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # SPDX-FileCopyrightText: 2026 Brian Grant
 set -euo pipefail
+PALWORLD_USER="${PALWORLD_USER:-palworld}"; PALWORLD_GROUP="${PALWORLD_GROUP:-palworld}"
 src=/opt/palworld/server/Pal/Saved/Config/LinuxServer/PalWorldSettings.ini
 dst=/opt/palworld/server/Pal/Saved/Config/LinuxServer/PalWorldSettings.pretty.ini
 python3 - <<"PY"
@@ -34,6 +35,6 @@ for line in text.splitlines():
     lines.append(")")
 dst.write_text("\n".join(lines)+"\n")
 PY
-chown palworld:palworld "$dst"
+chown "$PALWORLD_USER:$PALWORLD_GROUP" "$dst"
 chmod 0644 "$dst"
 echo "$dst"

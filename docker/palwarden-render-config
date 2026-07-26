@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Brian Grant
+#
+# palwarden-render-config <settings_env_path> <notify_env_path>
+#
+# Render the tooling's runtime config from environment variables. No secrets are
+# ever baked into the image; this runs at container start.
+#
+#   settings.env:
+#     - REST connection for the tooling (REST_API_HOST/PORT/ENABLED, ADMIN_PASSWORD)
+#       when ADMIN_PASSWORD is set. In embedded mode REST_API_HOST is localhost;
+#       in external mode it's PALWORLD_TARGET_HOST.
+#     - Any PALWORLD_CFG_<KEY>=value becomes a bare `<KEY>=value` line, which is
+#       what palworld-config-apply-env / palworld-config-parser consume to write
+#       the server's PalWorldSettings.ini (embedded mode).
+#   notify.env:
+#     - PALWORLD_DISCORD_WEBHOOK (+ optional PALWORLD_NOTIFY_NAME) from
+#       DISCORD_WEBHOOK when set.
+#
+# Files are written 0600 (they hold secrets).
+set -u
+
+settings_out="${1:?usage: palwarden-render-config <settings_env> <notify_env>}"
+notify_out="${2:?usage: palwarden-render-config <settings_env> <notify_env>}"
+
+MODE="${PALWARDEN_MODE:-embedded}"
+
+# Emit KEY="value" with the value safely double-quoted, so the file is valid to
+# `source` (values may contain spaces or shell metacharacters, e.g. passwords or
+# a server name like "Yggdrasil Palworld").
+emit() {
+  local key="$1" val="$2"
+  val="${val//\\/\\\\}"; val="${val//\"/\\\"}"; val="${val//\$/\\\$}"; val="${val//\`/\\\`}"
+  printf '%s="%s"\n' "$key" "$val"
+}
+
+umask 077
+
+# --- settings.env -----------------------------------------------------------
+{
+  echo "# Rendered by palwarden-render-config at container start. Do not edit by"
+  echo "# hand; set the corresponding environment variables instead."
+
+  if [[ -n "${ADMIN_PASSWORD:-}" ]]; then
+    rest_host="${PALWORLD_TARGET_HOST:-127.0.0.1}"
+    [[ "$MODE" == "embedded" ]] && rest_host="127.0.0.1"
+    emit REST_API_ENABLED "True"
+    emit REST_API_HOST "$rest_host"
+    emit REST_API_PORT "${PALWORLD_REST_PORT:-8212}"
+    emit ADMIN_PASSWORD "$ADMIN_PASSWORD"
+  fi
+
+  # Pass through PALWORLD_CFG_* as bare PalWorldSettings keys.
+  while IFS= read -r var; do
+    case "$var" in
+      PALWORLD_CFG_*) emit "${var#PALWORLD_CFG_}" "${!var}" ;;
+    esac
+  done < <(compgen -e)
+} > "$settings_out"
+chmod 600 "$settings_out" 2>/dev/null || true
+
+# --- notify.env -------------------------------------------------------------
+if [[ -n "${DISCORD_WEBHOOK:-}" ]]; then
+  {
+    emit PALWORLD_DISCORD_WEBHOOK "$DISCORD_WEBHOOK"
+    emit PALWORLD_NOTIFY_NAME "${PALWORLD_NOTIFY_NAME:-Palworld}"
+  } > "$notify_out"
+  chmod 600 "$notify_out" 2>/dev/null || true
+fi

@@ -76,6 +76,7 @@ COPY webui/ /opt/palworld/tools/config-webui/
 COPY docker/entrypoint.sh /usr/local/bin/palwarden-entrypoint
 COPY docker/palwarden-run-periodic /usr/local/bin/palwarden-run-periodic
 COPY docker/palwarden-run-daily /usr/local/bin/palwarden-run-daily
+COPY docker/palwarden-render-config /usr/local/bin/palwarden-render-config
 # Host-ism shims (systemctl -> s6/cgroup, sudo -> passthrough). Installed in
 # /usr/local/bin so they take precedence; only present in the container.
 COPY docker/shims/systemctl /usr/local/bin/systemctl
@@ -89,6 +90,7 @@ RUN chmod +x \
         /usr/local/bin/palwarden-entrypoint \
         /usr/local/bin/palwarden-run-periodic \
         /usr/local/bin/palwarden-run-daily \
+        /usr/local/bin/palwarden-render-config \
         /usr/local/bin/systemctl \
         /usr/local/bin/sudo \
         /etc/s6-overlay/s6-rc.d/palworld-server/run \
@@ -100,6 +102,7 @@ RUN chmod +x \
     && install -d -o steam -g steam \
         /opt/palworld/server/Pal/Saved/Config/LinuxServer \
         /opt/palworld/tools \
+        /opt/palworld/config-backups \
         /var/lib/palworld \
         /var/log/palworld
 

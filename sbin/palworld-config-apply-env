@@ -7,6 +7,10 @@ config_env=/etc/palworld/settings.env
 server_dir=/opt/palworld/server
 config_file="$server_dir/Pal/Saved/Config/LinuxServer/PalWorldSettings.ini"
 backup_dir=/opt/palworld/config-backups
+# Owner of the server files. Defaults to the bare-metal `palworld` service
+# account; the container overrides this to `steam`.
+PALWORLD_USER="${PALWORLD_USER:-palworld}"
+PALWORLD_GROUP="${PALWORLD_GROUP:-palworld}"
 if [[ ! -r "$config_env" ]]; then
   echo "Cannot read $config_env" >&2
   exit 1
@@ -23,11 +27,11 @@ admin_password_present=0
 server_password_present=0
 if [[ ${ADMIN_PASSWORD+x} ]]; then admin_password_present=1; admin_password_value="$ADMIN_PASSWORD"; unset ADMIN_PASSWORD; fi
 if [[ ${SERVER_PASSWORD+x} ]]; then server_password_present=1; server_password_value="$SERVER_PASSWORD"; unset SERVER_PASSWORD; fi
-install -d -o palworld -g palworld -m 0755 "$backup_dir"
+install -d -o "$PALWORLD_USER" -g "$PALWORLD_GROUP" -m 0755 "$backup_dir"
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 backup="$backup_dir/PalWorldSettings.ini.$stamp"
 cp -a "$config_file" "$backup"
-chown palworld:palworld "$backup"
+chown "$PALWORLD_USER:$PALWORLD_GROUP" "$backup"
 cd "$server_dir"
 parser_log=$(mktemp)
 if /usr/local/bin/palworld-config-parser >"$parser_log" 2>&1; then
@@ -74,7 +78,7 @@ if os.environ.get('SERVER_PASSWORD_PRESENT') == '1':
 p.write_text(text)
 PYSECRET
 fi
-chown palworld:palworld "$config_file"
+chown "$PALWORLD_USER:$PALWORLD_GROUP" "$config_file"
 chmod 0644 "$config_file"
 /usr/local/sbin/palworld-config-pretty >/dev/null 2>&1 || true
 diff_text=$(/usr/local/lib/palworld-config-diff --discord "$backup" "$config_file" || true)
