@@ -25,8 +25,13 @@ RUN_INTEGRATION=1 ./tests/run.sh
   scenarios: mode-based service selection, the systemctl shim, env-driven config
   application (`RESTAPIEnabled=True`), external-mode telemetry against a REST
   stub, container-native graceful restart, and graceful save-on-stop.
-- `fixtures/` — a fake server (`fake-server/`, whose "binary" saves on SIGINT)
-  and a Palworld REST API stub (`rest-stub.py`).
+- `integration/test_update_apply.sh` — simulates a new Steam build and drives the
+  full `palworld-update` apply flow in-container (graceful stop → fake SteamCMD
+  install → restart → event markers), plus the already-current no-op case.
+- `fixtures/` — a fake server (`fake-server/`, whose "binary" saves on SIGINT), a
+  REST-serving fake server for the update flow (`fake-server-rest/`), a fake
+  SteamCMD (`fake-steamcmd`, reports `STUB_REMOTE_BUILDID` and "installs" by
+  bumping the manifest), and a Palworld REST API stub (`rest-stub.py`).
 
 ## What is and isn't covered
 

@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Fake SteamCMD for update-apply integration tests. No downloads.
+set -u
+remote="${STUB_REMOTE_BUILDID:-200}"
+args="$*"
+dir=""; prev=""
+for a in "$@"; do [ "$prev" = "+force_install_dir" ] && dir="$a"; prev="$a"; done
+if printf '%s' "$args" | grep -q ' +app_update '; then
+  : "${dir:=/opt/palworld/server}"
+  mkdir -p "$dir/steamapps"
+  printf '"AppState"\n{\n\t"buildid"\t\t"%s"\n}\n' "$remote" > "$dir/steamapps/appmanifest_2394010.acf"
+  echo "Success! App '2394010' fully installed."
+elif printf '%s' "$args" | grep -q '+app_info_print'; then
+  cat <<OUT
+"2394010"
+{
+  "branches"
+  {
+    "public"
+    {
+      "buildid"  "$remote"
+    }
+  }
+}
+OUT
+fi
+exit 0
