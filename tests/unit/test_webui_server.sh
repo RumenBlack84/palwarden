@@ -28,8 +28,9 @@ cat > "$WORK/sbin/palworld-health-report" <<'EOF'
 #!/usr/bin/env bash
 echo '{"service":{"active_state":"active"},"buildid":"12345"}'
 EOF
-cat > "$WORK/sbin/palworld-fps" <<'EOF'
+cat > "$WORK/sbin/palworld-fps" <<EOF
 #!/usr/bin/env bash
+echo "\$@" >> "$WORK/fps-argv.log"
 echo '{"windows":{"24h":{"avg":59.5}}}'
 EOF
 cat > "$WORK/sbin/palworld-service-events" <<'EOF'
@@ -86,8 +87,10 @@ assert_contains "$(body -u "$CREDS" "$U/")" "PALWARDEN DASHBOARD" "root serves t
 assert_eq "$(code -u "$CREDS" "$U/PalWorldSettingsEditor.html")" "200" "editor is served"
 
 # --- traversal must not escape the web root -------------------------------
-assert_ne "$(code -u "$CREDS" "$U/../secret-outside-webroot.txt")" "200" "no parent traversal"
-assert_not_contains "$(body -u "$CREDS" "$U/../secret-outside-webroot.txt")" "SECRET-HOST-FILE" "traversal leaks nothing"
+# --path-as-is stops curl from normalising ".." client-side, so the raw path
+# (with the literal traversal sequence) actually reaches the server.
+assert_ne "$(code --path-as-is -u "$CREDS" "$U/../secret-outside-webroot.txt")" "200" "no parent traversal"
+assert_not_contains "$(body --path-as-is -u "$CREDS" "$U/../secret-outside-webroot.txt")" "SECRET-HOST-FILE" "traversal leaks nothing"
 assert_ne "$(code -u "$CREDS" "$U/..%2fsecret-outside-webroot.txt")" "200" "no encoded traversal"
 assert_eq "$(code -u "$CREDS" "$U/does-not-exist.html")" "404" "missing file is 404"
 
@@ -106,6 +109,22 @@ assert_not_contains "$cfg" "hunter-would-be-bad" "the admin password never leave
 
 # a rejected window falls back rather than passing junk to the tool
 assert_eq "$(code -u "$CREDS" "$U/api/fps?window=;rm%20-rf%20/")" "200" "hostile window is sanitised"
+# prove it, rather than trusting the 200: the stub records its real argv, so we
+# can check the LAST invocation (not just that some earlier, legitimate call
+# happened to use 24h) actually received the sanitised fallback, not the raw
+# hostile string.
+last_fps_argv="$(tail -n 1 "$WORK/fps-argv.log")"
+assert_contains "$last_fps_argv" "--window 24h" "hostile window becomes the sanitised fallback in the tool's argv"
+assert_not_contains "$last_fps_argv" "rm -rf" "hostile window string never reaches the tool"
+
+# a tool that exits non-zero with empty stdout must surface as ok:false, not a
+# silently-successful empty payload (the dashboard's error path depends on this
+# — see run_tool_json). Swap the health-report stub for the broken-tool
+# fixture (which prints nothing on stdout and exits 3) and re-check /api/health.
+cp "$WORK/sbin/palworld-broken-tool" "$WORK/sbin/palworld-health-report"
+broken="$(body -u "$CREDS" "$U/api/health")"
+assert_contains "$broken" '"ok": false' "a tool that exits non-zero with empty stdout reports ok:false"
+
 
 # --- mutations are not available in this increment ------------------------
 assert_eq "$(code -u "$CREDS" -X POST "$U/api/jobs")" "501" "POST /api/jobs is not implemented yet"
