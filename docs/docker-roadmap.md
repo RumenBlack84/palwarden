@@ -70,5 +70,6 @@ Config via env vars → an entrypoint renders `settings.env` and runs
 - Supervisor choice: s6-overlay (smaller, container-native) vs. supervisord
   (simpler to author).
 - How to handle the `palworld-config-parser` binary — keep vendored, or replace
-  with an in-repo parser so the image has no opaque third-party binary
-  (ties into the attribution TODO in [`tools.md`](tools.md#palworld-config-parser)).
+  with an in-repo Python parser so the image has no opaque binary. Purely a
+  maintainability call now; licensing is settled (the project and the binary are
+  both AGPL-3.0 — see [`../CREDITS.md`](../CREDITS.md)).

@@ -203,14 +203,14 @@ Installed to `/usr/local/lib`, not run directly.
 
 `/usr/local/bin/palworld-config-parser` — a **prebuilt static ELF binary** from
 [pelican-eggs/Palworld-Config-Parser-Tool](https://github.com/pelican-eggs)
-(v1.0.23). It edits `Pal/Saved/Config/LinuxServer/PalWorldSettings.ini` in the
-current working directory from environment variables; `palworld-config-apply-env`
-wraps it.
+(v1.0.23), licensed **AGPL-3.0**. It edits
+`Pal/Saved/Config/LinuxServer/PalWorldSettings.ini` in the current working
+directory from environment variables; `palworld-config-apply-env` wraps it.
 
-> ⚠️ **Attribution / licensing TODO:** this binary is committed as a convenience
-> only. Before any long-term or redistributed use we should either rebuild it
-> from upstream source or vendor the source with its license and clear
-> attribution — or replace it with an in-repo parser we control.
+> **Licensing:** `palwarden` is itself AGPL-3.0, so bundling and building on this
+> is consistent — see [`CREDITS.md`](../CREDITS.md). Longer term we may
+> reimplement it in Python to drop the opaque-binary dependency (a
+> maintainability goal, not a licensing requirement).
 
 ---
 

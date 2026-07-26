@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Brian Grant
 """Apply curated Palworld Engine.ini performance overrides from engine.env."""
 
 from __future__ import annotations

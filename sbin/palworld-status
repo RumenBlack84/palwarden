@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Brian Grant
 set -euo pipefail
 SERVICE=palworld.service
 CONFIG=/opt/palworld/server/Pal/Saved/Config/LinuxServer/PalWorldSettings.ini

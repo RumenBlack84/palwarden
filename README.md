@@ -138,19 +138,32 @@ helpers cannot authenticate.
 
 ---
 
-## Third-party components
+## Credits & inspiration
 
-- `bin/palworld-config-parser` — prebuilt from
-  **pelican-eggs/Palworld-Config-Parser-Tool** (v1.0.23). Committed as a
-  convenience binary for now; **before any long-term/redistributed use we should
-  rebuild it from source or vendor it with proper attribution and its license.**
-  See [`docs/tools.md`](docs/tools.md#palworld-config-parser).
-- `webui/PalWorldSettingsEditor.html` — from
-  **BlinkZer0/Palworld-Dedicated-Server-Config-Creator** (MIT). See
-  `webui/README.md`.
+`palwarden` builds on two upstream projects; full attribution and license
+mapping is in [`CREDITS.md`](CREDITS.md):
+
+- **pelican-eggs/Palworld-Config-Parser-Tool** (AGPL-3.0) — the starting point
+  for our config-apply flow (`bin/palworld-config-parser`).
+- **BlinkZer0/Palworld-Dedicated-Server-Config-Creator** (MIT) — the basis for
+  our in-browser config editors (`webui/`); its MIT notice is retained at
+  `webui/LICENSE.upstream-mit`.
 
 Palworld is a trademark of Pocketpair. This tooling is unofficial and not
 affiliated with or endorsed by Pocketpair.
+
+---
+
+## License
+
+`palwarden` is licensed under the **GNU Affero General Public License v3.0 or
+later** (`AGPL-3.0-or-later`) — see [`LICENSE`](LICENSE). In short: it's free and
+open source, you may use, study, modify, and share it, and any distributed or
+network-served derivative must stay open under the same license with notices
+intact. Bundled upstream components keep their own licenses as noted in
+[`CREDITS.md`](CREDITS.md).
+
+Copyright (C) 2026 Brian Grant
 
 ---
 
@@ -160,3 +173,4 @@ affiliated with or endorsed by Pocketpair.
   [`docs/backlog.md`](docs/backlog.md)).
 - All-in-one Docker image bundling the server + tooling (see
   [`docs/docker-roadmap.md`](docs/docker-roadmap.md)).
+- A donation link once the project is public (fully compatible with AGPL).

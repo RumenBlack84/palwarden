@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Brian Grant
 #
 # palwarden installer
 #
@@ -25,7 +27,7 @@ for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=1 ;;
     --force-config) FORCE_CONFIG=1 ;;
-    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    -h|--help) sed -n '5,20p' "$0"; exit 0 ;;
     *) echo "Unknown option: $arg" >&2; exit 64 ;;
   esac
 done

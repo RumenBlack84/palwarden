@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Brian Grant
 set -euo pipefail
 source /usr/local/lib/palworld-notify || true
 START_EPOCH=$(date -u -d '2026-07-10 03:30:00 UTC' +%s)
