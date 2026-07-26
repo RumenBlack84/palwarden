@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Brian Grant
+"""palwarden web UI server: static editors plus a read-only JSON API.
+
+Runs UNPRIVILEGED on purpose. It executes only read-only tools; anything that
+mutates the server is enqueued for the root worker (increment 2), so a bug in
+this HTTP parser cannot restart the game or run SteamCMD.
+
+Every path — including the static editors — requires HTTP Basic auth. Basic over
+plain HTTP is acceptable only because the listener is loopback-bound and remote
+access goes through an SSH tunnel, which supplies the encryption.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import secrets
+import sys
+from pathlib import Path
+
+WEBUI_ENV = Path(os.environ.get("PALWARDEN_WEBUI_ENV", "/etc/palworld/webui.env"))
+
+REQUIRED_KEYS = ("WEBUI_USER", "WEBUI_PASSWORD", "WEBUI_TOKEN")
+
+
+def load_credentials(path: Path = WEBUI_ENV) -> dict[str, str]:
+    """Read KEY="value" lines. Exits with a clear message if unusable."""
+    if not path.is_file():
+        sys.exit(
+            f"error: no web UI credentials at {path}. "
+            "Run 'palwarden-webui --init-credentials' as root to create them."
+        )
+    values: dict[str, str] = {}
+    for raw in path.read_text(errors="replace").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        val = val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+            val = val[1:-1]
+        values[key.strip()] = val
+    missing = [k for k in REQUIRED_KEYS if not values.get(k)]
+    if missing:
+        sys.exit(f"error: web UI credentials in {path} are missing: {', '.join(missing)}")
+    return values
+
+
+def init_credentials(path: Path = WEBUI_ENV) -> tuple[dict[str, str], bool]:
+    """Create the credential file if absent. Never overwrites an existing one."""
+    if path.is_file():
+        return load_credentials(path), False
+    creds = {
+        "WEBUI_USER": os.environ.get("WEBUI_USER") or "admin",
+        "WEBUI_PASSWORD": os.environ.get("WEBUI_PASSWORD") or secrets.token_urlsafe(24),
+        "WEBUI_TOKEN": os.environ.get("WEBUI_TOKEN") or secrets.token_urlsafe(32),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text("".join(f'{k}="{v}"\n' for k, v in creds.items()))
+    tmp.chmod(0o600)
+    tmp.replace(path)
+    return creds, True
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="palwarden web UI server")
+    ap.add_argument("--init-credentials", action="store_true",
+                    help="create /etc/palworld/webui.env if absent, then exit")
+    ap.add_argument("--serve", action="store_true", help="run the HTTP server")
+    args = ap.parse_args()
+
+    if args.init_credentials:
+        creds, created = init_credentials(WEBUI_ENV)
+        if created:
+            print(f"Created {WEBUI_ENV} with new web UI credentials:")
+            for key in REQUIRED_KEYS:
+                print(f"  {key}={creds[key]}")
+            print("Store these now; they are not printed again.")
+        else:
+            print(f"{WEBUI_ENV} already exists; leaving it unchanged.")
+        return 0
+
+    if args.serve:
+        load_credentials(WEBUI_ENV)   # fail closed before binding anything
+        print("serve not implemented yet", file=sys.stderr)
+        return 0
+
+    ap.print_help()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
