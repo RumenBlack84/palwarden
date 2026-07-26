@@ -18,10 +18,16 @@ mkdir -p "$WORK/backups"
 
 ENV_FILE="$WORK/engine.env"
 INI="$WORK/Engine.ini"
+PRETTY="$WORK/Engine.pretty.ini"
+# The managed owner is now applied with fchown, which needs a real uid/gid: point
+# it at whoever runs the suite so the ownership path is genuinely exercised rather
+# than skipped on a host with no palworld user.
+PALWORLD_USER="$(id -un)"; PALWORLD_GROUP="$(id -gn)"
+export PALWORLD_USER PALWORLD_GROUP
 
 check() {
   PALWORLD_ENGINE_INI="$INI" PALWORLD_ENGINE_ENV="$ENV_FILE" \
-  PALWORLD_BACKUP_DIR="$WORK/backups" PALWORLD_ENGINE_PRETTY_INI="$WORK/Engine.pretty.ini" \
+  PALWORLD_BACKUP_DIR="$WORK/backups" PALWORLD_ENGINE_PRETTY_INI="$PRETTY" \
   PALWORLD_FPS_BIN=/bin/true \
     python3 "$ENGINE" status --check 2>&1
 }
@@ -133,7 +139,7 @@ assert_contains "$out" "more than once" "explains the duplicate"
 # entry can be swapped between check and open — so the read uses O_NOFOLLOW.
 rollback() {
   PALWORLD_ENGINE_INI="$INI" PALWORLD_ENGINE_ENV="$ENV_FILE" \
-  PALWORLD_BACKUP_DIR="$WORK/backups" PALWORLD_ENGINE_PRETTY_INI="$WORK/Engine.pretty.ini" \
+  PALWORLD_BACKUP_DIR="$WORK/backups" PALWORLD_ENGINE_PRETTY_INI="$PRETTY" \
   PALWORLD_FPS_BIN=/bin/true \
     python3 "$ENGINE" rollback "$@" 2>&1
 }
@@ -161,6 +167,13 @@ assert_contains "$out" "symlink" "says why the symlink was refused"
 assert_not_contains "$out" "Traceback" "the refusal is a message, not a crash"
 assert_file_not_contains "$INI" "ADMIN_PASSWORD" "the secret never reached Engine.ini"
 assert_file_contains "$INI" "NetServerMaxTickRate=42" "Engine.ini left as it was"
+
+# --dry-run opens nothing, so resolve_backup's lstat pre-flight is the only guard
+# on that path: it must still refuse, rather than printing "Would restore".
+out="$(rollback --dry-run -- Engine.ini.20260101T000000Z)"; rc=$?
+assert_ne "$rc" "0" "a symlinked backup is refused on the --dry-run path too"
+assert_contains "$out" "backup must not be a symlink" "dry-run names the refusal"
+assert_not_contains "$out" "Would restore" "dry-run does not offer to restore a symlink"
 
 # the same refusal must come from the *open*, not only the pre-flight check:
 # call rollback_engine directly with the check monkey-patched away, standing in
@@ -195,7 +208,7 @@ assert_file_not_contains "$INI" "ADMIN_PASSWORD" "the raced swap still published
 # few stamps and redirect root's write onto a file of its choosing.
 apply_cfg() {
   PALWORLD_ENGINE_INI="$INI" PALWORLD_ENGINE_ENV="$ENV_FILE" \
-  PALWORLD_BACKUP_DIR="$WORK/backups" PALWORLD_ENGINE_PRETTY_INI="$WORK/Engine.pretty.ini" \
+  PALWORLD_BACKUP_DIR="$WORK/backups" PALWORLD_ENGINE_PRETTY_INI="$PRETTY" \
   PALWORLD_FPS_BIN=/bin/true \
     python3 "$ENGINE" apply 2>&1
 }
@@ -225,5 +238,134 @@ assert_file_contains "$WORK/victim" "ROOT_ONLY_SECRET_CONTENT" "the victim is un
 assert_eq "$(stat -c %a "$WORK/victim")" "600" "the victim's mode is untouched"
 # refusing the backup must abort the apply: never edit Engine.ini with no backup
 assert_file_contains "$INI" "NetServerMaxTickRate=30" "Engine.ini left alone when the backup failed"
+
+# --- the CONFIG directory is untrusted too, and needs no race ----------------
+# Engine.ini and Engine.pretty.ini live in a directory the unprivileged game/web
+# user owns and must be able to write (the game rewrites Engine.ini itself). So it
+# can simply replace one of those names with a symlink: root then writes through
+# it, chmods 0644 and chowns to that user. No timing involved. Every write to
+# these names is O_NOFOLLOW, with the owner/mode set on that same descriptor.
+rm -f "$WORK/backups"/Engine.ini.*
+
+plant_victim() {  # a root-only file outside the config directory
+  printf 'ROOT_ONLY_SECRET_CONTENT\n' > "$WORK/victim"
+  chmod 0600 "$WORK/victim"
+}
+assert_victim_untouched() {  # $1 = context
+  assert_file_contains "$WORK/victim" "ROOT_ONLY_SECRET_CONTENT" "$1: victim content unchanged"
+  assert_file_not_contains "$WORK/victim" "Human-readable reference copy" "$1: no pretty header written into the victim"
+  assert_file_not_contains "$WORK/victim" "NetServerMaxTickRate" "$1: no managed key written into the victim"
+  assert_eq "$(stat -c %a "$WORK/victim")" "600" "$1: victim mode still 0600"
+  assert_eq "$(stat -c %U "$WORK/victim")" "$(id -un)" "$1: victim owner unchanged"
+}
+
+# apply, with the PRETTY destination symlinked at the victim
+plant_victim
+printf '[/Script/OnlineSubsystemUtils.IpNetDriver]\nNetServerMaxTickRate=30\n' > "$INI"
+rm -f "$PRETTY"; ln -s "$WORK/victim" "$PRETTY"
+out="$(apply_cfg)"; rc=$?
+assert_ne "$rc" "0" "apply refuses a symlinked Engine.pretty.ini"
+assert_contains "$out" "must not be a symlink" "the pretty refusal says it is a symlink"
+assert_contains "$out" "Engine.pretty.ini" "the pretty refusal names the file"
+assert_not_contains "$out" "Too many levels" "the refusal is not raw ELOOP strerror"
+assert_not_contains "$out" "Traceback" "the refusal is a message, not a crash"
+assert_victim_untouched "pretty via apply"
+rm -f "$PRETTY"
+
+# apply, with ENGINE.INI itself symlinked at the victim
+plant_victim
+rm -f "$INI"; ln -s "$WORK/victim" "$INI"
+out="$(apply_cfg)"; rc=$?
+assert_ne "$rc" "0" "apply refuses a symlinked Engine.ini"
+assert_contains "$out" "Engine.ini must not be a symlink" "the Engine.ini refusal is explicit"
+assert_not_contains "$out" "Traceback" "the Engine.ini refusal is a message, not a crash"
+assert_victim_untouched "Engine.ini via apply"
+rm -f "$INI"
+
+# rollback, with Engine.ini symlinked at the victim: refused before the backup's
+# bytes (or root's chown/chmod) reach it
+plant_victim
+printf '[/Script/OnlineSubsystemUtils.IpNetDriver]\nNetServerMaxTickRate=42\n' \
+  > "$WORK/backups/Engine.ini.20260710T182037Z"
+ln -s "$WORK/victim" "$INI"
+out="$(rollback -- Engine.ini.20260710T182037Z)"; rc=$?
+assert_ne "$rc" "0" "rollback refuses a symlinked Engine.ini"
+assert_contains "$out" "Engine.ini must not be a symlink" "the rollback refusal is explicit"
+assert_not_contains "$out" "Traceback" "the rollback refusal is a message, not a crash"
+assert_file_not_contains "$WORK/victim" "NetServerMaxTickRate" "the backup's bytes never reached the victim"
+assert_victim_untouched "Engine.ini via rollback"
+rm -f "$INI"
+
+# ...and the refusal must come from the *destination* open, not only from the
+# pre-rollback read of the current Engine.ini: with save_current=False that read
+# never happens, and the O_NOFOLLOW on the write is the only thing left.
+plant_victim
+ln -s "$WORK/victim" "$INI"
+raced="$(PALWORLD_BACKUP_DIR="$WORK/backups" PALWORLD_FPS_BIN=/bin/true python3 - "$ENGINE" "$WORK" <<'EOF' 2>&1
+import importlib.machinery, importlib.util, sys
+from pathlib import Path
+loader = importlib.machinery.SourceFileLoader("engine_cfg", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+mod = importlib.util.module_from_spec(spec)
+sys.modules[loader.name] = mod  # dataclasses needs the module registered
+loader.exec_module(mod)
+work = Path(sys.argv[2])
+try:
+    mod.rollback_engine("Engine.ini.20260710T182037Z", work / "Engine.ini",
+                        work / "backups", work / "Engine.pretty.ini",
+                        save_current=False)
+    print("WROTE")
+except ValueError as exc:
+    print("REFUSED:", exc)
+EOF
+)"
+assert_contains "$raced" "REFUSED" "the Engine.ini write itself refuses the symlink"
+assert_victim_untouched "Engine.ini write with save_current=False"
+rm -f "$INI"
+
+# --- a legitimate apply/rollback still lands owned and moded as before -------
+printf '[/Script/OnlineSubsystemUtils.IpNetDriver]\nNetServerMaxTickRate=30\n' > "$INI"
+rm -f "$WORK/backups"/Engine.ini.*
+out="$(apply_cfg)"; rc=$?
+assert_eq "$rc" "0" "a legitimate apply succeeds after the hardening"
+assert_file_contains "$INI" "NetServerMaxTickRate=60" "apply still wrote the managed value"
+assert_file_contains "$PRETTY" "Human-readable reference copy" "apply still wrote the pretty copy"
+assert_eq "$(stat -c %a "$INI")" "644" "Engine.ini is 0644"
+assert_eq "$(stat -c %a "$PRETTY")" "644" "Engine.pretty.ini is 0644"
+assert_eq "$(stat -c %U:%G "$PRETTY")" "$(id -un):$(id -gn)" "pretty copy owned by PALWORLD_USER:PALWORLD_GROUP"
+backup_name="$(find "$WORK/backups" -maxdepth 1 -name 'Engine.ini.*' -type f -printf '%f\n')"
+assert_eq "$(stat -c %a "$WORK/backups/$backup_name")" "644" "the backup is 0644"
+assert_eq "$(stat -c %U:%G "$WORK/backups/$backup_name")" "$(id -un):$(id -gn)" "the backup is owned by PALWORLD_USER:PALWORLD_GROUP"
+
+# an unknown owner is a configuration error, reported rather than swallowed —
+# and it must not cost the operator the apply itself
+# (a subshell, not a `VAR=x func` prefix: bash leaks those into the caller)
+out="$(export PALWORLD_USER=definitely-no-such-user; apply_cfg)"; rc=$?
+assert_eq "$rc" "0" "an unknown PALWORLD_USER does not fail the apply"
+assert_contains "$out" "definitely-no-such-user" "names the owner it could not resolve"
+
+# --- two applies in the same UTC second must BOTH succeed --------------------
+# The stamp is second-resolution, so a double-clicked Apply (or a retried
+# engine_save_apply_restart) lands two backups in one second. O_EXCL|O_NOFOLLOW is
+# still on every attempt; only the *name* gives way, with a `-N` suffix.
+same_second=0
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  rm -f "$WORK/backups"/Engine.ini.*
+  printf '[/Script/OnlineSubsystemUtils.IpNetDriver]\nNetServerMaxTickRate=30\n' > "$INI"
+  start="$(date -u +%Y%m%dT%H%M%SZ)"
+  apply_cfg >/dev/null; rc1=$?
+  out2="$(apply_cfg)"; rc2=$?
+  end="$(date -u +%Y%m%dT%H%M%SZ)"
+  if [ "$start" = "$end" ]; then same_second=1; break; fi
+done
+if [ "$same_second" = "1" ]; then
+  assert_eq "$rc1" "0" "first apply in the second succeeds"
+  assert_eq "$rc2" "0" "second apply in the SAME second also succeeds"
+  assert_not_contains "$out2" "File exists" "no EEXIST failure on a same-second collision"
+  assert_contains "$out2" "Backup: $WORK/backups/Engine.ini.$start-1" "the colliding backup got the -1 suffix"
+  assert_eq "$(find "$WORK/backups" -maxdepth 1 -name 'Engine.ini.*' -type f | wc -l | tr -d ' ')" "2" "both backups are on disk"
+else
+  fail "could not get two applies into one UTC second after 10 tries"
+fi
 
 assert_report

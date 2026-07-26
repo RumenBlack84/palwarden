@@ -8,9 +8,10 @@ from __future__ import annotations
 import argparse
 import difflib
 import errno
+import grp
 import os
+import pwd
 import re
-import shutil
 import stat
 import subprocess
 import sys
@@ -242,7 +243,12 @@ def apply_settings(text: str, env_values: dict[str, str]) -> tuple[str, list[tup
 
 
 def write_pretty(engine_ini: Path, pretty_ini: Path) -> None:
-    text = engine_ini.read_text(errors="replace").replace("\r\n", "\n")
+    # Both ends live in the config directory, which the unprivileged game/web user
+    # owns: the read must not be redirected onto a secret (the pretty copy ends up
+    # 0644 and owned by that user), and the write must not be redirected onto an
+    # arbitrary file. See read_nofollow / write_dest_nofollow.
+    raw, _ = read_nofollow(engine_ini, engine_ini.name)
+    text = raw.decode(errors="replace").replace("\r\n", "\n")
     managed = {(s.section, s.key): s for s in SETTINGS}
     lines = ["; Human-readable reference copy. Engine.ini remains canonical.", "; Managed Palworld performance keys are annotated below.", ""]
     current_section: str | None = None
@@ -258,7 +264,7 @@ def write_pretty(engine_ini: Path, pretty_ini: Path) -> None:
             if setting:
                 lines.append(f"; {setting.env}: {setting.description}")
         lines.append(line)
-    pretty_ini.write_text("\n".join(lines).rstrip() + "\n")
+    write_dest_nofollow(pretty_ini, ("\n".join(lines).rstrip() + "\n").encode(), pretty_ini.name)
 
 
 def format_changes(changes: Iterable[tuple[Setting, str | None, str]]) -> str:
@@ -407,9 +413,102 @@ def list_backups(backup_dir: Path) -> list[Path]:
 # own, and reading through a hardlink it *does* own discloses nothing it could not
 # already read. Reading via a descriptor also means we never hand the destination
 # path back to a follow-capable copy.
+#
+# --- and the untrusted *config* directory ------------------------------------
+# The very same primitive, with no race needed at all: Engine.ini,
+# Engine.pretty.ini and their PalWorldSettings siblings live in a directory the
+# game's (and the web UI's) unprivileged user owns and must be able to write —
+# docker/Dockerfile pre-creates it owned by steam, and the game rewrites
+# Engine.ini itself. So that user can simply *replace* one of those names with a
+# symlink and wait: root then writes the pretty copy through it, chmods it 0644
+# and chowns it to the web user. Pointed at /etc/shadow that is full root, via
+# jobd's non-disruptive engine_apply which needs no confirmation.
+#
+# Every write to those destinations therefore goes through write_dest_nofollow (or
+# the O_RDWR open in command_apply), and the owner/mode that follow are applied
+# with fchown/fchmod on that same descriptor — a path-based chown after a safe
+# write is still a check-then-use the attacker can win by swapping the name in
+# afterwards.
+
+MAX_BACKUP_NAME_ATTEMPTS = 20
+_OWNER_WARNED: set[str] = set()
 
 
-def write_new_nofollow(path: Path, data: bytes, mode: int = 0o644) -> None:
+def refuse_symlink(exc: OSError, path: Path, what: str) -> None:
+    """Translate an O_NOFOLLOW open failure into an operator-readable refusal.
+
+    Linux reports ELOOP when O_NOFOLLOW hits a symlink (some BSDs use EMLINK).
+    Left raw that surfaces as "Too many levels of symbolic links", which reads
+    like a filesystem fault when it is in fact us refusing to follow a planted
+    link — a security event, so say so plainly and name the file. Any other errno
+    keeps its own message; EEXIST in particular is usually an innocent same-second
+    collision (see write_new_nofollow, which has to look closer because O_EXCL
+    reports a symlink as EEXIST rather than reaching ELOOP at all).
+    """
+    if exc.errno in (errno.ELOOP, errno.EMLINK):
+        raise ValueError(f"{what} must not be a symlink; refused: {path}") from exc
+
+
+def owner_ids() -> tuple[int, int]:
+    """Numeric uid/gid for PALWORLD_USER/PALWORLD_GROUP.
+
+    fchown() takes numbers only — unlike shutil.chown it cannot resolve a name —
+    so the lookup happens here, and an unknown user or group is reported as the
+    configuration error it is rather than a bare KeyError.
+    """
+    try:
+        uid = pwd.getpwnam(PALWORLD_USER).pw_uid
+    except KeyError as exc:
+        raise LookupError(f"unknown PALWORLD_USER {PALWORLD_USER!r}") from exc
+    try:
+        gid = grp.getgrnam(PALWORLD_GROUP).gr_gid
+    except KeyError as exc:
+        raise LookupError(f"unknown PALWORLD_GROUP {PALWORLD_GROUP!r}") from exc
+    return uid, gid
+
+
+def set_owner_mode_fd(fd: int, path: Path, mode: int = 0o644) -> None:
+    """Apply the managed owner and mode to the file behind `fd`, not behind a name.
+
+    fchown/fchmod act on the inode we just wrote. That is the point: the path-based
+    shutil.chown/os.chmod these replace could be redirected by a symlink swapped in
+    after the write, which is the whole escalation.
+
+    Ownership stays best-effort, as it was before: not being root, or a host with
+    no such user, must not fail an otherwise good apply — but it now says so once
+    instead of silently. The mode is not best-effort; we just created the file.
+    """
+    try:
+        uid, gid = owner_ids()
+        os.fchown(fd, uid, gid)
+    except (LookupError, OSError) as exc:
+        key = f"{PALWORLD_USER}:{PALWORLD_GROUP}"
+        if key not in _OWNER_WARNED:
+            _OWNER_WARNED.add(key)
+            print(f"Warning: cannot set owner {key} on {path}: {exc}", file=sys.stderr)
+    os.fchmod(fd, mode)
+
+
+def write_all(fd: int, data: bytes) -> int:
+    """os.write can be a short write; loop until the buffer is out."""
+    written = 0
+    while written < len(data):
+        written += os.write(fd, data[written:])
+    return written
+
+
+def read_fd_all(fd: int) -> bytes:
+    """Read an open descriptor to EOF, from wherever its offset is."""
+    chunks: list[bytes] = []
+    while True:
+        chunk = os.read(fd, 1 << 20)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def write_new_nofollow(path: Path, data: bytes, mode: int = 0o644) -> Path:
     """Create a NEW file at `path`, refusing to follow a symlink or clobber.
 
     For writes *into* the untrusted backup directory. `O_EXCL | O_NOFOLLOW` means
@@ -417,48 +516,97 @@ def write_new_nofollow(path: Path, data: bytes, mode: int = 0o644) -> None:
     symlink, dangling or not — so a pre-planted link cannot redirect the write,
     and there is no check-then-use window for one to appear in.
 
-    The trade this makes deliberately: two backups written in the same UTC second
-    now fail instead of the second silently overwriting the first. The stamp is
-    second-resolution, so that is possible in principle; failing loudly is the
-    right outcome, because the alternative is being unable to tell an innocent
-    collision from an attack.
+    The security property comes from `O_EXCL | O_NOFOLLOW` being on *every*
+    attempt, not from the name being unique, so an ordinary collision does not
+    have to be fatal: the stamp is second-resolution, and a double-clicked Apply
+    (or an engine_save_apply_restart retried after a failed restart) can land two
+    backups in one UTC second. On EEXIST over a *regular file* we therefore retry
+    `<name>-1`, `-2`, … up to MAX_BACKUP_NAME_ATTEMPTS and return the name actually
+    used. A symlink sitting at the name is a different situation entirely and is
+    refused outright, never retried.
 
-    Note this is *not* used for the Engine.ini destination write, which has the
-    opposite requirement: it must truncate a file that already exists, and it
-    targets a path the attacker does not control.
+    Owner and mode are set through this descriptor (see set_owner_mode_fd), so the
+    caller must not chown the path afterwards.
+
+    Note this is *not* used for the Engine.ini / pretty destinations, which have
+    the opposite requirement: they must truncate a file that already exists. See
+    write_dest_nofollow.
     """
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
-    with os.fdopen(fd, "wb") as fh:
-        fh.write(data)
+    for attempt in range(MAX_BACKUP_NAME_ATTEMPTS):
+        candidate = path if attempt == 0 else path.with_name(f"{path.name}-{attempt}")
+        try:
+            fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+        except OSError as exc:
+            refuse_symlink(exc, candidate, "backup")
+            if exc.errno == errno.EEXIST:
+                # O_CREAT|O_EXCL reports EEXIST for a *symlink* at the name too —
+                # it never gets as far as ELOOP — so errno alone cannot separate an
+                # innocent same-second collision from a planted link. lstat picks
+                # which of the two this is. That is not a security check: the
+                # kernel has already refused to create or write anything. It only
+                # decides the message, and whether a retry is reasonable at all.
+                if candidate.is_symlink():
+                    raise ValueError(
+                        f"backup must not be a symlink; refused: {candidate}") from exc
+                continue
+            raise
+        try:
+            write_all(fd, data)
+            set_owner_mode_fd(fd, candidate, mode)
+        finally:
+            os.close(fd)
+        return candidate
+    raise OSError(errno.EEXIST,
+                  f"no unused backup name after {MAX_BACKUP_NAME_ATTEMPTS} attempts",
+                  str(path))
 
 
-def read_backup_nofollow(backup: Path) -> tuple[bytes, os.stat_result]:
-    """Read a rollback source, refusing to traverse a symlink, via one open().
+def write_dest_nofollow(path: Path, data: bytes, what: str, mode: int = 0o644) -> None:
+    """Overwrite a managed config output in place, refusing to follow a symlink.
+
+    For the destinations in the config directory (Engine.ini's pretty copy, and
+    Engine.ini on the rollback path). `O_EXCL` would be wrong here — these files
+    are legitimately rewritten on every apply — so `O_NOFOLLOW` alone is what
+    refuses a link planted at the name, and it does so in the same syscall that
+    creates the file. Owner/mode go on the descriptor, never the path.
+    """
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, mode)
+    except OSError as exc:
+        refuse_symlink(exc, path, what)
+        raise
+    try:
+        write_all(fd, data)
+        set_owner_mode_fd(fd, path, mode)
+    finally:
+        os.close(fd)
+
+
+def read_nofollow(path: Path, what: str) -> tuple[bytes, os.stat_result]:
+    """Read a file in an attacker-writable directory, refusing to traverse a link.
 
     Returns the contents plus the fstat of the descriptor we actually read, so
     the caller can carry over metadata from the file it really read rather than
     re-stat'ing the (possibly since-swapped) path.
     """
     try:
-        fd = os.open(backup, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     except OSError as exc:
-        # Linux reports ELOOP for O_NOFOLLOW on a symlink; some BSDs use EMLINK.
-        if exc.errno in (errno.ELOOP, errno.EMLINK):
-            raise ValueError(f"backup must not be a symlink: {backup}") from exc
-        raise FileNotFoundError(f"backup not readable: {backup} ({exc.strerror})") from exc
+        refuse_symlink(exc, path, what)
+        raise FileNotFoundError(f"{what} not readable: {path} ({exc.strerror})") from exc
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
-            raise ValueError(f"backup must be a regular file: {backup}")
-        chunks: list[bytes] = []
-        while True:
-            chunk = os.read(fd, 1 << 20)
-            if not chunk:
-                break
-            chunks.append(chunk)
+            raise ValueError(f"{what} must be a regular file: {path}")
+        data = read_fd_all(fd)
     finally:
         os.close(fd)
-    return b"".join(chunks), st
+    return data, st
+
+
+def read_backup_nofollow(backup: Path) -> tuple[bytes, os.stat_result]:
+    """Read a rollback source from the untrusted backup directory."""
+    return read_nofollow(backup, "backup")
 
 
 def resolve_backup(name: str, backup_dir: Path) -> Path:
@@ -483,29 +631,27 @@ def rollback_engine(name: str, ini_path: Path, backup_dir: Path, pretty_path: Pa
     if save_current and ini_path.exists():
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         pre = backup_dir / f"Engine.ini.pre-rollback.{stamp}"
-        write_new_nofollow(pre, ini_path.read_bytes())
-        try:
-            shutil.chown(pre, user=PALWORLD_USER, group=PALWORLD_GROUP)
-        except Exception:
-            pass
+        current, _ = read_nofollow(ini_path, ini_path.name)
+        write_new_nofollow(pre, current)
     # Replaces shutil.copy2(backup, ini_path): same content, and mtime/atime are
     # carried over as copy2 did. The mode copy2 also propagated is dropped, which
-    # changes nothing — the chmod 0644 below always overwrote it.
-    ini_fd = os.open(ini_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
-    with os.fdopen(ini_fd, "wb") as fh:
-        fh.write(data)
-    os.utime(ini_path, ns=(src_st.st_atime_ns, src_st.st_mtime_ns))
+    # changes nothing — the chmod 0644 that always followed overwrote it.
+    # O_NOFOLLOW because the config directory is the game user's: a symlink left at
+    # Engine.ini would otherwise send the backup's bytes (and root's chown/chmod)
+    # to a file of the attacker's choosing.
     try:
-        shutil.chown(ini_path, user=PALWORLD_USER, group=PALWORLD_GROUP)
-    except Exception:
-        pass
-    os.chmod(ini_path, 0o644)
+        ini_fd = os.open(ini_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+    except OSError as exc:
+        refuse_symlink(exc, ini_path, ini_path.name)
+        raise
+    try:
+        write_all(ini_fd, data)
+        os.utime(ini_fd, ns=(src_st.st_atime_ns, src_st.st_mtime_ns))
+        set_owner_mode_fd(ini_fd, ini_path, 0o644)
+    finally:
+        os.close(ini_fd)
+    # write_pretty applies the same owner/mode through its own descriptor.
     write_pretty(ini_path, pretty_path)
-    try:
-        shutil.chown(pretty_path, user=PALWORLD_USER, group=PALWORLD_GROUP)
-    except Exception:
-        pass
-    os.chmod(pretty_path, 0o644)
     return backup
 
 
@@ -702,7 +848,34 @@ def command_apply(args: argparse.Namespace) -> int:
     if not env_values:
         print(f"No known uncommented Engine.ini overrides found in {env_path}")
         return 0
-    before = ini_path.read_text(errors="replace")
+    # One descriptor for both the read and the write. Engine.ini sits in a
+    # directory the unprivileged user owns, so re-opening it by name to write the
+    # result would be a TOCTOU: swap the file for a symlink between the two and
+    # root writes attacker-authored bytes to an attacker-chosen path. O_NOFOLLOW
+    # refuses a link that is there already, and reusing the descriptor means no
+    # window exists for one to appear. --dry-run needs no write access.
+    flags = (os.O_RDONLY if args.dry_run else os.O_RDWR) | os.O_NOFOLLOW
+    try:
+        ini_fd = os.open(ini_path, flags)
+    except OSError as exc:
+        try:
+            refuse_symlink(exc, ini_path, ini_path.name)
+        except ValueError as refusal:
+            print(str(refusal), file=sys.stderr)
+            return 1
+        print(f"Cannot read {ini_path}: {exc.strerror}", file=sys.stderr)
+        return 1
+    try:
+        return _apply_with_fd(args, ini_fd, ini_path, backup_dir, pretty_path, env_values)
+    finally:
+        os.close(ini_fd)
+
+
+def _apply_with_fd(args: argparse.Namespace, ini_fd: int, ini_path: Path,
+                   backup_dir: Path, pretty_path: Path, env_values: dict[str, str]) -> int:
+    """The body of command_apply, once Engine.ini is open on a trusted descriptor."""
+    raw = read_fd_all(ini_fd)
+    before = raw.decode(errors="replace")
     try:
         after, changes = apply_settings(before, env_values)
     except ValueError as exc:
@@ -714,25 +887,29 @@ def command_apply(args: argparse.Namespace) -> int:
     if not args.dry_run:
             # Reachable from the web UI as the engine_apply / engine_save_apply_restart
             # jobd actions, so the backup name is a write into a directory the
-            # requester owns; see write_new_nofollow.
+            # requester owns; see write_new_nofollow. The bytes are the ones we read
+            # through ini_fd, not a second read of the name.
             try:
-                write_new_nofollow(backup, ini_path.read_bytes())
-            except OSError as exc:
-                print(f"Cannot write backup {backup}: {exc.strerror}", file=sys.stderr)
+                backup = write_new_nofollow(backup, raw)
+            except (OSError, ValueError) as exc:
+                reason = exc.strerror if isinstance(exc, OSError) and exc.strerror else str(exc)
+                print(f"Cannot write backup {backup}: {reason}", file=sys.stderr)
                 return 1
-            ini_path.write_text(after)
+            payload = after.encode()
+            os.lseek(ini_fd, 0, os.SEEK_SET)
+            write_all(ini_fd, payload)
+            os.ftruncate(ini_fd, len(payload))
+            set_owner_mode_fd(ini_fd, ini_path, 0o644)
+            # write_pretty applies the same owner/mode through its own descriptor.
+            # A refusal here comes after Engine.ini is already updated, so say that
+            # too: the apply itself stands, only the reference copy is missing.
             try:
-                shutil.chown(backup, user="palworld", group="palworld")
-                shutil.chown(ini_path, user="palworld", group="palworld")
-            except Exception:
-                pass
-            os.chmod(ini_path, 0o644)
-            write_pretty(ini_path, pretty_path)
-            try:
-                shutil.chown(pretty_path, user="palworld", group="palworld")
-            except Exception:
-                pass
-            os.chmod(pretty_path, 0o644)
+                write_pretty(ini_path, pretty_path)
+            except (ValueError, OSError) as exc:
+                print(str(exc), file=sys.stderr)
+                print(f"Updated {ini_path} (backup: {backup}), but could not write "
+                      f"the reference copy {pretty_path}", file=sys.stderr)
+                return 1
     summary = format_changes(changes)
     print(summary)
     if args.dry_run:
@@ -747,7 +924,13 @@ def command_apply(args: argparse.Namespace) -> int:
 
 
 def command_pretty(args: argparse.Namespace) -> int:
-    write_pretty(Path(args.ini), Path(args.pretty))
+    # A symlink at either end is refused by write_pretty; report it like any other
+    # unusable path instead of as a traceback.
+    try:
+        write_pretty(Path(args.ini), Path(args.pretty))
+    except (ValueError, OSError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     print(args.pretty)
     return 0
 

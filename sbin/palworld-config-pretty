@@ -3,37 +3,89 @@
 # SPDX-FileCopyrightText: 2026 Brian Grant
 set -euo pipefail
 PALWORLD_USER="${PALWORLD_USER:-palworld}"; PALWORLD_GROUP="${PALWORLD_GROUP:-palworld}"
-dst=/opt/palworld/server/Pal/Saved/Config/LinuxServer/PalWorldSettings.pretty.ini
-python3 - <<"PY"
-from pathlib import Path
-src=Path("/opt/palworld/server/Pal/Saved/Config/LinuxServer/PalWorldSettings.ini")
-dst=Path("/opt/palworld/server/Pal/Saved/Config/LinuxServer/PalWorldSettings.pretty.ini")
-text=src.read_text(errors="ignore").replace("\r\n","\n")
-lines=[]
+cfg_dir=/opt/palworld/server/Pal/Saved/Config/LinuxServer
+src="${PALWORLD_CONFIG_FILE:-$cfg_dir/PalWorldSettings.ini}"
+dst="${PALWORLD_CONFIG_PRETTY_INI:-$cfg_dir/PalWorldSettings.pretty.ini}"
+# The write, the chown and the chmod all happen inside python, on one descriptor.
+# This runs as root (via jobd's config_pretty action, which needs no confirmation)
+# against a directory the unprivileged game/web user owns and must be able to
+# write. A symlink planted at either name would otherwise be followed: root's
+# write lands on the target, and the shell `chown`/`chmod` that used to follow
+# would hand it to the web user 0644 — /etc/shadow included. O_NOFOLLOW makes the
+# kernel refuse the link at open() time, and fchown/fchmod act on the inode we
+# just wrote, which no later rename can redirect. O_EXCL is deliberately not used:
+# this file is legitimately rewritten on every run.
+python3 - "$src" "$dst" "$PALWORLD_USER" "$PALWORLD_GROUP" <<"PY"
+import errno, grp, os, pwd, sys
+
+src, dst, user, group = sys.argv[1:5]
+
+
+def open_nofollow(path, flags, mode=0o644):
+    try:
+        return os.open(path, flags | os.O_NOFOLLOW, mode)
+    except OSError as exc:
+        # Linux reports ELOOP for O_NOFOLLOW on a symlink; some BSDs use EMLINK.
+        # Raw, that reads as "Too many levels of symbolic links" — a filesystem
+        # fault — when it is really us refusing a planted link, so name the file.
+        if exc.errno in (errno.ELOOP, errno.EMLINK):
+            sys.exit(f"{path} must not be a symlink; refused")
+        sys.exit(f"cannot open {path}: {exc.strerror}")
+
+
+fd = open_nofollow(src, os.O_RDONLY)
+try:
+    chunks = []
+    while True:
+        chunk = os.read(fd, 1 << 20)
+        if not chunk:
+            break
+        chunks.append(chunk)
+finally:
+    os.close(fd)
+text = b"".join(chunks).decode(errors="ignore").replace("\r\n", "\n")
+
+lines = []
 for line in text.splitlines():
     if not line.startswith("OptionSettings=("):
         lines.append(line); continue
-    body=line[len("OptionSettings=("):-1] if line.endswith(")") else line[len("OptionSettings=("):]
-    parts=[]; cur=[]; depth=0; in_str=False; esc=False
+    body = line[len("OptionSettings=("):-1] if line.endswith(")") else line[len("OptionSettings=("):]
+    parts = []; cur = []; depth = 0; in_str = False; esc = False
     for ch in body:
         if esc:
-            cur.append(ch); esc=False; continue
-        if ch=="\\" and in_str:
-            cur.append(ch); esc=True; continue
-        if ch=="\"":
-            in_str=not in_str; cur.append(ch); continue
+            cur.append(ch); esc = False; continue
+        if ch == "\\" and in_str:
+            cur.append(ch); esc = True; continue
+        if ch == "\"":
+            in_str = not in_str; cur.append(ch); continue
         if not in_str:
-            if ch=="(": depth+=1
-            elif ch==")" and depth: depth-=1
-            elif ch=="," and depth==0:
-                parts.append("".join(cur).strip()); cur=[]; continue
+            if ch == "(": depth += 1
+            elif ch == ")" and depth: depth -= 1
+            elif ch == "," and depth == 0:
+                parts.append("".join(cur).strip()); cur = []; continue
         cur.append(ch)
     if cur: parts.append("".join(cur).strip())
     lines += ["; Human-readable reference only. PalworldSettings.ini remains canonical.", "; This is Unreal Engine config syntax, not JSON.", "OptionSettings=("]
-    lines += [f"    {p}{"," if i < len(parts)-1 else ""}" for i,p in enumerate(parts)]
+    lines += [f"    {p}{',' if i < len(parts) - 1 else ''}" for i, p in enumerate(parts)]
     lines.append(")")
-dst.write_text("\n".join(lines)+"\n")
+
+data = ("\n".join(lines) + "\n").encode()
+fd = open_nofollow(dst, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+try:
+    written = 0
+    while written < len(data):
+        written += os.write(fd, data[written:])
+    # Ownership is best-effort — no such user on the host, or not running as
+    # root, must not fail an otherwise good render — but it says so when it fails.
+    try:
+        os.fchown(fd, pwd.getpwnam(user).pw_uid, grp.getgrnam(group).gr_gid)
+    except KeyError as exc:
+        print(f"Warning: unknown owner {user}:{group} ({exc}); leaving {dst} as is",
+              file=sys.stderr)
+    except OSError as exc:
+        print(f"Warning: cannot set owner {user}:{group} on {dst}: {exc}", file=sys.stderr)
+    os.fchmod(fd, 0o644)
+finally:
+    os.close(fd)
 PY
-chown "$PALWORLD_USER:$PALWORLD_GROUP" "$dst"
-chmod 0644 "$dst"
 echo "$dst"

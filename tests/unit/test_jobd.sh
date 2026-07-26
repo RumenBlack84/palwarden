@@ -321,6 +321,23 @@ jobd --once >/dev/null 2>&1
 assert_eq "$(state_of "$id")" "succeeded" "rollback to a real backup succeeds"
 assert_file_contains "$WORK/argv.log" "palworld-engine-config rollback -- Engine.ini.20260710T182037Z" "rollback argv exact"
 
+# the `-N` suffix palworld-engine-config adds when two applies land in the same
+# UTC second is part of the legitimate name shape: those backups must be rollable
+echo "[/script/onlineSubsystemUtils.ipnetdriver]" > "$WORK/backups/Engine.ini.20260710T182037Z-1"
+: > "$WORK/argv.log"
+id="$(enqueue engine_rollback '{"backup": "Engine.ini.20260710T182037Z-1", "confirm": true}')"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "succeeded" "a same-second -1 backup can be rolled back"
+assert_file_contains "$WORK/argv.log" "rollback -- Engine.ini.20260710T182037Z-1" "the -1 name passed verbatim"
+
+# ...but the suffix is digits only; it is not a licence for arbitrary trailing text
+: > "$WORK/argv.log"
+echo "[whatever]" > "$WORK/backups/Engine.ini.20260710T182037Z-pwn"
+id="$(enqueue engine_rollback '{"backup": "Engine.ini.20260710T182037Z-pwn", "confirm": true}')"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "failed" "a non-numeric suffix is still off-pattern"
+assert_eq "$(wc -c < "$WORK/argv.log" | tr -d ' ')" "0" "off-pattern suffix never reached a command"
+
 echo "ADMIN_PASSWORD=hunter2" > "$WORK/etc/settings.env"
 ln -sf "$WORK/etc/settings.env" "$WORK/backups/Engine.ini.20260101T000000Z"
 : > "$WORK/argv.log"
