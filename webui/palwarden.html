@@ -4,6 +4,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>palwarden</title>
 <style>
   /* Design tokens — the only place raw colors appear. Shared with future pages;
@@ -16,26 +17,56 @@
     --pw-accent: #8ab4f8;
     --pw-space-1: 4px; --pw-space-2: 8px; --pw-space-3: 16px; --pw-space-4: 24px;
     --pw-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+    --pw-sans: system-ui, -apple-system, "Segoe UI", sans-serif;
   }
-  body { font: 14px/1.5 system-ui, sans-serif; margin: 0; padding: var(--pw-space-4);
+  * { box-sizing: border-box; }
+  body { font: 14px/1.5 var(--pw-sans); margin: 0;
          background: var(--pw-bg); color: var(--pw-fg); }
-  h1 { font-size: 1.1rem; margin: 0 0 var(--pw-space-3); letter-spacing: .08em;
-       font-family: var(--pw-mono); }
   a { color: var(--pw-accent); }
   :focus-visible { outline: 2px solid var(--pw-accent); outline-offset: 2px; }
 
-  .pw-grid { display: grid; gap: var(--pw-space-3);
-             grid-template-columns: repeat(auto-fit, minmax(19rem, 1fr)); }
-  .pw-card { background: var(--pw-surface); border: 1px solid var(--pw-border);
-             border-radius: 6px; padding: var(--pw-space-3); }
-  .pw-card > h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .1em;
-                  color: var(--pw-fg-muted); margin: 0 0 var(--pw-space-2); }
+  /* pw-nav: slim header bar with the wordmark and a segmented tab control. */
+  .pw-nav { display: flex; align-items: center; justify-content: space-between;
+            gap: var(--pw-space-3); padding: var(--pw-space-2) var(--pw-space-4);
+            border-bottom: 1px solid var(--pw-border); background: var(--pw-surface);
+            flex-wrap: wrap; }
+  .pw-nav__wordmark { font-family: var(--pw-mono); font-size: 1.1rem;
+                       letter-spacing: .08em; color: var(--pw-fg); }
+  .pw-nav__tabs { display: flex; gap: 2px; background: var(--pw-bg);
+                  border: 1px solid var(--pw-border); border-radius: 8px; padding: 2px; }
+  .pw-tab { font-family: var(--pw-sans); font-size: .82rem; color: var(--pw-fg-muted);
+            text-decoration: none; padding: var(--pw-space-1) var(--pw-space-3);
+            border-radius: 6px; }
+  .pw-tab:hover { color: var(--pw-fg); }
+  .pw-tab[aria-current="page"] { background: var(--pw-surface); color: var(--pw-fg);
+                                  border: 1px solid var(--pw-border); }
 
-  /* pw-stats: label/value grid. Labels are prose, values are monospace. */
-  .pw-stats { display: grid; grid-template-columns: auto 1fr;
-              gap: var(--pw-space-1) var(--pw-space-2); margin: 0; }
-  .pw-stats dt { color: var(--pw-fg-muted); }
-  .pw-stats dd { margin: 0; font-family: var(--pw-mono); }
+  .pw-page { padding: var(--pw-space-4); }
+
+  /* pw-banner: the nameplate + vitals readout, the signature element. */
+  .pw-banner { background: var(--pw-surface); border: 1px solid var(--pw-border);
+               border-radius: 8px; padding: var(--pw-space-4); margin-bottom: var(--pw-space-4); }
+  .pw-banner__name { display: flex; align-items: baseline; gap: var(--pw-space-3);
+                      flex-wrap: wrap; }
+  .pw-banner__name h1 { font-family: var(--pw-mono); font-size: 2.2rem; font-weight: 600;
+                         margin: 0; letter-spacing: -.01em; }
+  .pw-banner__meta { margin: var(--pw-space-2) 0 0; color: var(--pw-fg-muted);
+                      font-size: .85rem; }
+  .pw-banner__meta span { font-family: var(--pw-mono); }
+
+  /* pw-vitals: four large-numeral readout cells. */
+  .pw-vitals { display: grid; grid-template-columns: repeat(4, 1fr);
+               gap: var(--pw-space-3); margin-top: var(--pw-space-4); }
+  .pw-vitals__cell { border-top: 1px solid var(--pw-border); padding-top: var(--pw-space-2); }
+  .pw-vitals__label { display: block; font-family: var(--pw-sans); font-size: .7rem;
+                       text-transform: uppercase; letter-spacing: .12em;
+                       color: var(--pw-fg-muted); margin-bottom: var(--pw-space-1); }
+  .pw-vitals__value { display: block; font-family: var(--pw-mono); font-size: 2rem;
+                       line-height: 1.1; }
+  .pw-vitals__value--warn { color: var(--pw-warn); }
+  .pw-vitals__value--bad { color: var(--pw-bad); }
+  .pw-vitals__sub { display: block; font-family: var(--pw-mono); font-size: .78rem;
+                    color: var(--pw-fg-muted); margin-top: var(--pw-space-1); }
 
   /* pw-pill: state badge. Always carries a text label — never color alone. */
   .pw-pill { display: inline-block; padding: 0 var(--pw-space-2); border-radius: 999px;
@@ -44,29 +75,90 @@
   .pw-pill--ok { color: var(--pw-ok); } .pw-pill--warn { color: var(--pw-warn); }
   .pw-pill--bad { color: var(--pw-bad); } .pw-pill--idle { color: var(--pw-idle); }
 
+  /* pw-grid: detail cards below the banner, with hierarchy via column span. */
+  .pw-grid { display: grid; gap: var(--pw-space-3);
+             grid-template-columns: repeat(6, 1fr); }
+  .pw-card { background: var(--pw-surface); border: 1px solid var(--pw-border);
+             border-radius: 6px; padding: var(--pw-space-3);
+             grid-column: span 2; }
+  .pw-card--wide { grid-column: span 3; }
+  .pw-card > h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .1em;
+                  color: var(--pw-fg-muted); margin: 0 0 var(--pw-space-2);
+                  font-family: var(--pw-sans); }
+
+  /* pw-stats: label/value grid. Labels are prose, values are monospace. */
+  .pw-stats { display: grid; grid-template-columns: auto 1fr;
+              gap: var(--pw-space-1) var(--pw-space-2); margin: 0; }
+  .pw-stats dt { color: var(--pw-fg-muted); }
+  .pw-stats dd { margin: 0; font-family: var(--pw-mono); }
+
   .pw-log { margin: 0; white-space: pre-wrap; word-break: break-word; max-height: 14rem;
             overflow: auto; font-family: var(--pw-mono); color: var(--pw-fg); }
   .pw-empty { color: var(--pw-fg-muted); font-style: italic; }
-  footer { margin-top: var(--pw-space-4); color: var(--pw-fg-muted); font-size: .8rem; }
+
+  @media (max-width: 900px) {
+    .pw-vitals { grid-template-columns: repeat(2, 1fr); }
+    .pw-grid { grid-template-columns: 1fr; }
+    .pw-card, .pw-card--wide { grid-column: span 1; }
+  }
+  @media (max-width: 480px) {
+    .pw-vitals { grid-template-columns: 1fr; }
+    .pw-vitals__cell { border-top: none; border-left: 2px solid var(--pw-border);
+                        padding-top: 0; padding-left: var(--pw-space-2); }
+    .pw-banner__name h1 { font-size: 1.6rem; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; animation: none !important; }
+  }
+  .pw-pill, .pw-vitals__value { transition: color .15s ease; }
 </style>
 </head>
 <body>
 <div id="palwarden-dashboard">
-  <h1>palwarden</h1>
-  <div class="pw-grid">
-    <section class="pw-card"><h2>Server</h2><dl class="pw-stats" id="server"></dl></section>
-    <section class="pw-card"><h2>Performance</h2><dl class="pw-stats" id="fps"></dl></section>
-    <section class="pw-card"><h2>Restarts &amp; outages</h2><dl class="pw-stats" id="events"></dl></section>
-    <section class="pw-card"><h2>Engine.ini</h2><pre class="pw-log" id="engine" aria-live="polite">…</pre></section>
-    <section class="pw-card"><h2>Backups</h2><pre class="pw-log" id="backups" aria-live="polite">…</pre></section>
-    <section class="pw-card"><h2>Snapshots</h2><pre class="pw-log" id="snapshots" aria-live="polite">…</pre></section>
+  <nav class="pw-nav">
+    <span class="pw-nav__wordmark">palwarden</span>
+    <div class="pw-nav__tabs">
+      <a class="pw-tab" href="palwarden.html" aria-current="page">Dashboard</a>
+      <a class="pw-tab" href="PalWorldSettingsEditor.html">Server settings</a>
+      <a class="pw-tab" href="EngineIniPerformanceEditor.html">Engine.ini performance</a>
+    </div>
+  </nav>
+  <div class="pw-page">
+    <section class="pw-banner">
+      <div class="pw-banner__name">
+        <h1 id="server-name">palwarden</h1>
+        <span class="pw-pill pw-pill--idle" id="server-pill">UNKNOWN</span>
+      </div>
+      <p class="pw-banner__meta" id="server-meta">version — · pid —</p>
+      <div class="pw-vitals" id="vitals">
+        <div class="pw-vitals__cell">
+          <span class="pw-vitals__label">Players</span>
+          <span class="pw-vitals__value" id="vital-players">—</span>
+        </div>
+        <div class="pw-vitals__cell">
+          <span class="pw-vitals__label">Avg FPS</span>
+          <span class="pw-vitals__value" id="vital-fps">—</span>
+        </div>
+        <div class="pw-vitals__cell">
+          <span class="pw-vitals__label">Restarts</span>
+          <span class="pw-vitals__value" id="vital-restarts">—</span>
+          <span class="pw-vitals__sub" id="vital-restarts-sub"></span>
+        </div>
+        <div class="pw-vitals__cell">
+          <span class="pw-vitals__label">Engine drift</span>
+          <span class="pw-vitals__value" id="vital-drift">—</span>
+        </div>
+      </div>
+    </section>
+
+    <div class="pw-grid">
+      <section class="pw-card pw-card--wide"><h2>Performance</h2><dl class="pw-stats" id="fps"></dl></section>
+      <section class="pw-card pw-card--wide"><h2>Restarts &amp; outages</h2><dl class="pw-stats" id="events"></dl></section>
+      <section class="pw-card"><h2>Engine.ini</h2><pre class="pw-log" id="engine" aria-live="polite">…</pre></section>
+      <section class="pw-card"><h2>Backups</h2><pre class="pw-log" id="backups" aria-live="polite">…</pre></section>
+      <section class="pw-card"><h2>Snapshots</h2><pre class="pw-log" id="snapshots" aria-live="polite">…</pre></section>
+    </div>
   </div>
-  <footer>
-    Config editors:
-    <a href="PalWorldSettingsEditor.html">server settings</a> ·
-    <a href="EngineIniPerformanceEditor.html">Engine.ini performance</a>.
-    Actions arrive in a later increment; this panel is read-only.
-  </footer>
 </div>
 <script>
 // The API token is only needed for mutating calls (increment 2). It is kept in
@@ -132,6 +224,17 @@ function putEmpty(id, message) {
   dl.append(dt, dd);
 }
 
+// Sets a vitals cell's large numeral, an optional muted sub-line, and an
+// optional warn/bad color (text is always present regardless of color).
+function vital(id, value, level, sub) {
+  const el = document.getElementById("vital-" + id);
+  el.textContent = value;
+  el.classList.toggle("pw-vitals__value--warn", level === "warn");
+  el.classList.toggle("pw-vitals__value--bad", level === "bad");
+  const subEl = document.getElementById("vital-" + id + "-sub");
+  if (subEl) subEl.textContent = sub || "";
+}
+
 async function refresh() {
   try {
     const h = await get("/api/health");
@@ -140,14 +243,28 @@ async function refresh() {
     const d = h.data || {};
     const svc = d.service || {};
     const api = (d.api && d.api.metrics) || {};
-    put("server", [
-      ["state", (svc.active_state || "?") + "/" + (svc.sub_state || "?"),
-       svc.active_state === "active" ? "ok" : "bad"],
-      ["pid", svc.main_pid || "n/a"],
-      ["players", (api.currentplayernum ?? "?") + "/" + (api.maxplayernum ?? "?")],
-      ["buildid", d.buildid || "unknown"],
-    ]);
-  } catch (e) { putEmpty("server", String(e && e.message || e)); }
+    const active = svc.active_state === "active";
+    const pill = document.getElementById("server-pill");
+    pill.className = "pw-pill pw-pill--" + (active ? "ok" : "bad");
+    pill.textContent = active ? "RUNNING" : "STOPPED";
+    document.getElementById("server-meta").textContent =
+      "version " + (d.buildid || "unknown") + " · pid " + (svc.main_pid || "n/a");
+    vital("players", (api.currentplayernum ?? "?") + "/" + (api.maxplayernum ?? "?"));
+  } catch (e) {
+    const pill = document.getElementById("server-pill");
+    pill.className = "pw-pill pw-pill--idle";
+    pill.textContent = "UNKNOWN";
+    document.getElementById("server-meta").textContent = String(e && e.message || e);
+    vital("players", "n/a");
+  }
+
+  try {
+    const c = await get("/api/config");
+    const err = payloadError(c);
+    if (err) throw new Error(err);
+    const d = c.data || {};
+    document.getElementById("server-name").textContent = d.ServerName || "palwarden";
+  } catch (e) { /* nameplate keeps its default; the error already surfaces above */ }
 
   try {
     const f = await get("/api/fps?window=24h");
@@ -159,7 +276,8 @@ async function refresh() {
       ["1% low", w.low_1 ?? w["1%_low"] ?? "n/a"],
       ["samples", w.samples ?? "n/a"],
     ]);
-  } catch (e) { putEmpty("fps", String(e && e.message || e)); }
+    vital("fps", w.avg ?? "n/a");
+  } catch (e) { putEmpty("fps", String(e && e.message || e)); vital("fps", "n/a"); }
 
   try {
     const s = await get("/api/service-events?since=24h");
@@ -171,14 +289,18 @@ async function refresh() {
       ["unexpected", d.unexpected ?? "n/a", (d.unexpected > 0) ? "warn" : "ok"],
       ["outages", d.outages ?? "n/a", (d.outages > 0) ? "warn" : "ok"],
     ]);
-  } catch (e) { putEmpty("events", String(e && e.message || e)); }
+    const unexpected = d.unexpected > 0;
+    vital("restarts", d.restarts ?? "n/a", unexpected ? "warn" : null,
+          unexpected ? d.unexpected + " unexpected" : "");
+  } catch (e) { putEmpty("events", String(e && e.message || e)); vital("restarts", "n/a"); }
 
   try {
     const e = await get("/api/engine");
     const err = payloadError(e);
     if (err) throw new Error(err);
     text("engine", (e.drift_ok ? "OK — " : "DRIFT — ") + (e.text || ""));
-  } catch (e) { text("engine", String(e && e.message || e), true); }
+    vital("drift", e.drift_ok ? "OK" : "DRIFT", e.drift_ok ? null : "warn");
+  } catch (e) { text("engine", String(e && e.message || e), true); vital("drift", "n/a"); }
 
   for (const [id, path] of [["backups", "/api/backups"], ["snapshots", "/api/snapshots"]]) {
     try {
@@ -187,7 +309,7 @@ async function refresh() {
       if (err) throw new Error(err);
       const list = r.data || [];
       if (list.length) text(id, list.map(x => x.name).join("\n"));
-      else text(id, "(none)", true);
+      else text(id, "No " + id + " yet — run palworld-" + id.replace(/s$/, ""), true);
     } catch (e) { text(id, String(e && e.message || e), true); }
   }
 }
