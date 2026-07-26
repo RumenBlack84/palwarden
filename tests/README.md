@@ -43,6 +43,11 @@ integration tests as separate jobs on every push / PR.
   scenarios: mode-based service selection, the systemctl shim, env-driven config
   application (`RESTAPIEnabled=True`), external-mode telemetry against a REST
   stub, container-native graceful restart, and graceful save-on-stop.
+- `integration/test_persistence.sh` — drives the real `docker/compose.yaml`
+  (own project + ports) to prove `compose down` then `up` preserves the world and
+  config: the nested `palworld-saved` submount holds the saves, `down` without
+  `-v` keeps the volumes, and a second boot re-applies config through the
+  pre-existing `chattr +i` lock.
 - `integration/test_update_apply.sh` — simulates a new Steam build and drives the
   full `palworld-update` apply flow in-container (graceful stop → fake SteamCMD
   install → restart → event markers), plus the already-current no-op case.

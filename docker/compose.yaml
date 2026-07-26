@@ -25,12 +25,18 @@ services:
     image: palwarden:latest
     container_name: palwarden
     profiles: ["embedded"]
+    # Pass .env straight through to the container as well as using it for
+    # interpolation below. This is what makes open-ended settings work — notably
+    # every PALWORLD_CFG_<KEY> applied to PalWorldSettings.ini, which compose
+    # cannot enumerate here.
+    env_file:
+      - path: .env
+        required: false
     environment:
       PALWARDEN_MODE: embedded
       UPDATE_ON_START: ${UPDATE_ON_START:-true}
-      # Telemetry/management need the REST API admin password. For embedded, the
-      # server's PalWorldSettings.ini must also enable the REST API with this
-      # same password (server-config rendering lands in a later increment).
+      # Telemetry/management need the REST API admin password; setting it also
+      # enables the server's REST API via PalWorldSettings.ini on boot.
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       DISCORD_WEBHOOK: ${DISCORD_WEBHOOK:-}
       PALWORLD_REST_PORT: ${PALWORLD_REST_PORT:-8212}
@@ -69,6 +75,9 @@ services:
     image: palwarden:latest
     container_name: palwarden-external
     profiles: ["external"]
+    env_file:
+      - path: .env
+        required: false
     environment:
       PALWARDEN_MODE: external
       # Required for external mode; validated by the entrypoint at start.

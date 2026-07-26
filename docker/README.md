@@ -68,6 +68,25 @@ capability — the tooling then **warns and runs unprotected** rather than faili
 Manual control: `palworld-config-protect {status|lock|unlock}` and
 `palworld-engine-config {lock|unlock}`.
 
+> **Deleting volumes needs an unlock first.** An immutable file cannot be
+> unlinked, so `docker compose down -v` fails with
+> `operation not permitted ... PalWorldSettings.ini`. Unlock while the container
+> is still up:
+>
+> ```bash
+> docker compose exec palwarden palworld-config-protect unlock
+> docker compose exec palwarden palworld-engine-config unlock   # if Engine.ini is managed
+> docker compose down -v
+> ```
+>
+> If the container is already gone, clear the bit from a throwaway container:
+>
+> ```bash
+> docker run --rm --user root --cap-add LINUX_IMMUTABLE \
+>   -v palwarden_palworld-saved:/v palwarden:latest \
+>   sh -c 'find /v -type f -exec chattr -i {} +'
+> ```
+
 ### Host-ism shims
 
 The tooling was written for a systemd host. Two shims (installed only in the
@@ -103,9 +122,13 @@ works with no hand-editing.
 
 ### Server settings (embedded)
 
-Any `PALWORLD_CFG_<KEY>` env var is applied to `PalWorldSettings.ini` before the
-server starts — e.g. `PALWORLD_CFG_SERVER_NAME`, `PALWORLD_CFG_MAX_PLAYERS`,
-`PALWORLD_CFG_SERVER_PASSWORD`. See [`.env.example`](.env.example).
+Any `PALWORLD_CFG_<KEY>` in your `.env` is applied to `PalWorldSettings.ini`
+before the server starts — e.g. `PALWORLD_CFG_SERVER_NAME`,
+`PALWORLD_CFG_MAX_PLAYERS`, `PALWORLD_CFG_SERVER_PASSWORD`. See
+[`.env.example`](.env.example). Compose passes `.env` into the container
+(`env_file`) as well as using it for interpolation, which is what makes these
+open-ended keys work — setting them only in your shell will *not* reach the
+container.
 
 ## Quick start — embedded (self-contained server)
 

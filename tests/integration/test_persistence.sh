@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Brian Grant
+#
+# Volume persistence: `docker compose down` followed by `up` must preserve the
+# world and the config. Exercises the real docker/compose.yaml, including the
+# nested submount (palworld-saved mounted *inside* palworld-server) and the
+# chattr +i protection, so a second boot has to cope with an already-locked
+# config file.
+#
+# Runs under its own compose project/ports so it cannot disturb a real stack.
+set -u
+DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO="$(cd "$DIR/../.." && pwd)"
+source "$DIR/../lib/assert.sh"
+
+PROJECT="palwarden-persist-test"
+FAKE="$REPO/tests/fixtures/fake-server"
+WORK="$(mktemp -d)"
+
+export COMPOSE_PROFILES=embedded
+export UPDATE_ON_START=false
+export ADMIN_PASSWORD=persistTest
+export PALWORLD_GAME_PORT=18211
+export WEBUI_PORT=18088
+
+# Server settings go through an env file, the documented mechanism (compose
+# forwards .env into the container so open-ended PALWORLD_CFG_* keys work).
+set_server_name() { printf 'PALWORLD_CFG_SERVER_NAME=%s\n' "$1" > "$WORK/test.env"; }
+set_server_name "persistence probe"
+
+# Distinct container name so a running stack does not clash.
+cat > "$WORK/override.yml" <<EOF
+services:
+  palwarden:
+    container_name: palwarden-persist-test
+    env_file:
+      - path: $WORK/test.env
+        required: true
+EOF
+
+dc() { docker compose -p "$PROJECT" -f "$REPO/docker/compose.yaml" -f "$WORK/override.yml" "$@"; }
+cleanup() {
+  # A chattr +i config file cannot be unlinked, so Docker refuses to delete the
+  # volume containing it: unlock before tearing down.
+  docker exec --user root palwarden-persist-test palworld-config-protect unlock >/dev/null 2>&1 || true
+  dc down -v --remove-orphans >/dev/null 2>&1 || true
+  # Belt and braces: volumes seeded with `docker run -v` lack compose's labels
+  # (so `down -v` skips them), and anything still locked needs clearing first.
+  for v in palworld-server palworld-saved palwarden-state; do
+    docker run --rm --user root --cap-add LINUX_IMMUTABLE \
+      -v "${PROJECT}_${v}":/v --entrypoint sh palwarden:latest \
+      -c 'command -v chattr >/dev/null && find /v -type f -exec chattr -i {} + 2>/dev/null; true' \
+      >/dev/null 2>&1 || true
+    docker volume rm -f "${PROJECT}_${v}" >/dev/null 2>&1 || true
+  done
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+if ! docker compose version >/dev/null 2>&1; then
+  echo "  docker compose unavailable — skipping"; assert_report; exit 0
+fi
+
+SAVED_MARKER=/opt/palworld/server/Pal/Saved/SaveGames/world-marker.txt
+CFG=/opt/palworld/server/Pal/Saved/Config/LinuxServer/PalWorldSettings.ini
+
+# Start clean, then seed the game volume with the dummy server (no 5GB download).
+dc down -v --remove-orphans >/dev/null 2>&1 || true
+echo "  building + seeding ..."
+dc build >/dev/null 2>&1 || { fail "compose build failed"; assert_report; exit 1; }
+docker run --rm -v "${PROJECT}_palworld-server":/dst -v "$FAKE":/src:ro \
+  --entrypoint sh palwarden:latest -c 'cp -a /src/. /dst/ && chown -R steam:steam /dst' >/dev/null 2>&1 \
+  || { fail "seeding the game volume failed"; assert_report; exit 1; }
+
+wait_ready() {
+  docker exec "$1" sh -c 'i=0; until s6-svstat /run/service/palworld-server 2>/dev/null | grep -q "^up"; do
+    i=$((i+1)); [ $i -gt 30 ] && exit 1; sleep 1; done'
+}
+
+# ---------------------------------------------------------------- first boot --
+dc up -d >/dev/null 2>&1 || { fail "first compose up failed"; assert_report; exit 1; }
+C=palwarden-persist-test
+wait_ready "$C" || fail "server did not come up on first boot"
+
+# config from the environment was applied
+assert_rc 0 docker exec "$C" grep -qF 'ServerName="persistence probe"' "$CFG"
+# and locked, since compose grants CAP_LINUX_IMMUTABLE
+attrs="$(docker exec "$C" lsattr -d "$CFG" 2>/dev/null | awk '{print $1}')"
+assert_contains "$attrs" "i" "config is locked on first boot"
+
+# write world data, as the server would
+docker exec --user root "$C" sh -c "mkdir -p \$(dirname $SAVED_MARKER) && \
+  echo 'world-data-v1' > $SAVED_MARKER && chown -R steam:steam /opt/palworld/server/Pal/Saved/SaveGames" >/dev/null 2>&1
+assert_rc 0 docker exec "$C" grep -qx 'world-data-v1' "$SAVED_MARKER"
+
+# the save must live in the palworld-saved volume, not the parent server volume
+saved_in_saved="$(docker run --rm -v "${PROJECT}_palworld-saved":/v --entrypoint sh palwarden:latest \
+  -c 'cat /v/SaveGames/world-marker.txt 2>/dev/null' 2>/dev/null || true)"
+assert_eq "$saved_in_saved" "world-data-v1" "save data lands in the palworld-saved volume"
+
+# --------------------------------------------------------------- down and up --
+dc down >/dev/null 2>&1 || fail "compose down failed"
+# `down` without -v must keep the volumes
+assert_rc 0 docker volume inspect "${PROJECT}_palworld-saved"
+assert_rc 0 docker volume inspect "${PROJECT}_palworld-server"
+# and the container really is gone
+out="$(docker ps -a --filter "name=^${C}$" --format '{{.Names}}')"
+assert_eq "$out" "" "container removed by down"
+
+dc up -d >/dev/null 2>&1 || { fail "second compose up failed"; assert_report; exit 1; }
+wait_ready "$C" || fail "server did not come up on second boot"
+
+# ------------------------------------------------------------ what persisted --
+assert_rc 0 docker exec "$C" grep -qx 'world-data-v1' "$SAVED_MARKER"
+assert_rc 0 docker exec "$C" grep -qF 'ServerName="persistence probe"' "$CFG"
+# the game install itself persisted too (no re-download needed)
+assert_rc 0 docker exec "$C" test -x /opt/palworld/server/PalServer.sh
+
+# second boot re-applied config through the pre-existing lock, without error
+logs="$(docker logs "$C" 2>&1)"
+assert_not_contains "$logs" "Operation not permitted" "no permission error against the locked config"
+assert_not_contains "$logs" "Traceback" "no traceback on the second boot"
+attrs="$(docker exec "$C" lsattr -d "$CFG" 2>/dev/null | awk '{print $1}')"
+assert_contains "$attrs" "i" "config still locked after restart"
+
+# a changed setting is picked up on reboot even though the file was locked
+dc down >/dev/null 2>&1
+set_server_name "renamed after restart"
+dc up -d >/dev/null 2>&1
+wait_ready "$C" || fail "server did not come up on third boot"
+assert_rc 0 docker exec "$C" grep -qF 'ServerName="renamed after restart"' "$CFG"
+assert_rc 0 docker exec "$C" grep -qx 'world-data-v1' "$SAVED_MARKER"
+
+# --- tearing the stack down for real ----------------------------------------
+# A chattr +i file cannot be unlinked, so `down -v` cannot delete the volume
+# while the config is locked. Verify the documented remedy: unlock, then down -v.
+docker exec --user root "$C" palworld-config-protect unlock >/dev/null 2>&1
+dc down -v >/dev/null 2>&1
+assert_rc 1 docker volume inspect "${PROJECT}_palworld-saved"
+
+assert_report
