@@ -1,5 +1,5 @@
 [Unit]
-Description=Palworld static config editor web UI (local-only)
+Description=Palworld authenticated web UI and config API
 After=network.target
 
 [Service]
@@ -14,7 +14,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/opt/palworld/tools/config-webui
+ReadWritePaths=/var/lib/palworld
 
 [Install]
 WantedBy=multi-user.target

@@ -127,18 +127,16 @@ COMPOSE_PROFILES=embedded docker compose up -d --build
 docker compose logs -f palwarden
 ```
 
-Players connect on `UDP 8211`; the config web UI is at
-`http://127.0.0.1:8088/PalWorldSettingsEditor.html`. Stop gracefully with
+Players connect on `UDP 8211`. Stop gracefully with
 `docker compose down` (server saves via SIGINT).
 
-The panel is at `http://127.0.0.1:8088/` and **requires Basic auth**. Credentials
-are generated on first start; read them with:
+The config web UI is published to `127.0.0.1:8088` and **requires Basic auth on all paths** — the dashboard is at `/` and the vendored editors (like `PalWorldSettingsEditor.html`) are accessible by their filenames. Credentials are generated on first start; read them with:
 
 ```bash
 docker compose exec palwarden cat /etc/palworld/webui.env
 ```
 
-Set `WEBUI_USER` / `WEBUI_PASSWORD` in `.env` to choose your own instead.
+**Credential persistence**: `/etc/palworld` is not a volume, so credentials regenerate when the container is recreated (e.g. `docker compose up --build`). Set `WEBUI_USER` / `WEBUI_PASSWORD` in `.env` if you want stable credentials across container rebuilds.
 
 ## Quick start — external (monitor an existing server)
 
