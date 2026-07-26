@@ -1,0 +1,2452 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Palworld Server Settings Editor</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            /* Light theme variables */
+            --bg-primary: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            --bg-secondary: white;
+            --bg-tertiary: #f7fafc;
+            --text-primary: #2d3748;
+            --text-secondary: #4a5568;
+            --text-muted: #718096;
+            --border-color: #e2e8f0;
+            --shadow: 0 10px 40px rgba(0,0,0,0.2);
+            --header-gradient: linear-gradient(135deg, #5a67d8 0%, #6b46c1 100%);
+            --input-bg: white;
+            --input-border: #e2e8f0;
+            --input-focus: #5a67d8;
+            --section-bg: white;
+            --section-border: #e2e8f0;
+            --tooltip-bg: #2d3748;
+            --tooltip-text: white;
+        }
+
+        [data-theme="dark"] {
+            /* Dark theme variables */
+            --bg-primary: linear-gradient(135deg, #1a202c 0%, #2d3748 100%);
+            --bg-secondary: #1a202c;
+            --bg-tertiary: #2d3748;
+            --text-primary: #f7fafc;
+            --text-secondary: #e2e8f0;
+            --text-muted: #a0aec0;
+            --border-color: #4a5568;
+            --shadow: 0 10px 40px rgba(0,0,0,0.5);
+            --header-gradient: linear-gradient(135deg, #2d3748 0%, #4a5568 100%);
+            --input-bg: #2d3748;
+            --input-border: #4a5568;
+            --input-focus: #63b3ed;
+            --section-bg: #180d0d;
+            --section-border: #4a5568;
+            --tooltip-bg: #1a202c;
+            --tooltip-text: #f7fafc;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            padding: 20px;
+            min-height: 100vh;
+            transition: background 0.3s ease, color 0.3s ease;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: var(--bg-secondary);
+            border-radius: 12px;
+            box-shadow: var(--shadow);
+            overflow: hidden;
+            transition: background 0.3s ease, box-shadow 0.3s ease;
+        }
+
+        .header {
+            background: var(--header-gradient);
+            color: white;
+            padding: 30px;
+            text-align: center;
+            transition: background 0.3s ease;
+        }
+
+        .header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+
+        .header p {
+            font-size: 1.1em;
+            opacity: 0.9;
+        }
+
+        .header-content {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            width: 100%;
+        }
+
+        .header-text {
+            flex: 1;
+        }
+
+        .theme-toggle {
+            background: rgba(255, 255, 255, 0.2);
+            border: 2px solid rgba(255, 255, 255, 0.3);
+            border-radius: 50px;
+            width: 50px;
+            height: 50px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            backdrop-filter: blur(10px);
+        }
+
+        .theme-toggle:hover {
+            background: rgba(255, 255, 255, 0.3);
+            border-color: rgba(255, 255, 255, 0.5);
+            transform: scale(1.1);
+        }
+
+        .theme-icon {
+            font-size: 1.5em;
+            transition: transform 0.3s ease;
+        }
+
+        .theme-toggle:hover .theme-icon {
+            transform: rotate(15deg);
+        }
+
+        .controls {
+            padding: 20px 30px;
+            background: var(--bg-tertiary);
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            transition: background 0.3s ease, border-color 0.3s ease;
+        }
+
+        .btn {
+            padding: 12px 24px;
+            border: none;
+            border-radius: 6px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .btn-primary {
+            background: #5a67d8;
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background: #4c51bf;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(90, 103, 216, 0.4);
+        }
+
+        .btn-secondary {
+            background: #48bb78;
+            color: white;
+        }
+
+        .btn-secondary:hover {
+            background: #38a169;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(72, 187, 120, 0.4);
+        }
+
+        .btn-danger {
+            background: #f56565;
+            color: white;
+        }
+
+        .btn-danger:hover {
+            background: #e53e3e;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(245, 101, 101, 0.4);
+        }
+
+        .content {
+            padding: 30px;
+            background: var(--bg-secondary);
+            transition: background 0.3s ease;
+        }
+
+        .section {
+            margin-bottom: 30px;
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            overflow: visible;
+            background: var(--section-bg);
+            transition: border-color 0.3s ease, background 0.3s ease;
+        }
+
+        .section-header {
+            background: var(--bg-tertiary);
+            padding: 15px 20px;
+            font-size: 1.3em;
+            font-weight: 600;
+            color: var(--text-primary);
+            cursor: pointer;
+            user-select: none;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            transition: background 0.3s ease;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .section-header:hover {
+            background: var(--border-color);
+        }
+
+        .section-header::after {
+            content: '▼';
+            transition: transform 0.3s ease;
+        }
+
+        .section-header.collapsed::after {
+            transform: rotate(-90deg);
+        }
+
+        .section-content {
+            padding: 20px;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            background: var(--section-bg);
+            overflow: visible;
+            transition: background 0.3s ease;
+        }
+
+        .section-content.collapsed {
+            display: none;
+        }
+
+        .form-group {
+            display: flex;
+            flex-direction: column;
+            position: relative;
+            overflow: visible;
+        }
+
+        .form-group label {
+            font-weight: 600;
+            margin-bottom: 6px;
+            color: #2d3748;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+
+        .tooltip {
+            position: relative;
+            display: inline-block;
+            cursor: help;
+            color: #5a67d8;
+            font-size: 0.9em;
+        }
+
+        .tooltip:hover::after {
+            content: attr(data-tip);
+            position: absolute;
+            left: 0;
+            top: 25px;
+            background: var(--tooltip-bg);
+            color: var(--tooltip-text);
+            padding: 10px 14px;
+            border-radius: 6px;
+            white-space: nowrap;
+            z-index: 10000;
+            font-size: 13px;
+            font-weight: normal;
+            min-width: 250px;
+            max-width: 500px;
+            white-space: normal;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+            pointer-events: none;
+            line-height: 1.5;
+        }
+
+        .tooltip:hover::before {
+            content: '';
+            position: absolute;
+            left: 8px;
+            top: 18px;
+            width: 0;
+            height: 0;
+            border-left: 6px solid transparent;
+            border-right: 6px solid transparent;
+            border-bottom: 7px solid var(--tooltip-bg);
+            z-index: 10001;
+            pointer-events: none;
+        }
+
+        input[type="text"],
+        input[type="number"],
+        input[type="password"],
+        select,
+        textarea {
+            padding: 10px 12px;
+            border: 2px solid var(--input-border);
+            border-radius: 6px;
+            font-size: 14px;
+            background: var(--input-bg);
+            color: var(--text-primary);
+            transition: all 0.3s ease;
+            font-family: inherit;
+        }
+
+        input[type="text"]:focus,
+        input[type="number"]:focus,
+        input[type="password"]:focus,
+        select:focus,
+        textarea:focus {
+            outline: none;
+            border-color: var(--input-focus);
+            box-shadow: 0 0 0 3px rgba(90, 103, 216, 0.1);
+        }
+
+        /* Dark mode select dropdown styling */
+        [data-theme="dark"] select {
+            background-color: #4a5568 !important;
+            color: #f7fafc !important;
+        }
+
+        [data-theme="dark"] select option {
+            background-color: #4a5568 !important;
+            color: #f7fafc !important;
+        }
+
+        [data-theme="dark"] select:focus {
+            background-color: #4a5568 !important;
+            color: #f7fafc !important;
+        }
+
+        /* Dark mode section content with white text */
+        [data-theme="dark"] .section-content {
+            background: #180d0d !important;
+            color: white !important;
+        }
+
+        [data-theme="dark"] .section-content * {
+            color: white !important;
+        }
+
+        [data-theme="dark"] .section-content label {
+            color: white !important;
+        }
+
+        input[type="checkbox"] {
+            width: 20px;
+            height: 20px;
+            cursor: pointer;
+        }
+
+        .checkbox-label {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            cursor: pointer;
+        }
+
+        .output-section {
+            margin-top: 30px;
+            padding: 20px;
+            background: #f7fafc;
+            border-radius: 8px;
+            border: 1px solid #e2e8f0;
+        }
+
+        .output-section h3 {
+            margin-bottom: 15px;
+            color: #2d3748;
+        }
+
+        textarea#output {
+            width: 100%;
+            min-height: 200px;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            resize: vertical;
+        }
+
+        .file-input-wrapper {
+            position: relative;
+            overflow: hidden;
+            display: inline-block;
+        }
+
+        .file-input-wrapper input[type=file] {
+            position: absolute;
+            left: -9999px;
+        }
+
+        .multi-select-wrapper {
+            border: 2px solid #e2e8f0;
+            border-radius: 6px;
+            padding: 10px;
+        }
+
+        .multi-select-option {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 5px 0;
+        }
+
+        .success-message {
+            padding: 12px;
+            background: #c6f6d5;
+            color: #22543d;
+            border-radius: 6px;
+            margin-top: 10px;
+            display: none;
+        }
+
+        .error-message {
+            padding: 12px;
+            background: #fed7d7;
+            color: #742a2a;
+            border-radius: 6px;
+            margin-top: 10px;
+            display: none;
+        }
+
+        @media (max-width: 768px) {
+            .section-content {
+                grid-template-columns: 1fr;
+            }
+
+            .controls {
+                flex-direction: column;
+            }
+
+            .btn {
+                width: 100%;
+                justify-content: center;
+            }
+        }
+
+        /* Enhanced UI Styles */
+        .section-icon {
+            width: 28px;
+            height: 28px;
+            margin-right: 12px;
+            display: inline-block;
+            vertical-align: middle;
+        }
+
+        .section-header-content {
+            display: flex;
+            align-items: center;
+            flex: 1;
+        }
+
+        .value-indicator {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            margin-left: 8px;
+            animation: pulse 2s infinite;
+        }
+
+        .value-normal { background: #48bb78; }
+        .value-high { background: #f6ad55; }
+        .value-extreme { background: #fc8181; }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        @keyframes spin {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(360deg); }
+        }
+
+        @keyframes float {
+            0%, 100% { transform: translateY(0px); }
+            50% { transform: translateY(-10px); }
+        }
+
+        .loading-spinner {
+            display: none;
+            width: 40px;
+            height: 40px;
+            margin: 20px auto;
+            animation: spin 1s linear infinite;
+        }
+
+        .loading-spinner.active {
+            display: block;
+        }
+
+        .preset-buttons {
+            display: flex;
+            gap: 10px;
+            padding: 10px 30px;
+            background: #edf2f7;
+            border-bottom: 1px solid #e2e8f0;
+            flex-wrap: wrap;
+        }
+
+        .btn-preset {
+            padding: 8px 16px;
+            border: 2px solid;
+            border-radius: 6px;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            background: white;
+        }
+
+        .btn-preset:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+        }
+
+        .btn-preset.casual {
+            border-color: #48bb78;
+            color: #22543d;
+        }
+
+        .btn-preset.normal {
+            border-color: #4299e1;
+            color: #2c5282;
+        }
+
+        .btn-preset.hardcore {
+            border-color: #f56565;
+            color: #742a2a;
+        }
+
+        .btn-preset.builder {
+            border-color: #ed8936; /* orange */
+            color: #7b341e;
+        }
+
+        .btn-preset.progression {
+            border-color: #9f7aea; /* purple */
+            color: #44337a;
+        }
+
+        .btn-preset.lootfest {
+            border-color: #d69e2e; /* gold */
+            color: #744210;
+        }
+
+        .preset-icon {
+            width: 16px;
+            height: 16px;
+        }
+
+        /* Validation tips */
+        .input-error-tip {
+            color: #e53e3e;
+            font-size: 12px;
+            margin-top: 6px;
+            display: none;
+        }
+        .has-error input[type="number"] {
+            border-color: #e53e3e;
+            outline: none;
+        }
+        .has-error .slider-value {
+            color: #e53e3e;
+        }
+        input[type="url"]:invalid,
+        input[pattern]:invalid {
+            border-color: #e53e3e;
+        }
+
+        .form-group {
+            position: relative;
+        }
+
+        .input-with-indicator input[type="number"] {
+            padding-right: 35px;
+        }
+
+        .range-badge {
+            position: absolute;
+            right: 10px;
+            top: 50%;
+            transform: translateY(-50%);
+            font-size: 10px;
+            font-weight: 600;
+            padding: 2px 6px;
+            border-radius: 3px;
+            pointer-events: none;
+        }
+
+        .range-low {
+            background: #bee3f8;
+            color: #2c5282;
+        }
+
+        .range-normal {
+            background: #c6f6d5;
+            color: #22543d;
+        }
+
+        .range-high {
+            background: #fed7d7;
+            color: #742a2a;
+        }
+
+        .success-message, .error-message {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .message-icon {
+            width: 20px;
+            height: 20px;
+        }
+
+        /* Color-coded section borders */
+        .section.server-info { border-left: 4px solid #5a67d8; }
+        .section.multiplayer { border-left: 4px solid #48bb78; }
+        .section.gameplay { border-left: 4px solid #ed8936; }
+        .section.randomizer { border-left: 4px solid #9f7aea; }
+        .section.player { border-left: 4px solid #4299e1; }
+        .section.pal { border-left: 4px solid #f6ad55; }
+        .section.building { border-left: 4px solid #fc8181; }
+        .section.resources { border-left: 4px solid #38b2ac; }
+        .section.guild { border-left: 4px solid #d69e2e; }
+        .section.enemy { border-left: 4px solid #e53e3e; }
+        .section.management { border-left: 4px solid #667eea; }
+        .section.rcon { border-left: 4px solid #805ad5; }
+
+        /* Input-Slider Wrapper Styles */
+        .input-slider-wrapper {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            width: 100%;
+        }
+
+        .input-slider-wrapper input[type="number"] {
+            flex: 0 0 120px;
+            min-width: 120px;
+        }
+
+        .input-slider-wrapper input[type="range"] {
+            flex: 1;
+            min-width: 150px;
+        }
+
+        .slider-value {
+            flex: 0 0 60px;
+            font-weight: 600;
+            font-size: 13px;
+            color: #4a5568;
+            text-align: right;
+            min-width: 60px;
+        }
+
+        /* Custom Range Slider Styles */
+        input[type="range"] {
+            -webkit-appearance: none;
+            appearance: none;
+            height: 8px;
+            border-radius: 4px;
+            background: linear-gradient(to right, #48bb78 0%, #48bb78 10%, #4299e1 10%, #4299e1 50%, #f6ad55 50%, #f6ad55 80%, #fc8181 80%, #fc8181 100%);
+            outline: none;
+            transition: all 0.3s ease;
+        }
+
+        input[type="range"]:hover {
+            box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+        }
+
+        /* Webkit (Chrome, Safari, Edge) */
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            background: #5a67d8;
+            cursor: pointer;
+            border: 3px solid white;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.2);
+            transition: all 0.2s ease;
+        }
+
+        input[type="range"]::-webkit-slider-thumb:hover {
+            transform: scale(1.2);
+            box-shadow: 0 3px 10px rgba(90, 103, 216, 0.4);
+        }
+
+        input[type="range"]::-webkit-slider-thumb:active {
+            transform: scale(1.1);
+            background: #4c51bf;
+        }
+
+        /* Firefox */
+        input[type="range"]::-moz-range-thumb {
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            background: #5a67d8;
+            cursor: pointer;
+            border: 3px solid white;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.2);
+            transition: all 0.2s ease;
+        }
+
+        input[type="range"]::-moz-range-thumb:hover {
+            transform: scale(1.2);
+            box-shadow: 0 3px 10px rgba(90, 103, 216, 0.4);
+        }
+
+        input[type="range"]::-moz-range-thumb:active {
+            transform: scale(1.1);
+            background: #4c51bf;
+        }
+
+        /* Firefox track */
+        input[type="range"]::-moz-range-track {
+            height: 8px;
+            border-radius: 4px;
+            background: transparent;
+        }
+
+        /* Value color coding */
+        .slider-value.value-low {
+            color: #3182ce;
+        }
+
+        .slider-value.value-normal {
+            color: #38a169;
+        }
+
+        .slider-value.value-high {
+            color: #dd6b20;
+        }
+
+        .slider-value.value-extreme {
+            color: #e53e3e;
+        }
+    </style>
+
+    <!-- SVG Icon Definitions -->
+    <svg style="display: none;">
+        <defs>
+            <!-- Server Icon -->
+            <symbol id="icon-server" viewBox="0 0 24 24">
+                <rect x="2" y="4" width="20" height="6" rx="2" fill="currentColor" opacity="0.3"/>
+                <rect x="2" y="12" width="20" height="6" rx="2" fill="currentColor" opacity="0.5"/>
+                <rect x="2" y="20" width="20" height="2" rx="1" fill="currentColor" opacity="0.7"/>
+                <circle cx="6" cy="7" r="1" fill="#48bb78">
+                    <animate attributeName="opacity" values="1;0.3;1" dur="2s" repeatCount="indefinite"/>
+                </circle>
+                <circle cx="10" cy="7" r="1" fill="#48bb78">
+                    <animate attributeName="opacity" values="1;0.3;1" dur="2s" begin="0.3s" repeatCount="indefinite"/>
+                </circle>
+                <circle cx="6" cy="15" r="1" fill="#48bb78">
+                    <animate attributeName="opacity" values="1;0.3;1" dur="2s" begin="0.6s" repeatCount="indefinite"/>
+                </circle>
+            </symbol>
+
+            <!-- Multiplayer Icon -->
+            <symbol id="icon-multiplayer" viewBox="0 0 24 24">
+                <circle cx="9" cy="7" r="3" fill="currentColor" opacity="0.5"/>
+                <circle cx="15" cy="7" r="3" fill="currentColor" opacity="0.7"/>
+                <path d="M9 11c-2.5 0-7 1.3-7 4v2h14v-2c0-2.7-4.5-4-7-4z" fill="currentColor" opacity="0.5"/>
+                <path d="M15 11c-2.5 0-7 1.3-7 4v2h14v-2c0-2.7-4.5-4-7-4z" fill="currentColor" opacity="0.7"/>
+            </symbol>
+
+            <!-- Gameplay Icon -->
+            <symbol id="icon-gameplay" viewBox="0 0 24 24">
+                <path d="M6 9h6v2H6V9zm4 4H6v2h4v-2zm8-4v2h-2V9h-2v2h2v2h2v-2h2V9h-2z" fill="currentColor" opacity="0.7"/>
+                <path d="M18 5H6C3.8 5 2 6.8 2 9v6c0 2.2 1.8 4 4 4h12c2.2 0 4-1.8 4-4V9c0-2.2-1.8-4-4-4z" stroke="currentColor" fill="none" stroke-width="2"/>
+                <animateTransform attributeName="transform" type="rotate" from="0 12 12" to="5 12 12" dur="0.5s" repeatCount="indefinite"/>
+            </symbol>
+
+            <!-- Randomizer Icon -->
+            <symbol id="icon-randomizer" viewBox="0 0 24 24">
+                <rect x="3" y="3" width="6" height="6" rx="1" fill="currentColor" opacity="0.5">
+                    <animate attributeName="opacity" values="0.5;1;0.5" dur="1.5s" repeatCount="indefinite"/>
+                </rect>
+                <rect x="3" y="13" width="6" height="6" rx="1" fill="currentColor" opacity="0.7">
+                    <animate attributeName="opacity" values="0.7;0.3;0.7" dur="1.5s" begin="0.3s" repeatCount="indefinite"/>
+                </rect>
+                <rect x="15" y="3" width="6" height="6" rx="1" fill="currentColor" opacity="0.6">
+                    <animate attributeName="opacity" values="0.6;1;0.6" dur="1.5s" begin="0.6s" repeatCount="indefinite"/>
+                </rect>
+                <rect x="15" y="13" width="6" height="6" rx="1" fill="currentColor" opacity="0.8">
+                    <animate attributeName="opacity" values="0.8;0.4;0.8" dur="1.5s" begin="0.9s" repeatCount="indefinite"/>
+                </rect>
+            </symbol>
+
+            <!-- Player Icon -->
+            <symbol id="icon-player" viewBox="0 0 24 24">
+                <circle cx="12" cy="7" r="4" fill="currentColor" opacity="0.6"/>
+                <path d="M12 12c-4 0-8 2-8 5v3h16v-3c0-3-4-5-8-5z" fill="currentColor" opacity="0.7"/>
+            </symbol>
+
+            <!-- Pal Icon -->
+            <symbol id="icon-pal" viewBox="0 0 24 24">
+                <circle cx="9" cy="9" r="2" fill="currentColor" opacity="0.7"/>
+                <circle cx="15" cy="9" r="2" fill="currentColor" opacity="0.7"/>
+                <path d="M12 4c-4 0-7 3-7 7v5c0 3 3 5 7 5s7-2 7-5v-5c0-4-3-7-7-7z" fill="currentColor" opacity="0.5"/>
+                <path d="M9 14c0 1.5 1.3 3 3 3s3-1.5 3-3" stroke="currentColor" fill="none" stroke-width="2" stroke-linecap="round"/>
+                <animateTransform attributeName="transform" type="translate" from="0 0" to="0 2" dur="1s" repeatCount="indefinite" direction="alternate"/>
+            </symbol>
+
+            <!-- Building Icon -->
+            <symbol id="icon-building" viewBox="0 0 24 24">
+                <path d="M12 3L4 9v12h16V9l-8-6z" fill="currentColor" opacity="0.5"/>
+                <rect x="9" y="13" width="2" height="4" fill="currentColor" opacity="0.8"/>
+                <rect x="13" y="13" width="2" height="4" fill="currentColor" opacity="0.8"/>
+                <rect x="9" y="9" width="2" height="2" fill="currentColor" opacity="0.6"/>
+                <rect x="13" y="9" width="2" height="2" fill="currentColor" opacity="0.6"/>
+            </symbol>
+
+            <!-- Resources Icon -->
+            <symbol id="icon-resources" viewBox="0 0 24 24">
+                <path d="M12 2L8 8h8l-4-6z" fill="currentColor" opacity="0.7">
+                    <animate attributeName="opacity" values="0.7;1;0.7" dur="2s" repeatCount="indefinite"/>
+                </path>
+                <path d="M8 8l-4 6h8l-4-6z" fill="currentColor" opacity="0.5"/>
+                <path d="M16 8l-4 6h8l-4-6z" fill="currentColor" opacity="0.6"/>
+                <path d="M12 14l-4 6h8l-4-6z" fill="currentColor" opacity="0.8"/>
+            </symbol>
+
+            <!-- Guild Icon -->
+            <symbol id="icon-guild" viewBox="0 0 24 24">
+                <path d="M12 2L2 7v10c0 5 10 8 10 8s10-3 10-8V7L12 2z" fill="currentColor" opacity="0.5"/>
+                <path d="M12 8v8" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                <path d="M8 10l4 4 4-4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+            </symbol>
+
+            <!-- Enemy Icon -->
+            <symbol id="icon-enemy" viewBox="0 0 24 24">
+                <circle cx="12" cy="12" r="10" fill="currentColor" opacity="0.3">
+                    <animate attributeName="r" values="10;11;10" dur="1s" repeatCount="indefinite"/>
+                </circle>
+                <path d="M8 10l2-2 2 2-2 2-2-2zm6 0l2-2 2 2-2 2-2-2z" fill="currentColor" opacity="0.7"/>
+                <path d="M8 15c1 2 3 3 4 3s3-1 4-3" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/>
+            </symbol>
+
+            <!-- Management Icon -->
+            <symbol id="icon-management" viewBox="0 0 24 24">
+                <circle cx="12" cy="12" r="2" fill="currentColor"/>
+                <path d="M12 6v2m0 8v2m6-6h-2m-8 0H6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                <circle cx="12" cy="12" r="8" stroke="currentColor" fill="none" stroke-width="2">
+                    <animateTransform attributeName="transform" type="rotate" from="0 12 12" to="360 12 12" dur="20s" repeatCount="indefinite"/>
+                </circle>
+            </symbol>
+
+            <!-- RCON Icon -->
+            <symbol id="icon-rcon" viewBox="0 0 24 24">
+                <path d="M3 9l9-7 9 7v11H3V9z" fill="currentColor" opacity="0.3"/>
+                <circle cx="8" cy="14" r="1.5" fill="currentColor"/>
+                <circle cx="12" cy="14" r="1.5" fill="currentColor"/>
+                <circle cx="16" cy="14" r="1.5" fill="currentColor"/>
+                <path d="M7 17h10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+            </symbol>
+
+            <!-- Check Icon -->
+            <symbol id="icon-check" viewBox="0 0 24 24">
+                <circle cx="12" cy="12" r="10" fill="#48bb78"/>
+                <path d="M9 12l2 2 4-4" stroke="white" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+            </symbol>
+
+            <!-- Error Icon -->
+            <symbol id="icon-error" viewBox="0 0 24 24">
+                <circle cx="12" cy="12" r="10" fill="#f56565"/>
+                <path d="M15 9l-6 6m0-6l6 6" stroke="white" stroke-width="2" stroke-linecap="round"/>
+            </symbol>
+
+            <!-- Loading Spinner -->
+            <symbol id="icon-spinner" viewBox="0 0 50 50">
+                <circle cx="25" cy="25" r="20" fill="none" stroke="#5a67d8" stroke-width="4" stroke-dasharray="31.4 31.4" stroke-linecap="round">
+                    <animateTransform attributeName="transform" type="rotate" from="0 25 25" to="360 25 25" dur="1s" repeatCount="indefinite"/>
+                </circle>
+            </symbol>
+
+            <!-- Preset Icons -->
+            <symbol id="icon-casual" viewBox="0 0 24 24">
+                <path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10 10-4.5 10-10S17.5 2 12 2z" fill="currentColor" opacity="0.3"/>
+                <circle cx="9" cy="10" r="1.5" fill="currentColor"/>
+                <circle cx="15" cy="10" r="1.5" fill="currentColor"/>
+                <path d="M8 15c1 2 3 2 4 2s3 0 4-2" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/>
+            </symbol>
+
+            <symbol id="icon-normal" viewBox="0 0 24 24">
+                <path d="M12 2L2 7v10c0 5 10 8 10 8s10-3 10-8V7L12 2z" fill="currentColor" opacity="0.4"/>
+                <path d="M9 12l2 2 4-4" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+            </symbol>
+
+            <symbol id="icon-hardcore" viewBox="0 0 24 24">
+                <path d="M12 2l3 7h7l-5.5 4 2 7-6.5-5-6.5 5 2-7L2 9h7l3-7z" fill="currentColor" opacity="0.5"/>
+                <circle cx="12" cy="12" r="3" fill="currentColor">
+                    <animate attributeName="r" values="3;3.5;3" dur="0.5s" repeatCount="indefinite"/>
+                </circle>
+            </symbol>
+        </defs>
+    </svg>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div class="header-content">
+                <div class="header-text">
+                    <h1>⚙️ Palworld Server Settings Editor</h1>
+                    <p>Configure your dedicated server settings with ease</p>
+                </div>
+                <button id="theme-toggle" class="theme-toggle" onclick="toggleTheme()" title="Toggle Dark/Light Mode">
+                    <span class="theme-icon">🌙</span>
+                </button>
+            </div>
+        </div>
+
+        <div class="preset-buttons">
+            <button class="btn-preset casual" onclick="applyPreset('casual')">
+                <svg class="preset-icon"><use href="#icon-casual"/></svg>
+                Casual Mode
+            </button>
+            <button class="btn-preset normal" onclick="applyPreset('normal')">
+                <svg class="preset-icon"><use href="#icon-normal"/></svg>
+                Normal Mode
+            </button>
+            <button class="btn-preset hardcore" onclick="applyPreset('hardcore')">
+                <svg class="preset-icon"><use href="#icon-hardcore"/></svg>
+                Hardcore Mode
+            </button>
+            <button class="btn-preset builder" onclick="applyPreset('builder')">
+                <svg class="preset-icon"><use href="#icon-building"/></svg>
+                Builder Mode
+            </button>
+            <button class="btn-preset progression" onclick="applyPreset('progression')">
+                <svg class="preset-icon"><use href="#icon-gameplay"/></svg>
+                Fast Progression
+            </button>
+            <button class="btn-preset lootfest" onclick="applyPreset('lootfest')">
+                <svg class="preset-icon"><use href="#icon-resources"/></svg>
+                Lootfest
+            </button>
+        </div>
+
+        <div class="controls">
+            <div class="file-input-wrapper">
+                <button class="btn btn-primary" onclick="document.getElementById('fileInput').click()">
+                    📂 Load from INI File
+                </button>
+                <input type="file" id="fileInput" accept=".ini" onchange="loadFromFile(event)">
+            </div>
+            <button class="btn btn-primary" onclick="loadFromText()">Load from INI Text</button>
+            <div class="spacer"></div>
+            <button class="btn btn-secondary" onclick="generateINI()">✅ Generate INI Output</button>
+            <button class="btn btn-secondary" onclick="copyToClipboard()">📋 Copy to Clipboard</button>
+            <button class="btn btn-danger" onclick="resetToDefaults()">🔄 Reset to Defaults</button>
+        </div>
+
+        <svg class="loading-spinner" id="loadingSpinner">
+            <use href="#icon-spinner"/>
+        </svg>
+
+        <div id="successMessage" class="success-message">
+            <svg class="message-icon"><use href="#icon-check"/></svg>
+            <span></span>
+        </div>
+        <div id="errorMessage" class="error-message">
+            <svg class="message-icon"><use href="#icon-error"/></svg>
+            <span></span>
+        </div>
+
+        <div class="content">
+            <form id="settingsForm">
+                <!-- Server Information Section -->
+                <div class="section server-info">
+                    <div class="section-header" onclick="toggleSection(this)">
+                        <div class="section-header-content">
+                            <svg class="section-icon"><use href="#icon-server"/></svg>
+                            Server Information
+                        </div>
+                    </div>
+                    <div class="section-content">
+                        <div class="form-group">
+                            <label>Server Name <span class="tooltip" data-tip="Custom name displayed in the server browser. Players will see this when searching for servers to join.">ℹ️</span></label>
+                            <input type="text" id="ServerName" value="Default Palworld Server">
+                        </div>
+                        <div class="form-group">
+                            <label>Server Description <span class="tooltip" data-tip="Detailed description text about your server. Helps players understand your server's rules, playstyle, or special features.">ℹ️</span></label>
+                            <input type="text" id="ServerDescription" value="">
+                        </div>
+                        <div class="form-group">
+                            <label>Server Password <span class="tooltip" data-tip="Login password required to join the server. Leave empty for a public server. Use this to create a private server for friends.">ℹ️</span></label>
+                            <input type="password" id="ServerPassword" value="">
+                        </div>
+                        <div class="form-group">
+                            <label>Admin Password <span class="tooltip" data-tip="Administrative access credentials for server management. Required to use admin commands and perform server maintenance.">ℹ️</span></label>
+                            <input type="password" id="AdminPassword" value="">
+                        </div>
+                        <div class="form-group">
+                            <label>Public IP <span class="tooltip" data-tip="Your server's external IP address for manual network configuration. Usually auto-detected. Only set if having connection issues.">ℹ️</span></label>
+                            <input type="text" id="PublicIP" value="" pattern="^(?:(?:\d{1,3}\.){3}\d{1,3}|[A-Za-z0-9.-]+)$" title="Enter a valid IPv4 or hostname">
+                        </div>
+                        <div class="form-group">
+                            <label>Public Port <span class="tooltip" data-tip="Port for game connections. Default is 8211. Must be forwarded in your router if hosting from home. Players connect using IP:Port.">ℹ️</span></label>
+                            <input type="number" id="PublicPort" value="8211" min="1024" max="65535">
+                        </div>
+                        <div class="form-group">
+                            <label>Region <span class="tooltip" data-tip="Server region identifier (e.g., NA, EU, ASIA). Helps players find servers in their geographic area for better latency.">ℹ️</span></label>
+                            <input type="text" id="Region" value="">
+                        </div>
+                        <div class="form-group">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="bUseAuth">
+                                Use Authentication <span class="tooltip" data-tip="Enable platform authentication (Steam/Xbox/PlayStation). Prevents unauthorized access and helps with ban management.">ℹ️</span>
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="bShowPlayerList">
+                                Show Player List <span class="tooltip" data-tip="Display the list of online players publicly. When disabled, only admins can see who's online for privacy.">ℹ️</span>
+                            </label>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Multiplayer Settings Section -->
+                <div class="section multiplayer">
+                    <div class="section-header" onclick="toggleSection(this)">
+                        <div class="section-header-content">
+                            <svg class="section-icon"><use href="#icon-multiplayer"/></svg>
+                            Multiplayer Settings
+                        </div>
+                    </div>
+                    <div class="section-content">
+                        <div class="form-group">
+                            <label>Max Players <span class="tooltip" data-tip="Maximum concurrent players allowed on the server (1-32). Official servers support up to 32 players. Higher values may impact performance.">ℹ️</span></label>
+                            <input type="number" id="ServerPlayerMaxNum" value="32" min="1" max="32">
+                        </div>
+                        <div class="form-group">
+                            <label>Co-op Players <span class="tooltip" data-tip="Maximum party size for cooperative play (1-4). Controls how many players can join together in a co-op group. Note: This setting may not always function as expected.">ℹ️</span></label>
+                            <input type="number" id="CoopPlayerMaxNum" value="4" min="1" max="4">
+                        </div>
+                        <div class="form-group">
+                            <label>Guild Max Players <span class="tooltip" data-tip="Maximum members allowed per guild/faction (1-100). Larger guilds enable more cooperative base building and PvP coordination.">ℹ️</span></label>
+                            <input type="number" id="GuildPlayerMaxNum" value="20" min="1" max="100">
+                        </div>
+                        <div class="form-group">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="bIsMultiplay">
+                                Multiplayer Enabled <span class="tooltip" data-tip="Enable multiplayer functionality. When disabled, server runs in single-player mode. Must be enabled for online play.">ℹ️</span>
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="bIsPvP">
+                                PvP Enabled <span class="tooltip" data-tip="Enable player-versus-player combat. When enabled, players can attack each other outside of safe zones. Affects overall server playstyle.">ℹ️</span>
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="bEnablePlayerToPlayerDamage">
+                                Player-to-Player Damage <span class="tooltip" data-tip="Allow players to damage each other directly. Works in conjunction with PvP settings. Disable for pure cooperative gameplay.">ℹ️</span>
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="bEnableFriendlyFire">
+                                Friendly Fire <span class="tooltip" data-tip="Enable damage to allies and guild members. When enabled, be careful with area attacks! Adds realism but can cause accidents.">ℹ️</span>
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="bEnableDefenseOtherGuildPlayer">
+                                Defense vs Other Guilds <span class="tooltip" data-tip="Enable defensive actions against players from other guilds. Allows protecting territory from rival factions.">ℹ️</span>
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="bCanPickupOtherGuildDeathPenaltyDrop">
+                                Pickup Other Guild Drops <span class="tooltip" data-tip="Allow picking up items dropped by players from other guilds when they die. Creates risk vs reward for PvP encounters.">ℹ️</span>
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label>Crossplay Platforms <span class="tooltip" data-tip="Select which gaming platforms can connect to your server. Supports Steam, Xbox, PS5, and Mac. More platforms = larger player pool.">ℹ️</span></label>
+                            <div class="multi-select-wrapper">
+                                <div class="multi-select-option">
+                                    <input type="checkbox" id="platform_Steam" value="Steam" checked>
+                                    <label for="platform_Steam">Steam</label>
+                                </div>
+                                <div class="multi-select-option">
+                                    <input type="checkbox" id="platform_Xbox" value="Xbox" checked>
+                                    <label for="platform_Xbox">Xbox</label>
+                                </div>
+                                <div class="multi-select-option">
+                                    <input type="checkbox" id="platform_PS5" value="PS5" checked>
+                                    <label for="platform_PS5">PS5</label>
+                                </div>
+                                <div class="multi-select-option">
+                                    <input type="checkbox" id="platform_Mac" value="Mac" checked>
+                                    <label for="platform_Mac">Mac</label>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Gameplay Settings Section -->
+                <div class="section gameplay">
+                    <div class="section-header" onclick="toggleSection(this)">
+                        <div class="section-header-content">
+                            <svg class="section-icon"><use href="#icon-gameplay"/></svg>
+                            Gameplay Settings
+                        </div>
+                    </div>
+                    <div class="section-content">
+                        <div class="form-group">
+                            <label>Difficulty <span class="tooltip" data-tip="Game difficulty preset. Note: Currently not fully functional. Use individual multipliers below for fine-tuning difficulty instead.">ℹ️</span></label>
+                            <select id="Difficulty">
+                                <option value="None">None</option>
+                                <option value="Normal">Normal</option>
+                                <option value="Difficult">Difficult</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>Death Penalty <span class="tooltip" data-tip="What you lose when you die. None = keep everything, Item = lose inventory items, ItemAndEquipment = lose items + worn gear, All = lose everything including Pals in party.">ℹ️</span></label>
+                            <select id="DeathPenalty">
+                                <option value="None">None</option>
+                                <option value="Item">Items Only</option>
+                                <option value="ItemAndEquipment">Items & Equipment</option>
+                                <option value="All" selected>All</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>Experience Rate <span class="tooltip" data-tip="XP gain multiplier for both players and Pals (0.1-10.0). 1.0 = default, 2.0 = double XP, 0.5 = half XP. Higher values = faster leveling.">ℹ️</span></label>
+                            <div class="input-slider-wrapper">
+                                <input type="number" id="ExpRate" value="1.000000" step="0.1" min="0.1" max="10.0" oninput="syncSlider('ExpRate')">
+                                <input type="range" id="ExpRate_slider" value="1.0" min="0.1" max="10.0" step="0.1" oninput="syncInput('ExpRate_slider')">
+                                <span class="slider-value" id="ExpRate_value">1.0x</span>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>Pal Capture Rate <span class="tooltip" data-tip="Pal capture probability multiplier (0.1-10.0). 1.0 = default catch rates, 2.0 = twice as easy, 0.5 = twice as hard. Affects sphere success chance.">ℹ️</span></label>
+                            <div class="input-slider-wrapper">
+                                <input type="number" id="PalCaptureRate" value="1.000000" step="0.1" min="0.1" max="10.0" oninput="syncSlider('PalCaptureRate')">
+                                <input type="range" id="PalCaptureRate_slider" value="1.0" min="0.1" max="10.0" step="0.1" oninput="syncInput('PalCaptureRate_slider')">
+                                <span class="slider-value" id="PalCaptureRate_value">1.0x</span>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>Day Speed Rate <span class="tooltip" data-tip="Day cycle speed multiplier (0.1-10.0). 1.0 = normal 30min days, 2.0 = 15min days (faster), 0.5 = 60min days (slower). Affects gameplay pacing.">ℹ️</span></label>
+                            <div class="input-slider-wrapper">
+                                <input type="number" id="DayTimeSpeedRate" value="1.000000" step="0.1" min="0.1" max="10.0" oninput="syncSlider('DayTimeSpeedRate')">
+                                <input type="range" id="DayTimeSpeedRate_slider" value="1.0" min="0.1" max="10.0" step="0.1" oninput="syncInput('DayTimeSpeedRate_slider')">
+                                <span class="slider-value" id="DayTimeSpeedRate_value">1.0x</span>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>Night Speed Rate <span class="tooltip" data-tip="Night cycle speed multiplier (0.1-10.0). Works same as day speed. Set higher to shorten nights, lower to extend them. Separate from day rate for flexibility.">ℹ️</span></label>
+                            <div class="input-slider-wrapper">
+                                <input type="number" id="NightTimeSpeedRate" value="1.000000" step="0.1" min="0.1" max="10.0" oninput="syncSlider('NightTimeSpeedRate')">
+                                <input type="range" id="NightTimeSpeedRate_slider" value="1.0" min="0.1" max="10.0" step="0.1" oninput="syncInput('NightTimeSpeedRate_slider')">
+                                <span class="slider-value" id="NightTimeSpeedRate_value">1.0x</span>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="bHardcore">
+                                Hardcore Mode <span class="tooltip" data-tip="Enable permanent death mode. When your character dies, you must delete and recreate. Creates intense high-stakes gameplay. Backup your save!">ℹ️</span>
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="bPalLost">
+                                Pal Lost on Death <span class="tooltip" data-tip="Pals in your party are permanently lost when you die. Extremely punishing! Only for the most hardcore players. Pairs well with Hardcore Mode.">ℹ️</span>
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="bCharacterRecreateInHardcore">
+                                Character Recreate in Hardcore <span class="tooltip" data-tip="Allow creating a new character in Hardcore mode after death instead of being locked out. Provides second chances in perma-death gameplay.">ℹ️</span>
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="bEnableFastTravel" checked>
+                                Fast Travel Enabled <span class="tooltip" data-tip="Allow teleporting between discovered fast travel points. Disable for more realistic travel or to increase world exploration difficulty.">ℹ️</span>
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="bIsStartLocationSelectByMap" checked>
+                                Select Start Location <span class="tooltip" data-tip="Allow choosing your spawn point on the map when creating a character. When disabled, spawns are random, adding unpredictability.">ℹ️</span>
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="bEnableAimAssistPad" checked>
+                                Aim Assist (Gamepad) <span class="tooltip" data-tip="Enable aim assistance for controller/gamepad users. Helps with aiming during combat on console or when using controllers on PC.">ℹ️</span>
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="bEnableAimAssistKeyboard">
+                                Aim Assist (Keyboard) <span class="tooltip" data-tip="Enable aim assistance for keyboard/mouse users. Generally not recommended as mouse aiming is already precise. Most players keep this off.">ℹ️</span>
+                            </label>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Randomizer Settings Section -->
+                <div class="section randomizer">
+                    <div class="section-header" onclick="toggleSection(this)">
+                        <div class="section-header-content">
+                            <svg class="section-icon"><use href="#icon-randomizer"/></svg>
+                            Randomizer Settings
+                        </div>
+                    </div>
+                    <div class="section-content">
+                        <div class="form-group">
+                            <label>Randomizer Type <span class="tooltip" data-tip="World randomization mode. None = standard world, Region = randomize Pal spawns per region, All = complete randomization. Creates unique world experiences each playthrough.">ℹ️</span></label>
+                            <select id="RandomizerType">
+                                <option value="None" selected>None</option>
+                                <option value="Region">Region</option>
+                                <option value="All">All</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>Randomizer Seed <span class="tooltip" data-tip="Custom seed for randomization. Leave empty for truly random generation. Use same seed to recreate identical randomized worlds across servers.">ℹ️</span></label>
+                            <input type="text" id="RandomizerSeed" value="">
+                        </div>
+                        <div class="form-group">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="bIsRandomizerPalLevelRandom">
+                                Randomize Pal Levels <span class="tooltip" data-tip="Randomize wild Pal levels instead of using zone-based scaling. Creates unpredictable encounters - low level areas may have high level Pals!">ℹ️</span>
+                            </label>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Player Settings Section -->
+                <div class="section player">
+                    <div class="section-header" onclick="toggleSection(this)">
+                        <div class="section-header-content">
+                            <svg class="section-icon"><use href="#icon-player"/></svg>
+                            Player Settings
+                        </div>
+                    </div>
+                    <div class="section-content">
+                        <div class="form-group">
+                            <label>Player Attack Damage <span class="tooltip" data-tip="Player damage dealt multiplier (0.1-10.0). 1.0 = default damage, 2.0 = double damage, 0.5 = half damage. Makes combat easier/harder.">ℹ️</span></label>
+                            <div class="input-slider-wrapper">
+                                <input type="number" id="PlayerDamageRateAttack" value="1.000000" step="0.1" min="0.1" max="10.0" oninput="syncSlider('PlayerDamageRateAttack')">
+                                <input type="range" id="PlayerDamageRateAttack_slider" value="1.0" min="0.1" max="10.0" step="0.1" oninput="syncInput('PlayerDamageRateAttack_slider')">
+                                <span class="slider-value" id="PlayerDamageRateAttack_value">1.0x</span>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>Player Defense <span class="tooltip" data-tip="Player damage received multiplier (0.1-10.0). 1.0 = normal damage taken, 0.5 = take half damage (easier), 2.0 = take double damage (harder).">ℹ️</span></label>
+                            <div class="input-slider-wrapper">
+                                <input type="number" id="PlayerDamageRateDefense" value="1.000000" step="0.1" min="0.1" max="10.0" oninput="syncSlider('PlayerDamageRateDefense')">
+                                <input type="range" id="PlayerDamageRateDefense_slider" value="1.0" min="0.1" max="10.0" step="0.1" oninput="syncInput('PlayerDamageRateDefense_slider')">
+                                <span class="slider-value" id="PlayerDamageRateDefense_value">1.0x</span>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>Hunger Decrease Rate <span class="tooltip" data-tip="How fast player hunger depletes (0.1-10.0). 1.0 = normal, 2.0 = get hungry twice as fast, 0.5 = slower hunger. Affects food consumption frequency.">ℹ️</span></label>
+                            <div class="input-slider-wrapper">
+                                <input type="number" id="PlayerStomachDecreaceRate" value="1.000000" step="0.1" min="0.1" max="10.0" oninput="syncSlider('PlayerStomachDecreaceRate')">
+                                <input type="range" id="PlayerStomachDecreaceRate_slider" value="1.0" min="0.1" max="10.0" step="0.1" oninput="syncInput('PlayerStomachDecreaceRate_slider')">
+                                <span class="slider-value" id="PlayerStomachDecreaceRate_value">1.0x</span>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>Stamina Decrease Rate <span class="tooltip" data-tip="How fast stamina drains during activities (0.1-10.0). 1.0 = normal, 0.5 = stamina lasts longer, 2.0 = stamina drains faster. Affects sprinting, climbing, etc.">ℹ️</span></label>
+                            <div class="input-slider-wrapper">
+                                <input type="number" id="PlayerStaminaDecreaceRate" value="1.000000" step="0.1" min="0.1" max="10.0" oninput="syncSlider('PlayerStaminaDecreaceRate')">
+                                <input type="range" id="PlayerStaminaDecreaceRate_slider" value="1.0" min="0.1" max="10.0" step="0.1" oninput="syncInput('PlayerStaminaDecreaceRate_slider')">
+                                <span class="slider-value" id="PlayerStaminaDecreaceRate_value">1.0x</span>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>HP Regen Rate <span class="tooltip" data-tip="Player health regeneration speed (0.1-10.0). 1.0 = default regen, 2.0 = heal twice as fast, 0.5 = slower healing. Affects passive HP recovery.">ℹ️</span></label>
+                            <div class="input-slider-wrapper">
+                                <input type="number" id="PlayerAutoHPRegeneRate" value="1.000000" step="0.1" min="0.1" max="10.0" oninput="syncSlider('PlayerAutoHPRegeneRate')">
+                                <input type="range" id="PlayerAutoHPRegeneRate_slider" value="1.0" min="0.1" max="10.0" step="0.1" oninput="syncInput('PlayerAutoHPRegeneRate_slider')">
+                                <span class="slider-value" id="PlayerAutoHPRegeneRate_value">1.0x</span>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>HP Regen (Sleep) <span class="tooltip" data-tip="HP regeneration rate while sleeping in bed (0.1-10.0). Higher values = wake up healthier. Separate from active regen for balancing rest mechanics.">ℹ️</span></label>
+                            <div class="input-slider-wrapper">
+                                <input type="number" id="PlayerAutoHpRegeneRateInSleep" value="1.000000" step="0.1" min="0.1" max="10.0" oninput="syncSlider('PlayerAutoHpRegeneRateInSleep')">
+                                <input type="range" id="PlayerAutoHpRegeneRateInSleep_slider" value="1.0" min="0.1" max="10.0" step="0.1" oninput="syncInput('PlayerAutoHpRegeneRateInSleep_slider')">
+                                <span class="slider-value" id="PlayerAutoHpRegeneRateInSleep_value">1.0x</span>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>Item Weight Rate <span class="tooltip" data-tip="Item weight/encumbrance multiplier (0.1-10.0). 1.0 = normal weight, 0.5 = items weigh half (carry more), 2.0 = items weigh double (carry less).">ℹ️</span></label>
+                            <div class="input-slider-wrapper">
+                                <input type="number" id="ItemWeightRate" value="1.000000" step="0.1" min="0.1" max="10.0" oninput="syncSlider('ItemWeightRate')">
+                                <input type="range" id="ItemWeightRate_slider" value="1.0" min="0.1" max="10.0" step="0.1" oninput="syncInput('ItemWeightRate_slider')">
+                                <span class="slider-value" id="ItemWeightRate_value">1.0x</span>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="bExistPlayerAfterLogout">
+                                Player Exists After Logout <span class="tooltip" data-tip="Player body remains vulnerable in world after logout. Disable for safe logout. Enable for realistic survival where you can be killed while offline.">ℹ️</span>
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="bEnableNonLoginPenalty" checked>
+                                Non-Login Penalty <span class="tooltip" data-tip="Enable penalties for inactive players. Bases may deteriorate or resources decay if not maintained. Keeps server active and prevents abandoned bases.">ℹ️</span>
+                            </label>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Pal Settings Section -->
+                <div class="section pal">
+                    <div class="section-header" onclick="toggleSection(this)">
+                        <div class="section-header-content">
+                            <svg class="section-icon"><use href="#icon-pal"/></svg>
+                            Pal Settings
+                        </div>
+                    </div>
+                    <div class="section-content">
+                        <div class="form-group">
+                            <label>Pal Spawn Rate <span class="tooltip" data-tip="Wild Pal spawn frequency multiplier (0.1-10.0). 1.0 = normal spawns, 2.0 = twice as many Pals, 0.5 = half as many. Affects world population density.">ℹ️</span></label>
+                            <div class="input-slider-wrapper">
+                                <input type="number" id="PalSpawnNumRate" value="1.000000" step="0.1" min="0.1" max="10.0" oninput="syncSlider('PalSpawnNumRate')">
+                                <input type="range" id="PalSpawnNumRate_slider" value="1.0" min="0.1" max="10.0" step="0.1" oninput="syncInput('PalSpawnNumRate_slider')">
+                                <span class="slider-value" id="PalSpawnNumRate_value">1.0x</span>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>Pal Attack Damage <span class="tooltip" data-tip="Pal damage dealt multiplier (0.1-10.0). Affects both your Pals and wild Pals. 1.0 = default, 2.0 = Pals hit twice as hard, 0.5 = half damage.">ℹ️</span></label>
+                            <div class="input-slider-wrapper">
+                                <input type="number" id="PalDamageRateAttack" value="1.000000" step="0.1" min="0.1" max="10.0" oninput="syncSlider('PalDamageRateAttack')">
+                                <input type="range" id="PalDamageRateAttack_slider" value="1.0" min="0.1" max="10.0" step="0.1" oninput="syncInput('PalDamageRateAttack_slider')">
+                                <span class="slider-value" id="PalDamageRateAttack_value">1.0x</span>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>Pal Defense <span class="tooltip" data-tip="Pal damage received multiplier (0.1-10.0). 1.0 = normal, 0.5 = Pals take half damage (tankier), 2.0 = Pals take double damage (die faster).">ℹ️</span></label>
+                            <div class="input-slider-wrapper">
+                                <input type="number" id="PalDamageRateDefense" value="1.000000" step="0.1" min="0.1" max="10.0" oninput="syncSlider('PalDamageRateDefense')">
+                                <input type="range" id="PalDamageRateDefense_slider" value="1.0" min="0.1" max="10.0" step="0.1" oninput="syncInput('PalDamageRateDefense_slider')">
+                                <span class="slider-value" id="PalDamageRateDefense_value">1.0x</span>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>Pal Hunger Decrease <span class="tooltip" data-tip="How fast Pals get hungry (0.1-10.0). 1.0 = normal, 2.0 = need to feed twice as often, 0.5 = need less food. Affects base food consumption.">ℹ️</span></label>
+                            <div class="input-slider-wrapper">
+                                <input type="number" id="PalStomachDecreaceRate" value="1.000000" step="0.1" min="0.1" max="10.0" oninput="syncSlider('PalStomachDecreaceRate')">
+                                <input type="range" id="PalStomachDecreaceRate_slider" value="1.0" min="0.1" max="10.0" step="0.1" oninput="syncInput('PalStomachDecreaceRate_slider')">
+                                <span class="slider-value" id="PalStomachDecreaceRate_value">1.0x</span>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>Pal Stamina Decrease <span class="tooltip" data-tip="Pal stamina drain rate (0.1-10.0). Affects riding, combat, and work. Lower = Pals can work/fight longer without rest.">ℹ️</span></label>
+                            <div class="input-slider-wrapper">
+                                <input type="number" id="PalStaminaDecreaceRate" value="1.000000" step="0.1" min="0.1" max="10.0" oninput="syncSlider('PalStaminaDecreaceRate')">
+                                <input type="range" id="PalStaminaDecreaceRate_slider" value="1.0" min="0.1" max="10.0" step="0.1" oninput="syncInput('PalStaminaDecreaceRate_slider')">
+                                <span class="slider-value" id="PalStaminaDecreaceRate_value">1.0x</span>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>Pal HP Regen <span class="tooltip" data-tip="Pal health regeneration speed (0.1-10.0). 1.0 = default healing, 2.0 = heal twice as fast, 0.5 = slower healing. Passive recovery rate.">ℹ️</span></label>
+                            <div class="input-slider-wrapper">
+                                <input type="number" id="PalAutoHPRegeneRate" value="1.000000" step="0.1" min="0.1" max="10.0" oninput="syncSlider('PalAutoHPRegeneRate')">
+                                <input type="range" id="PalAutoHPRegeneRate_slider" value="1.0" min="0.1" max="10.0" step="0.1" oninput="syncInput('PalAutoHPRegeneRate_slider')">
+                                <span class="slider-value" id="PalAutoHPRegeneRate_value">1.0x</span>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>Pal HP Regen (Sleep) <span class="tooltip" data-tip="HP regen while Pals are resting in Palbox (0.1-10.0). Higher = faster recovery when not deployed. Helps with base management.">ℹ️</span></label>
+                            <div class="input-slider-wrapper">
+                                <input type="number" id="PalAutoHpRegeneRateInSleep" value="1.000000" step="0.1" min="0.1" max="10.0" oninput="syncSlider('PalAutoHpRegeneRateInSleep')">
+                                <input type="range" id="PalAutoHpRegeneRateInSleep_slider" value="1.0" min="0.1" max="10.0" step="0.1" oninput="syncInput('PalAutoHpRegeneRateInSleep_slider')">
+                                <span class="slider-value" id="PalAutoHpRegeneRateInSleep_value">1.0x</span>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>Pal Egg Hatch Time (hours) <span class="tooltip" data-tip="Real-time hours for Pal eggs to hatch (0-240). Default is 72 hours (3 days). Lower for faster breeding, higher for more realistic incubation.">ℹ️</span></label>
+                            <input type="number" id="PalEggDefaultHatchingTime" value="72.000000" step="1" min="0" max="240">
+                        </div>
+                        <div class="form-group">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="bAllowGlobalPalboxExport" checked>
+                                Allow Global Palbox Export <span class="tooltip" data-tip="Allow moving Pals OUT of the global Palbox system. Disable to prevent transferring Pals between bases or players.">ℹ️</span>
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="bAllowGlobalPalboxImport">
+                                Allow Global Palbox Import <span class="tooltip" data-tip="Allow moving Pals INTO the global Palbox system. When disabled, Pals stay at their current base only.">ℹ️</span>
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="EnablePredatorBossPal" checked>
+                                Enable Predator Boss Pals <span class="tooltip" data-tip="Enable special predator-type boss Pals to spawn in the world. These are rare, powerful encounters with unique rewards.">ℹ️</span>
+                            </label>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Base & Building Settings Section -->
+                <div class="section building">
+                    <div class="section-header" onclick="toggleSection(this)">
+                        <div class="section-header-content">
+                            <svg class="section-icon"><use href="#icon-building"/></svg>
+                            Base & Building Settings
+                        </div>
+                    </div>
+                    <div class="section-content">
+                        <div class="form-group">
+                            <label>Max Base Camps <span class="tooltip" data-tip="Maximum base camps per player (1-128). Allows building multiple bases across the map. More bases = more resource production but harder to defend.">ℹ️</span></label>
+                            <input type="number" id="BaseCampMaxNum" value="128" min="1" max="128">
+                        </div>
+                        <div class="form-group">
+                            <label>Max Workers per Base <span class="tooltip" data-tip="Maximum Pals that can work at each base (1-50). Default is 15. More workers = faster production but requires more food. Note: May not always function as expected.">ℹ️</span></label>
+                            <input type="number" id="BaseCampWorkerMaxNum" value="15" min="1" max="50">
+                        </div>
+                        <div class="form-group">
+                            <label>Max Bases in Guild <span class="tooltip" data-tip="Maximum base camps per guild/group (1-10). Guild members can share and work together at these bases. Enables large-scale cooperation.">ℹ️</span></label>
+                            <input type="number" id="BaseCampMaxNumInGuild" value="4" min="1" max="10">
+                        </div>
+                        <div class="form-group">
+                            <label>Building HP Rate <span class="tooltip" data-tip="Building health multiplier (0.1-10.0). 1.0 = normal HP, 2.0 = double durability, 0.5 = half HP. Higher = structures harder to destroy in raids.">ℹ️</span></label>
+                            <div class="input-slider-wrapper">
+                                <input type="number" id="BuildObjectHpRate" value="1.000000" step="0.1" min="0.1" max="10.0" oninput="syncSlider('BuildObjectHpRate')">
+                                <input type="range" id="BuildObjectHpRate_slider" value="1.0" min="0.1" max="10.0" step="0.1" oninput="syncInput('BuildObjectHpRate_slider')">
+                                <span class="slider-value" id="BuildObjectHpRate_value">1.0x</span>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>Building Damage Rate <span class="tooltip" data-tip="Damage TO buildings multiplier (0.1-10.0). 1.0 = normal, 2.0 = buildings take double damage, 0.5 = buildings take half damage. Affects PvP raiding.">ℹ️</span></label>
+                            <div class="input-slider-wrapper">
+                                <input type="number" id="BuildObjectDamageRate" value="1.000000" step="0.1" min="0.1" max="10.0" oninput="syncSlider('BuildObjectDamageRate')">
+                                <input type="range" id="BuildObjectDamageRate_slider" value="1.0" min="0.1" max="10.0" step="0.1" oninput="syncInput('BuildObjectDamageRate_slider')">
+                                <span class="slider-value" id="BuildObjectDamageRate_value">1.0x</span>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>Building Deterioration <span class="tooltip" data-tip="Passive decay rate for structures (0.1-10.0). 1.0 = normal decay, 0.0 = no decay, 2.0 = faster decay. Affects long-term base maintenance.">ℹ️</span></label>
+                            <div class="input-slider-wrapper">
+                                <input type="number" id="BuildObjectDeteriorationDamageRate" value="1.000000" step="0.1" min="0.1" max="10.0" oninput="syncSlider('BuildObjectDeteriorationDamageRate')">
+                                <input type="range" id="BuildObjectDeteriorationDamageRate_slider" value="1.0" min="0.1" max="10.0" step="0.1" oninput="syncInput('BuildObjectDeteriorationDamageRate_slider')">
+                                <span class="slider-value" id="BuildObjectDeteriorationDamageRate_value">1.0x</span>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>Work Speed Rate <span class="tooltip" data-tip="Pal work performance speed (0.1-10.0). 1.0 = normal speed, 2.0 = work twice as fast, 0.5 = work half speed. Affects crafting, farming, mining at bases.">ℹ️</span></label>
+                            <div class="input-slider-wrapper">
+                                <input type="number" id="WorkSpeedRate" value="1.000000" step="0.1" min="0.1" max="10.0" oninput="syncSlider('WorkSpeedRate')">
+                                <input type="range" id="WorkSpeedRate_slider" value="1.0" min="0.1" max="10.0" step="0.1" oninput="syncInput('WorkSpeedRate_slider')">
+                                <span class="slider-value" id="WorkSpeedRate_value">1.0x</span>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>Max Building Limit <span class="tooltip" data-tip="Maximum number of structures per base (0-100000). 0 = unlimited. Set a limit to prevent lag from over-building or create building strategy challenges.">ℹ️</span></label>
+                            <input type="number" id="MaxBuildingLimitNum" value="0" min="0" max="100000">
+                        </div>
+                        <div class="form-group">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="bBuildAreaLimit">
+                                Build Area Limit <span class="tooltip" data-tip="Restrict building near dungeons, POIs, and other protected structures. Prevents exploits and maintains world integrity.">ℹ️</span>
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="bInvisibleOtherGuildBaseCampAreaFX">
+                                Hide Other Guild Base FX <span class="tooltip" data-tip="Hide visual effects of rival guild bases. Improves performance in areas with many nearby bases. Helps FPS on lower-end systems.">ℹ️</span>
+                            </label>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Drops & Resources Section -->
+                <div class="section resources">
+                    <div class="section-header" onclick="toggleSection(this)">
+                        <div class="section-header-content">
+                            <svg class="section-icon"><use href="#icon-resources"/></svg>
+                            Drops & Resources
+                        </div>
+                    </div>
+                    <div class="section-content">
+                        <div class="form-group">
+                            <label>Collection Drop Rate <span class="tooltip" data-tip="Resource yield multiplier when gathering (0.1-10.0). 1.0 = normal drops, 2.0 = double resources, 0.5 = half resources. Affects trees, rocks, ore nodes.">ℹ️</span></label>
+                            <div class="input-slider-wrapper">
+                                <input type="number" id="CollectionDropRate" value="1.000000" step="0.1" min="0.1" max="10.0" oninput="syncSlider('CollectionDropRate')">
+                                <input type="range" id="CollectionDropRate_slider" value="1.0" min="0.1" max="10.0" step="0.1" oninput="syncInput('CollectionDropRate_slider')">
+                                <span class="slider-value" id="CollectionDropRate_value">1.0x</span>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>Collection Object HP <span class="tooltip" data-tip="Health of harvestable nodes (0.1-10.0). 1.0 = normal HP, 2.0 = nodes take twice as many hits, 0.5 = nodes break faster. Affects gathering speed.">ℹ️</span></label>
+                            <div class="input-slider-wrapper">
+                                <input type="number" id="CollectionObjectHpRate" value="1.000000" step="0.1" min="0.1" max="10.0" oninput="syncSlider('CollectionObjectHpRate')">
+                                <input type="range" id="CollectionObjectHpRate_slider" value="1.0" min="0.1" max="10.0" step="0.1" oninput="syncInput('CollectionObjectHpRate_slider')">
+                                <span class="slider-value" id="CollectionObjectHpRate_value">1.0x</span>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>Resource Respawn Speed <span class="tooltip" data-tip="How fast resources respawn (0.1-10.0). 1.0 = normal respawn, 2.0 = respawn twice as fast, 0.5 = respawn twice as slow. Affects world resource availability.">ℹ️</span></label>
+                            <div class="input-slider-wrapper">
+                                <input type="number" id="CollectionObjectRespawnSpeedRate" value="1.000000" step="0.1" min="0.1" max="10.0" oninput="syncSlider('CollectionObjectRespawnSpeedRate')">
+                                <input type="range" id="CollectionObjectRespawnSpeedRate_slider" value="1.0" min="0.1" max="10.0" step="0.1" oninput="syncInput('CollectionObjectRespawnSpeedRate_slider')">
+                                <span class="slider-value" id="CollectionObjectRespawnSpeedRate_value">1.0x</span>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>Enemy Drop Rate <span class="tooltip" data-tip="Enemy/Pal item drop rate (0.1-10.0). 1.0 = normal loot, 2.0 = double drops, 0.5 = half drops. Affects resources gained from defeated enemies.">ℹ️</span></label>
+                            <div class="input-slider-wrapper">
+                                <input type="number" id="EnemyDropItemRate" value="1.000000" step="0.1" min="0.1" max="10.0" oninput="syncSlider('EnemyDropItemRate')">
+                                <input type="range" id="EnemyDropItemRate_slider" value="1.0" min="0.1" max="10.0" step="0.1" oninput="syncInput('EnemyDropItemRate_slider')">
+                                <span class="slider-value" id="EnemyDropItemRate_value">1.0x</span>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>Max Dropped Items <span class="tooltip" data-tip="Maximum item entities in world (100-10000). Higher = less cleanup but potential lag. Lower = better performance but items may despawn faster. Default: 3000.">ℹ️</span></label>
+                            <input type="number" id="DropItemMaxNum" value="3000" min="100" max="10000">
+                        </div>
+                        <div class="form-group">
+                            <label>Max Dropped Items (UNKO) <span class="tooltip" data-tip="Maximum special/poop items (10-1000). Separate limit for Pal waste products. Lower if experiencing lag from too many special drops.">ℹ️</span></label>
+                            <input type="number" id="DropItemMaxNum_UNKO" value="100" min="10" max="1000">
+                        </div>
+                        <div class="form-group">
+                            <label>Drop Item Lifetime (hours) <span class="tooltip" data-tip="How long dropped items persist (0.1-24 hours). Default: 1 hour. Lower = cleaner world, higher = more time to retrieve items. Affects server cleanup.">ℹ️</span></label>
+                            <input type="number" id="DropItemAliveMaxHours" value="1.000000" step="0.1" min="0.1" max="24.0">
+                        </div>
+                        <div class="form-group">
+                            <label>Supply Drop Interval (minutes) <span class="tooltip" data-tip="Time between supply drop events (10-600 minutes). Default: 180 (3 hours). Supply drops contain rare loot crates that spawn across the map.">ℹ️</span></label>
+                            <input type="number" id="SupplyDropSpan" value="180" min="10" max="600">
+                        </div>
+                        <div class="form-group">
+                            <label>Equipment Durability Damage <span class="tooltip" data-tip="Equipment durability loss rate (0.1-10.0). 1.0 = normal wear, 2.0 = break twice as fast, 0.5 = last twice as long. Affects repair frequency.">ℹ️</span></label>
+                            <input type="number" id="EquipmentDurabilityDamageRate" value="1.000000" step="0.1" min="0.1" max="10.0">
+                        </div>
+                        <div class="form-group">
+                            <label>Item Corruption Multiplier <span class="tooltip" data-tip="Item corruption/decay rate (0.1-10.0). Affects how fast items degrade or spoil. Higher = faster corruption, lower = items last longer in inventory.">ℹ️</span></label>
+                            <input type="number" id="ItemCorruptionMultiplier" value="1.000000" step="0.1" min="0.1" max="10.0">
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Guild & Auto-Reset Settings Section -->
+                <div class="section guild">
+                    <div class="section-header" onclick="toggleSection(this)">
+                        <div class="section-header-content">
+                            <svg class="section-icon"><use href="#icon-guild"/></svg>
+                            Guild & Auto-Reset Settings
+                        </div>
+                    </div>
+                    <div class="section-content">
+                        <div class="form-group">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="bAutoResetGuildNoOnlinePlayers">
+                                Auto Reset Guild (No Online) <span class="tooltip" data-tip="Automatically reset/disband guilds when all members haven't logged in for specified time. Cleans up abandoned guilds and their bases from the server.">ℹ️</span>
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label>Auto Reset Time (hours) <span class="tooltip" data-tip="Hours of inactivity before guild is auto-reset (1-168). Default: 72 hours (3 days). Guild is deleted and bases released if ALL members offline this long.">ℹ️</span></label>
+                            <input type="number" id="AutoResetGuildTimeNoOnlinePlayers" value="72.000000" step="1" min="1" max="168">
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Enemy & Invader Settings Section -->
+                <div class="section enemy">
+                    <div class="section-header" onclick="toggleSection(this)">
+                        <div class="section-header-content">
+                            <svg class="section-icon"><use href="#icon-enemy"/></svg>
+                            Enemy & Invader Settings
+                        </div>
+                    </div>
+                    <div class="section-content">
+                        <div class="form-group">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="bEnableInvaderEnemy" checked>
+                                Enable Invader Enemies <span class="tooltip" data-tip="Enable enemy invasion/raid events at bases. When enabled, hostile Pals will periodically attack player bases. Disable for peaceful base building.">ℹ️</span>
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="bActiveUNKO">
+                                Active UNKO <span class="tooltip" data-tip="Enable special/poop drops from Pals. Pal waste products can be used as fertilizer or special resources. Disable to remove this mechanic entirely.">ℹ️</span>
+                            </label>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Server Management Section -->
+                <div class="section management">
+                    <div class="section-header" onclick="toggleSection(this)">
+                        <div class="section-header-content">
+                            <svg class="section-icon"><use href="#icon-management"/></svg>
+                            Server Management
+                        </div>
+                    </div>
+                    <div class="section-content">
+                        <div class="form-group">
+                            <label>Auto Save Interval (minutes) <span class="tooltip" data-tip="Time between auto-saves (5-60 minutes). Default: 30. More frequent = safer but higher disk usage. Less frequent = better performance but more potential data loss.">ℹ️</span></label>
+                            <input type="number" id="AutoSaveSpan" value="30.000000" step="1" min="5" max="60">
+                        </div>
+                        <div class="form-group">
+                            <label>Chat Post Limit/Min <span class="tooltip" data-tip="Max chat messages per player per minute (1-100). Default: 30. Prevents chat spam. Lower = stricter anti-spam, higher = more freedom.">ℹ️</span></label>
+                            <input type="number" id="ChatPostLimitPerMinute" value="30" min="1" max="100">
+                        </div>
+                        <div class="form-group">
+                            <label>Ban List URL <span class="tooltip" data-tip="URL to external ban list. Server will automatically ban players on this list. Official URL auto-bans known cheaters. Leave empty to disable.">ℹ️</span></label>
+                            <input type="url" id="BanListURL" value="https://api.palworldgame.com/api/banlist.txt" placeholder="https://...">
+                        </div>
+                        <div class="form-group">
+                            <label>Log Format Type <span class="tooltip" data-tip="Server log file format. Text = human-readable logs, JSON = machine-readable for log analysis tools. Choose JSON if using log parsers.">ℹ️</span></label>
+                            <select id="LogFormatType">
+                                <option value="Text" selected>Text</option>
+                                <option value="JSON">JSON</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="bIsUseBackupSaveData" checked>
+                                Use Backup Save Data <span class="tooltip" data-tip="Enable automatic save backups. Creates rolling backups: 5 every 30sec, 6 every 10min, 12 hourly, 7 daily. Critical for data protection!">ℹ️</span>
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label>Item Container Dirty Interval <span class="tooltip" data-tip="Seconds between chest/container state updates (0.1-10). Higher = better performance but slower container sync. Lower = real-time updates but more server load.">ℹ️</span></label>
+                            <input type="number" id="ItemContainerForceMarkDirtyInterval" value="1.000000" step="0.1" min="0.1" max="10.0">
+                        </div>
+                        <div class="form-group">
+                            <label>Server Pawn Cull Distance <span class="tooltip" data-tip="Distance in units before entities are hidden/culled (1000-50000). Lower = better performance, higher = see farther. Affects view distance of Pals/players.">ℹ️</span></label>
+                            <input type="number" id="ServerReplicatePawnCullDistance" value="15000.000000" step="1000" min="1000" max="50000">
+                        </div>
+                    </div>
+                </div>
+
+                <!-- RCON & REST API Section -->
+                <div class="section rcon">
+                    <div class="section-header" onclick="toggleSection(this)">
+                        <div class="section-header-content">
+                            <svg class="section-icon"><use href="#icon-rcon"/></svg>
+                            RCON & REST API
+                        </div>
+                    </div>
+                    <div class="section-content">
+                        <div class="form-group">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="RCONEnabled">
+                                Enable RCON <span class="tooltip" data-tip="Enable Remote Console protocol for server administration. Allows sending commands remotely using RCON tools. Must be port forwarded if using remotely.">ℹ️</span>
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label>RCON Port <span class="tooltip" data-tip="RCON connection port (1024-65535). Default: 25575. Must differ from game port. Use for remote admin tools. Remember to forward this port!">ℹ️</span></label>
+                            <input type="number" id="RCONPort" value="25575" min="1024" max="65535">
+                        </div>
+                        <div class="form-group">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="RESTAPIEnabled">
+                                Enable REST API <span class="tooltip" data-tip="Enable REST API for web-based server management and monitoring. Allows external tools/websites to query server status and send commands via HTTP.">ℹ️</span>
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label>REST API Port <span class="tooltip" data-tip="REST API HTTP port (1024-65535). Default: 8212. Used by web dashboards and monitoring tools. Ensure firewall allows if using externally.">ℹ️</span></label>
+                            <input type="number" id="RESTAPIPort" value="8212" min="1024" max="65535">
+                        </div>
+                    </div>
+                </div>
+            </form>
+
+            <!-- Output Section -->
+            <div class="output-section">
+                <h3>Generated PalWorldSettings.ini Content</h3>
+                <textarea id="output" placeholder="Paste INI here or generate output..."></textarea>
+                <div id="copySuccess" class="success-message"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Toggle section expand/collapse
+        function toggleSection(header) {
+            header.classList.toggle('collapsed');
+            const content = header.nextElementSibling;
+            content.classList.toggle('collapsed');
+        }
+
+        // Theme toggle functionality
+        function toggleTheme() {
+            const body = document.body;
+            const themeIcon = document.querySelector('.theme-icon');
+            const currentTheme = body.getAttribute('data-theme');
+            
+            if (currentTheme === 'dark') {
+                body.setAttribute('data-theme', 'light');
+                themeIcon.textContent = '🌙';
+                localStorage.setItem('theme', 'light');
+            } else {
+                body.setAttribute('data-theme', 'dark');
+                themeIcon.textContent = '☀️';
+                localStorage.setItem('theme', 'dark');
+            }
+        }
+
+        // Initialize theme on page load
+        function initializeTheme() {
+            const savedTheme = localStorage.getItem('theme') || 'dark'; // Default to dark
+            const body = document.body;
+            const themeIcon = document.querySelector('.theme-icon');
+            
+            body.setAttribute('data-theme', savedTheme);
+            themeIcon.textContent = savedTheme === 'dark' ? '☀️' : '🌙';
+        }
+
+        // Get all crossplay platforms
+        function getCrossplayPlatforms() {
+            const platforms = [];
+            document.querySelectorAll('[id^="platform_"]').forEach(cb => {
+                if (cb.checked) {
+                    platforms.push(cb.value);
+                }
+            });
+            return platforms.join(',');
+        }
+
+        // Helper function to format boolean values correctly for Palworld
+        function formatBoolean(value) {
+            return value ? 'True' : 'False';
+        }
+
+        // Generate INI file content
+        function generateINI() {
+            const outEl = document.getElementById('output');
+            const output = buildINIContent();
+            suppressOutputListener = true;
+            outEl.value = output;
+            suppressOutputListener = false;
+            showMessage('successMessage', 'INI file content generated successfully!');
+        }
+
+        // Copy to clipboard (modern API with fallback)
+        async function copyToClipboard() {
+            const output = document.getElementById('output');
+            if (!output.value) {
+                showMessage('errorMessage', 'Please generate INI output first!');
+                return;
+            }
+
+            try {
+                // Try modern clipboard API first
+                if (navigator.clipboard && window.isSecureContext) {
+                    await navigator.clipboard.writeText(output.value);
+                } else {
+                    // Fallback to older method
+                    output.select();
+                    document.execCommand('copy');
+                }
+
+                const copyMsg = document.getElementById('copySuccess');
+                copyMsg.textContent = 'Copied to clipboard! ✓';
+                copyMsg.style.display = 'block';
+                setTimeout(() => {
+                    copyMsg.style.display = 'none';
+                }, 3000);
+            } catch (err) {
+                showMessage('errorMessage', 'Failed to copy to clipboard. Please copy manually.');
+            }
+        }
+
+        // Load settings from INI file
+        function loadFromFile(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                try {
+                    const content = e.target.result;
+                    parseINI(content);
+                    showMessage('successMessage', 'Settings loaded from file successfully!');
+                } catch (error) {
+                    showMessage('errorMessage', 'Error parsing INI file: ' + error.message);
+                }
+            };
+            reader.readAsText(file);
+        }
+
+        // Load settings from pasted INI text (from the output textarea)
+        function loadFromText() {
+            const ta = document.getElementById('output');
+            if (!ta) {
+                showMessage('errorMessage', 'Paste area not found.');
+                return;
+            }
+            const content = ta.value.trim();
+            if (!content) {
+                showMessage('errorMessage', 'Paste INI content into the text area first.');
+                return;
+            }
+            try {
+                parseINI(content);
+                showMessage('successMessage', 'Settings loaded from pasted INI successfully!');
+            } catch (error) {
+                showMessage('errorMessage', 'Error parsing INI text: ' + error.message);
+            }
+        }
+
+        // Parse INI content and populate form
+        function parseINI(content) {
+            let match = content.match(/OptionSettings\=\((.*)\)/s);
+            if (!match) {
+                const parenOnly = content.match(/^\s*\((.*)\)\s*$/s);
+                if (parenOnly) {
+                    match = parenOnly;
+                }
+            }
+            if (!match) {
+                throw new Error('Invalid INI format');
+            }
+
+            const settingsStr = match[1];
+            const settings = {};
+
+            // Parse key=value pairs, handling quoted values
+            let currentKey = '';
+            let currentValue = '';
+            let inQuotes = false;
+            let inParens = false;
+
+            for (let i = 0; i < settingsStr.length; i++) {
+                const char = settingsStr[i];
+
+                if (char === '"') {
+                    inQuotes = !inQuotes;
+                    currentValue += char;
+                } else if (char === '(' && !inQuotes) {
+                    inParens = true;
+                    currentValue += char;
+                } else if (char === ')' && !inQuotes) {
+                    inParens = false;
+                    currentValue += char;
+                } else if (char === '=' && !inQuotes && !currentKey) {
+                    currentKey = currentValue.trim();
+                    currentValue = '';
+                } else if (char === ',' && !inQuotes && !inParens) {
+                    if (currentKey) {
+                        settings[currentKey] = currentValue.trim();
+                    }
+                    currentKey = '';
+                    currentValue = '';
+                } else {
+                    currentValue += char;
+                }
+            }
+
+            // Add last setting
+            if (currentKey) {
+                settings[currentKey] = currentValue.trim();
+            }
+
+            // Populate form fields
+            Object.keys(settings).forEach(key => {
+                let value = settings[key];
+
+                // Remove quotes from string values
+                if (value.startsWith('"') && value.endsWith('"')) {
+                    value = value.slice(1, -1);
+                }
+
+                const element = document.getElementById(key);
+                if (element) {
+                    if (element.type === 'checkbox') {
+                        element.checked = value === 'True' || value === 'true';
+                    } else if (element.type === 'number') {
+                        element.value = clampToInput(element, value);
+                    } else {
+                        element.value = value;
+                    }
+                }
+            });
+
+            // Handle CrossplayPlatforms specially
+            if (settings.CrossplayPlatforms) {
+                const platforms = settings.CrossplayPlatforms.replace(/[()]/g, '').split(',');
+                document.querySelectorAll('[id^="platform_"]').forEach(cb => {
+                    cb.checked = platforms.includes(cb.value);
+                });
+            }
+            // Re-sync sliders after parsing INI content
+            initializeSliders();
+        }
+
+        // Reset to defaults
+        function resetToDefaults() {
+            if (!confirm('Are you sure you want to reset all settings to default values?')) {
+                return;
+            }
+
+            document.getElementById('settingsForm').reset();
+
+            // Reset checkboxes to their default states
+            document.getElementById('bUseAuth').checked = true;
+            document.getElementById('bEnableInvaderEnemy').checked = true;
+            document.getElementById('bEnableAimAssistPad').checked = true;
+            document.getElementById('bEnableFastTravel').checked = true;
+            document.getElementById('bIsStartLocationSelectByMap').checked = true;
+            document.getElementById('bEnableNonLoginPenalty').checked = true;
+            document.getElementById('bIsUseBackupSaveData').checked = true;
+            document.getElementById('bAllowGlobalPalboxExport').checked = true;
+            document.getElementById('EnablePredatorBossPal').checked = true;
+
+            // Reset all platform checkboxes
+            document.querySelectorAll('[id^="platform_"]').forEach(cb => cb.checked = true);
+
+            // Normalize number defaults to correct precision/limits
+            document.querySelectorAll('input[type="number"]').forEach(n => {
+                n.value = clampToInput(n, n.value);
+            });
+
+            // Re-sync sliders to reflect default values
+            initializeSliders();
+
+            showMessage('successMessage', 'All settings reset to defaults!');
+        }
+
+        // Show message helper (enhanced with icons)
+        function showMessage(elementId, message) {
+            const msgElement = document.getElementById(elementId);
+            const span = msgElement.querySelector('span');
+            if (span) {
+                span.textContent = message;
+            } else {
+                msgElement.textContent = message;
+            }
+            msgElement.style.display = 'flex';
+            setTimeout(() => {
+                msgElement.style.display = 'none';
+            }, 5000);
+        }
+
+        // Global flags to coordinate textarea <-> sliders sync
+        let suppressOutputListener = false;    // avoid parsing when programmatically updating textarea
+        let isApplyingFromOutput = false;      // avoid regenerating output while applying parsed values
+
+        // Helper: decimals from step attribute
+        function getStepDecimals(el) {
+            if (!el) return null;
+            const stepAttr = el.getAttribute('step');
+            if (!stepAttr || stepAttr === 'any') return null;
+            if (stepAttr.includes('.')) {
+                const parts = stepAttr.split('.')
+                return parts[1] ? parts[1].length : 0;
+            }
+            return 0;
+        }
+
+        // Helper: format value for display (avoid redundant decimals)
+        function formatDisplayValue(inputEl, value) {
+            const stepDecimals = getStepDecimals(inputEl);
+            let base;
+            if (stepDecimals === null) {
+                base = Number.isInteger(value) ? String(Math.round(value)) : value.toFixed(1);
+            } else if (stepDecimals === 0) {
+                base = String(Math.round(value));
+            } else {
+                base = value.toFixed(stepDecimals);
+            }
+            const hasSuffix = inputEl && inputEl.hasAttribute('data-suffix');
+            const suffix = hasSuffix ? (inputEl.getAttribute('data-suffix') || '') : 'x';
+            return base + suffix;
+        }
+
+        // Clamp a numeric value to an input's min/max and align to step
+        function clampToInput(inputEl, raw) {
+            let val = parseFloat(raw);
+            if (isNaN(val)) val = parseFloat(inputEl.value) || 0;
+            const minAttr = inputEl.getAttribute('min');
+            const maxAttr = inputEl.getAttribute('max');
+            const stepAttr = inputEl.getAttribute('step');
+            const min = (minAttr !== null && minAttr !== '') ? parseFloat(minAttr) : null;
+            const max = (maxAttr !== null && maxAttr !== '') ? parseFloat(maxAttr) : null;
+            if (min !== null && val < min) val = min;
+            if (max !== null && val > max) val = max;
+            if (stepAttr && stepAttr !== 'any') {
+                const step = parseFloat(stepAttr);
+                if (!isNaN(step) && step > 0) {
+                    const anchor = (min !== null) ? min : 0;
+                    val = anchor + Math.round((val - anchor) / step) * step;
+                }
+            }
+            // Respect decimals for display in number input
+            const dec = getStepDecimals(inputEl);
+            if (dec === null) {
+                return Number.isInteger(val) ? String(Math.round(val)) : String(val);
+            } else if (dec === 0) {
+                return String(Math.round(val));
+            } else {
+                return (val).toFixed(dec);
+            }
+        }
+
+        function getWrapper(el) {
+            return el.closest('.input-slider-wrapper') || el.parentElement;
+        }
+
+        function showInputError(inputEl, message) {
+            const wrapper = getWrapper(inputEl);
+            if (!wrapper) return;
+            wrapper.classList.add('has-error');
+            let tip = document.getElementById(inputEl.id + '_error');
+            if (!tip) {
+                tip = document.createElement('div');
+                tip.id = inputEl.id + '_error';
+                tip.className = 'input-error-tip';
+                wrapper.appendChild(tip);
+            }
+            tip.textContent = message;
+            tip.style.display = 'block';
+        }
+
+        function clearInputError(inputEl) {
+            const wrapper = getWrapper(inputEl);
+            if (!wrapper) return;
+            wrapper.classList.remove('has-error');
+            const tip = document.getElementById(inputEl.id + '_error');
+            if (tip) tip.style.display = 'none';
+        }
+
+        function setValueFormatted(id, raw) {
+            const el = document.getElementById(id);
+            if (!el) return;
+            if (el.type === 'number') {
+                el.value = clampToInput(el, raw);
+                clearInputError(el);
+            } else {
+                el.value = raw;
+            }
+            const slider = document.getElementById(id + '_slider');
+            if (slider) {
+                syncSlider(id);
+            } else {
+                updateOutputRealtimeIfNeeded();
+            }
+        }
+
+        // Slider sync helper function
+        function syncSlider(inputId) {
+            const input = document.getElementById(inputId);
+            const slider = document.getElementById(inputId + '_slider');
+            const valueDisplay = document.getElementById(inputId + '_value');
+
+            if (!slider || !valueDisplay) return;
+
+            const value = parseFloat(input.value);
+            slider.value = value;
+
+            // Update display with appropriate suffix/precision
+            valueDisplay.textContent = formatDisplayValue(input, value);
+
+            // Update color coding
+            valueDisplay.className = 'slider-value';
+            if (value < 0.5) {
+                valueDisplay.classList.add('value-low');
+            } else if (value >= 0.5 && value <= 1.5) {
+                valueDisplay.classList.add('value-normal');
+            } else if (value > 1.5 && value <= 3.0) {
+                valueDisplay.classList.add('value-high');
+            } else {
+                valueDisplay.classList.add('value-extreme');
+            }
+
+            // Reflect to output textarea if appropriate
+            updateOutputRealtimeIfNeeded();
+        }
+
+        function syncInput(sliderId) {
+            const slider = document.getElementById(sliderId);
+            const inputId = sliderId.replace('_slider', '');
+            const input = document.getElementById(inputId);
+            const valueDisplay = document.getElementById(inputId + '_value');
+
+            if (!input || !valueDisplay) return;
+
+            const value = parseFloat(slider.value);
+            // Respect input step when writing back
+            const stepDecimals = getStepDecimals(input);
+            if (stepDecimals === null) {
+                input.value = Number.isInteger(value) ? String(Math.round(value)) : value.toString();
+            } else if (stepDecimals === 0) {
+                input.value = String(Math.round(value));
+            } else {
+                input.value = value.toFixed(stepDecimals);
+            }
+
+            // Update display
+            valueDisplay.textContent = formatDisplayValue(input, value);
+
+            // Update color coding
+            valueDisplay.className = 'slider-value';
+            if (value < 0.5) {
+                valueDisplay.classList.add('value-low');
+            } else if (value >= 0.5 && value <= 1.5) {
+                valueDisplay.classList.add('value-normal');
+            } else if (value > 1.5 && value <= 3.0) {
+                valueDisplay.classList.add('value-high');
+            } else {
+                valueDisplay.classList.add('value-extreme');
+            }
+
+            // Reflect to output textarea if appropriate
+            updateOutputRealtimeIfNeeded();
+        }
+
+        // Initialize all sliders
+        function initializeSliders() {
+            document.querySelectorAll('input[type="range"]').forEach(slider => {
+                const inputId = slider.id.replace('_slider', '');
+                const input = document.getElementById(inputId);
+                if (input) {
+                    syncSlider(inputId);
+                }
+            });
+            // Ensure number inputs respect bounds and keep output synced
+            document.querySelectorAll('input[type="number"]').forEach(num => {
+                num.addEventListener('input', () => {
+                    const rawStr = num.value;
+                    const formatted = clampToInput(num, rawStr);
+                    const rawNum = parseFloat(rawStr);
+                    const formattedNum = parseFloat(formatted);
+                    const changed = rawStr.trim() === '' || isNaN(rawNum) || Math.abs((rawNum || 0) - (formattedNum || 0)) > 1e-9;
+                    num.value = formatted;
+                    if (changed) {
+                        const min = num.getAttribute('min');
+                        const max = num.getAttribute('max');
+                        const step = num.getAttribute('step');
+                        let msg = 'Adjusted to ' + formatted;
+                        const parts = [];
+                        if (min !== null && min !== '') parts.push('min ' + min);
+                        if (max !== null && max !== '') parts.push('max ' + max);
+                        if (step && step !== 'any') parts.push('step ' + step);
+                        if (parts.length) msg += ' (' + parts.join(', ') + ')';
+                        showInputError(num, msg);
+                    } else {
+                        clearInputError(num);
+                    }
+                    // If this number has an associated slider, update it
+                    const slider = document.getElementById(num.id + '_slider');
+                    if (slider) {
+                        syncSlider(num.id);
+                    } else {
+                        // No slider (e.g., ports) — still update output in realtime
+                        updateOutputRealtimeIfNeeded();
+                    }
+                });
+                num.addEventListener('change', () => {
+                    num.value = clampToInput(num, num.value);
+                    clearInputError(num);
+                    const slider = document.getElementById(num.id + '_slider');
+                    if (slider) {
+                        syncSlider(num.id);
+                    } else {
+                        updateOutputRealtimeIfNeeded();
+                    }
+                });
+            });
+        }
+
+        // Build INI content from current form values (shared by generator and realtime updates)
+        function buildINIContent() {
+            const platforms = getCrossplayPlatforms();
+            const settings = `OptionSettings=(Difficulty=${document.getElementById('Difficulty').value},RandomizerType=${document.getElementById('RandomizerType').value},RandomizerSeed="${document.getElementById('RandomizerSeed').value}",bIsRandomizerPalLevelRandom=${formatBoolean(document.getElementById('bIsRandomizerPalLevelRandom').checked)},DayTimeSpeedRate=${document.getElementById('DayTimeSpeedRate').value},NightTimeSpeedRate=${document.getElementById('NightTimeSpeedRate').value},ExpRate=${document.getElementById('ExpRate').value},PalCaptureRate=${document.getElementById('PalCaptureRate').value},PalSpawnNumRate=${document.getElementById('PalSpawnNumRate').value},PalDamageRateAttack=${document.getElementById('PalDamageRateAttack').value},PalDamageRateDefense=${document.getElementById('PalDamageRateDefense').value},PlayerDamageRateAttack=${document.getElementById('PlayerDamageRateAttack').value},PlayerDamageRateDefense=${document.getElementById('PlayerDamageRateDefense').value},PlayerStomachDecreaceRate=${document.getElementById('PlayerStomachDecreaceRate').value},PlayerStaminaDecreaceRate=${document.getElementById('PlayerStaminaDecreaceRate').value},PlayerAutoHPRegeneRate=${document.getElementById('PlayerAutoHPRegeneRate').value},PlayerAutoHpRegeneRateInSleep=${document.getElementById('PlayerAutoHpRegeneRateInSleep').value},PalStomachDecreaceRate=${document.getElementById('PalStomachDecreaceRate').value},PalStaminaDecreaceRate=${document.getElementById('PalStaminaDecreaceRate').value},PalAutoHPRegeneRate=${document.getElementById('PalAutoHPRegeneRate').value},PalAutoHpRegeneRateInSleep=${document.getElementById('PalAutoHpRegeneRateInSleep').value},BuildObjectHpRate=${document.getElementById('BuildObjectHpRate').value},BuildObjectDamageRate=${document.getElementById('BuildObjectDamageRate').value},BuildObjectDeteriorationDamageRate=${document.getElementById('BuildObjectDeteriorationDamageRate').value},CollectionDropRate=${document.getElementById('CollectionDropRate').value},CollectionObjectHpRate=${document.getElementById('CollectionObjectHpRate').value},CollectionObjectRespawnSpeedRate=${document.getElementById('CollectionObjectRespawnSpeedRate').value},EnemyDropItemRate=${document.getElementById('EnemyDropItemRate').value},DeathPenalty=${document.getElementById('DeathPenalty').value},bEnablePlayerToPlayerDamage=${formatBoolean(document.getElementById('bEnablePlayerToPlayerDamage').checked)},bEnableFriendlyFire=${formatBoolean(document.getElementById('bEnableFriendlyFire').checked)},bEnableInvaderEnemy=${formatBoolean(document.getElementById('bEnableInvaderEnemy').checked)},bActiveUNKO=${formatBoolean(document.getElementById('bActiveUNKO').checked)},bEnableAimAssistPad=${formatBoolean(document.getElementById('bEnableAimAssistPad').checked)},bEnableAimAssistKeyboard=${formatBoolean(document.getElementById('bEnableAimAssistKeyboard').checked)},DropItemMaxNum=${document.getElementById('DropItemMaxNum').value},DropItemMaxNum_UNKO=${document.getElementById('DropItemMaxNum_UNKO').value},BaseCampMaxNum=${document.getElementById('BaseCampMaxNum').value},BaseCampWorkerMaxNum=${document.getElementById('BaseCampWorkerMaxNum').value},DropItemAliveMaxHours=${document.getElementById('DropItemAliveMaxHours').value},bAutoResetGuildNoOnlinePlayers=${formatBoolean(document.getElementById('bAutoResetGuildNoOnlinePlayers').checked)},AutoResetGuildTimeNoOnlinePlayers=${document.getElementById('AutoResetGuildTimeNoOnlinePlayers').value},GuildPlayerMaxNum=${document.getElementById('GuildPlayerMaxNum').value},BaseCampMaxNumInGuild=${document.getElementById('BaseCampMaxNumInGuild').value},PalEggDefaultHatchingTime=${document.getElementById('PalEggDefaultHatchingTime').value},WorkSpeedRate=${document.getElementById('WorkSpeedRate').value},AutoSaveSpan=${document.getElementById('AutoSaveSpan').value},bIsMultiplay=${formatBoolean(document.getElementById('bIsMultiplay').checked)},bIsPvP=${formatBoolean(document.getElementById('bIsPvP').checked)},bHardcore=${formatBoolean(document.getElementById('bHardcore').checked)},bPalLost=${formatBoolean(document.getElementById('bPalLost').checked)},bCharacterRecreateInHardcore=${formatBoolean(document.getElementById('bCharacterRecreateInHardcore').checked)},bCanPickupOtherGuildDeathPenaltyDrop=${formatBoolean(document.getElementById('bCanPickupOtherGuildDeathPenaltyDrop').checked)},bEnableNonLoginPenalty=${formatBoolean(document.getElementById('bEnableNonLoginPenalty').checked)},bEnableFastTravel=${formatBoolean(document.getElementById('bEnableFastTravel').checked)},bIsStartLocationSelectByMap=${formatBoolean(document.getElementById('bIsStartLocationSelectByMap').checked)},bExistPlayerAfterLogout=${formatBoolean(document.getElementById('bExistPlayerAfterLogout').checked)},bEnableDefenseOtherGuildPlayer=${formatBoolean(document.getElementById('bEnableDefenseOtherGuildPlayer').checked)},bInvisibleOtherGuildBaseCampAreaFX=${formatBoolean(document.getElementById('bInvisibleOtherGuildBaseCampAreaFX').checked)},bBuildAreaLimit=${formatBoolean(document.getElementById('bBuildAreaLimit').checked)},ItemWeightRate=${document.getElementById('ItemWeightRate').value},CoopPlayerMaxNum=${document.getElementById('CoopPlayerMaxNum').value},ServerPlayerMaxNum=${document.getElementById('ServerPlayerMaxNum').value},ServerName="${document.getElementById('ServerName').value}",ServerDescription="${document.getElementById('ServerDescription').value}",AdminPassword="${document.getElementById('AdminPassword').value}",ServerPassword="${document.getElementById('ServerPassword').value}",PublicPort=${document.getElementById('PublicPort').value},PublicIP="${document.getElementById('PublicIP').value}",RCONEnabled=${formatBoolean(document.getElementById('RCONEnabled').checked)},RCONPort=${document.getElementById('RCONPort').value},Region="${document.getElementById('Region').value}",bUseAuth=${formatBoolean(document.getElementById('bUseAuth').checked)},BanListURL="${document.getElementById('BanListURL').value}",RESTAPIEnabled=${formatBoolean(document.getElementById('RESTAPIEnabled').checked)},RESTAPIPort=${document.getElementById('RESTAPIPort').value},bShowPlayerList=${formatBoolean(document.getElementById('bShowPlayerList').checked)},ChatPostLimitPerMinute=${document.getElementById('ChatPostLimitPerMinute').value},CrossplayPlatforms=(${platforms}),bIsUseBackupSaveData=${formatBoolean(document.getElementById('bIsUseBackupSaveData').checked)},LogFormatType=${document.getElementById('LogFormatType').value},SupplyDropSpan=${document.getElementById('SupplyDropSpan').value},EnablePredatorBossPal=${formatBoolean(document.getElementById('EnablePredatorBossPal').checked)},MaxBuildingLimitNum=${document.getElementById('MaxBuildingLimitNum').value},ServerReplicatePawnCullDistance=${document.getElementById('ServerReplicatePawnCullDistance').value},bAllowGlobalPalboxExport=${formatBoolean(document.getElementById('bAllowGlobalPalboxExport').checked)},bAllowGlobalPalboxImport=${formatBoolean(document.getElementById('bAllowGlobalPalboxImport').checked)},EquipmentDurabilityDamageRate=${document.getElementById('EquipmentDurabilityDamageRate').value},ItemContainerForceMarkDirtyInterval=${document.getElementById('ItemContainerForceMarkDirtyInterval').value},ItemCorruptionMultiplier=${document.getElementById('ItemCorruptionMultiplier').value})`;
+            return `[/Script/Pal.PalGameWorldSettings]\n${settings}`;
+        }
+
+        // Update textarea content if it contains a generated OptionSettings, avoiding loops
+        function updateOutputRealtimeIfNeeded() {
+            if (isApplyingFromOutput) return; // don't overwrite user text while parsing it
+            const out = document.getElementById('output');
+            if (!out) return;
+            if (!out.value || out.value.indexOf('OptionSettings=(') === -1) return;
+            const content = buildINIContent();
+            suppressOutputListener = true;
+            out.value = content;
+            suppressOutputListener = false;
+        }
+
+        // Add sliders for number inputs that are missing them
+        function addSlidersForMissing() {
+            const ids = [
+                // Exclude network ports from sliders
+                'ServerPlayerMaxNum', 'CoopPlayerMaxNum', 'GuildPlayerMaxNum',
+                'PalEggDefaultHatchingTime', 'BaseCampMaxNum', 'BaseCampWorkerMaxNum', 'BaseCampMaxNumInGuild',
+                'MaxBuildingLimitNum', 'DropItemMaxNum', 'DropItemMaxNum_UNKO', 'DropItemAliveMaxHours', 'SupplyDropSpan',
+                'EquipmentDurabilityDamageRate', 'ItemCorruptionMultiplier', 'AutoResetGuildTimeNoOnlinePlayers',
+                'AutoSaveSpan', 'ChatPostLimitPerMinute', 'ItemContainerForceMarkDirtyInterval',
+                'ServerReplicatePawnCullDistance'
+            ];
+
+            const suffixMap = {
+                ServerPlayerMaxNum: ' players',
+                CoopPlayerMaxNum: ' players',
+                GuildPlayerMaxNum: ' players',
+                PalEggDefaultHatchingTime: ' h',
+                BaseCampMaxNum: ' bases',
+                BaseCampWorkerMaxNum: ' workers',
+                BaseCampMaxNumInGuild: ' bases',
+                MaxBuildingLimitNum: '',
+                DropItemMaxNum: ' items',
+                DropItemMaxNum_UNKO: ' items',
+                DropItemAliveMaxHours: ' h',
+                SupplyDropSpan: ' min',
+                AutoResetGuildTimeNoOnlinePlayers: ' h',
+                AutoSaveSpan: ' min',
+                ChatPostLimitPerMinute: ' /min',
+                ItemContainerForceMarkDirtyInterval: ' s',
+                ServerReplicatePawnCullDistance: ' u'
+            };
+
+            ids.forEach(id => {
+                const input = document.getElementById(id);
+                if (!input) return;
+
+                // Skip if slider already exists
+                if (document.getElementById(id + '_slider')) return;
+
+                // Mark suffix if provided
+                if (Object.prototype.hasOwnProperty.call(suffixMap, id)) {
+                    input.setAttribute('data-suffix', suffixMap[id]);
+                }
+
+                // Ensure number input updates slider when typing
+                input.setAttribute('oninput', "syncSlider('" + id + "')");
+
+                const parent = input.parentNode;
+                if (!parent) return;
+
+                // Create wrapper
+                const wrapper = document.createElement('div');
+                wrapper.className = 'input-slider-wrapper';
+
+                // Replace input with wrapper and append input inside
+                parent.replaceChild(wrapper, input);
+                wrapper.appendChild(input);
+
+                // Create range slider
+                const range = document.createElement('input');
+                range.type = 'range';
+                range.id = id + '_slider';
+                if (input.hasAttribute('min')) range.min = input.getAttribute('min');
+                if (input.hasAttribute('max')) range.max = input.getAttribute('max');
+                if (input.hasAttribute('step')) {
+                    range.step = input.getAttribute('step');
+                } else {
+                    // Default to integer steps for integer-like values
+                    const val = parseFloat(input.value);
+                    range.step = Number.isInteger(val) ? '1' : '0.1';
+                }
+                range.value = parseFloat(input.value) || 0;
+                range.setAttribute('oninput', "syncInput('" + range.id + "')");
+                wrapper.appendChild(range);
+
+                // Create value display span
+                const span = document.createElement('span');
+                span.className = 'slider-value';
+                span.id = id + '_value';
+                span.textContent = '';
+                wrapper.appendChild(span);
+
+                // Sync display
+                syncSlider(id);
+            });
+        }
+
+        // Apply preset configurations
+        function applyPreset(preset) {
+            if (!confirm(`Apply ${preset.charAt(0).toUpperCase() + preset.slice(1)} Mode preset? This will override your current settings.`)) {
+                return;
+            }
+
+            // Reset to defaults first
+            document.getElementById('settingsForm').reset();
+
+            // Normalize all numbers after reset so defaults use proper formatting
+            document.querySelectorAll('input[type="number"]').forEach(n => {
+                n.value = clampToInput(n, n.value);
+            });
+
+            // Apply preset-specific values
+            if (preset === 'casual') {
+                // Easier gameplay
+                setValueFormatted('ExpRate', '2');
+                setValueFormatted('PalCaptureRate', '2');
+                setValueFormatted('PlayerDamageRateAttack', '1.5');
+                setValueFormatted('PlayerDamageRateDefense', '0.7');
+                setValueFormatted('PalDamageRateAttack', '1.3');
+                setValueFormatted('EnemyDropItemRate', '2');
+                setValueFormatted('CollectionDropRate', '2');
+                setValueFormatted('WorkSpeedRate', '2');
+                document.getElementById('DeathPenalty').value = 'Item';
+                document.getElementById('bEnableFastTravel').checked = true;
+                setValueFormatted('PalEggDefaultHatchingTime', '36');
+                showMessage('successMessage', 'Casual Mode preset applied! Easier gameplay with faster progression.');
+            } else if (preset === 'normal') {
+                // Default balanced gameplay
+                setValueFormatted('ExpRate', '1');
+                setValueFormatted('PalCaptureRate', '1');
+                setValueFormatted('PlayerDamageRateAttack', '1');
+                setValueFormatted('PlayerDamageRateDefense', '1');
+                setValueFormatted('PalDamageRateAttack', '1');
+                setValueFormatted('EnemyDropItemRate', '1');
+                setValueFormatted('CollectionDropRate', '1');
+                setValueFormatted('WorkSpeedRate', '1');
+                document.getElementById('DeathPenalty').value = 'All';
+                document.getElementById('bEnableFastTravel').checked = true;
+                setValueFormatted('PalEggDefaultHatchingTime', '72');
+                showMessage('successMessage', 'Normal Mode preset applied! Balanced default settings.');
+            } else if (preset === 'hardcore') {
+                // Harder gameplay
+                setValueFormatted('ExpRate', '0.5');
+                setValueFormatted('PalCaptureRate', '0.5');
+                setValueFormatted('PlayerDamageRateAttack', '0.8');
+                setValueFormatted('PlayerDamageRateDefense', '1.5');
+                setValueFormatted('PalDamageRateAttack', '0.7');
+                setValueFormatted('EnemyDropItemRate', '0.5');
+                setValueFormatted('CollectionDropRate', '0.7');
+                setValueFormatted('WorkSpeedRate', '0.5');
+                document.getElementById('DeathPenalty').value = 'All';
+                document.getElementById('bHardcore').checked = true;
+                document.getElementById('bPalLost').checked = true;
+                document.getElementById('bEnableFastTravel').checked = false;
+                setValueFormatted('PalEggDefaultHatchingTime', '120');
+                setValueFormatted('PlayerStomachDecreaceRate', '2');
+                setValueFormatted('PlayerStaminaDecreaceRate', '1.5');
+                showMessage('successMessage', 'Hardcore Mode preset applied! Challenging survival experience.');
+            } else if (preset === 'builder') {
+                // Base building focused
+                setValueFormatted('BuildObjectHpRate', '2');
+                setValueFormatted('BuildObjectDamageRate', '0.5');
+                setValueFormatted('BuildObjectDeteriorationDamageRate', '0.1');
+                setValueFormatted('WorkSpeedRate', '2');
+                setValueFormatted('CollectionDropRate', '1.5');
+                setValueFormatted('CollectionObjectHpRate', '0.8');
+                setValueFormatted('CollectionObjectRespawnSpeedRate', '1.5');
+                document.getElementById('bEnableInvaderEnemy').checked = false;
+                document.getElementById('DeathPenalty').value = 'Item';
+                setValueFormatted('PalEggDefaultHatchingTime', '48');
+                showMessage('successMessage', 'Builder Mode applied! Stronger buildings, faster work, fewer raids.');
+            } else if (preset === 'progression') {
+                // Fast progression leveling
+                setValueFormatted('ExpRate', '3');
+                setValueFormatted('PalCaptureRate', '1.8');
+                setValueFormatted('EnemyDropItemRate', '1.5');
+                setValueFormatted('CollectionDropRate', '1.5');
+                setValueFormatted('WorkSpeedRate', '1.5');
+                setValueFormatted('PalEggDefaultHatchingTime', '36');
+                document.getElementById('DeathPenalty').value = 'Item';
+                document.getElementById('bEnableFastTravel').checked = true;
+                showMessage('successMessage', 'Fast Progression applied! Faster leveling and catch rates.');
+            } else if (preset === 'lootfest') {
+                // High drop/resource server
+                setValueFormatted('CollectionDropRate', '3');
+                setValueFormatted('EnemyDropItemRate', '3');
+                setValueFormatted('CollectionObjectRespawnSpeedRate', '2');
+                setValueFormatted('EquipmentDurabilityDamageRate', '0.6');
+                setValueFormatted('ItemCorruptionMultiplier', '0.6');
+                setValueFormatted('DropItemMaxNum', '5000');
+                setValueFormatted('DropItemMaxNum_UNKO', '200');
+                setValueFormatted('DropItemAliveMaxHours', '2');
+                showMessage('successMessage', 'Lootfest applied! More drops, faster respawns, gear lasts longer.');
+            }
+
+            // Set common default checkboxes
+            document.getElementById('bUseAuth').checked = true;
+            document.getElementById('bEnableInvaderEnemy').checked = true;
+            document.getElementById('bEnableAimAssistPad').checked = true;
+            document.getElementById('bIsStartLocationSelectByMap').checked = true;
+            document.getElementById('bEnableNonLoginPenalty').checked = true;
+            document.getElementById('bIsUseBackupSaveData').checked = true;
+            document.getElementById('bAllowGlobalPalboxExport').checked = true;
+            document.getElementById('EnablePredatorBossPal').checked = true;
+            document.querySelectorAll('[id^="platform_"]').forEach(cb => cb.checked = true);
+
+            // Sync all sliders after preset application
+            initializeSliders();
+        }
+
+        // Initialize - set default values
+        document.addEventListener('DOMContentLoaded', function() {
+            // Initialize theme (dark mode as default)
+            initializeTheme();
+            
+            // Set default checkboxes
+            document.getElementById('bUseAuth').checked = true;
+            document.getElementById('bEnableInvaderEnemy').checked = true;
+            document.getElementById('bEnableAimAssistPad').checked = true;
+            document.getElementById('bEnableFastTravel').checked = true;
+            document.getElementById('bIsStartLocationSelectByMap').checked = true;
+            document.getElementById('bEnableNonLoginPenalty').checked = true;
+            document.getElementById('bIsUseBackupSaveData').checked = true;
+            document.getElementById('bAllowGlobalPalboxExport').checked = true;
+            document.getElementById('EnablePredatorBossPal').checked = true;
+
+            // Normalize number defaults to correct precision/limits
+            document.querySelectorAll('input[type="number"]').forEach(n => {
+                n.value = clampToInput(n, n.value);
+            });
+
+            // Add sliders for fields missing them, then initialize all sliders
+            addSlidersForMissing();
+            // Initialize all sliders
+            initializeSliders();
+
+            // Auto-parse when INI text area changes (debounced)
+            const outputEl = document.getElementById('output');
+            if (outputEl) {
+                let parseTimer = null;
+                outputEl.addEventListener('input', () => {
+                    if (suppressOutputListener) return;
+                    if (parseTimer) clearTimeout(parseTimer);
+                    parseTimer = setTimeout(() => {
+                        try {
+                            isApplyingFromOutput = true;
+                            parseINI(outputEl.value);
+                        } catch (e) {
+                            // ignore parse errors while typing
+                        } finally {
+                            isApplyingFromOutput = false;
+                        }
+                    }, 400);
+                });
+            }
+        });
+    </script>
+</body>
+</html>

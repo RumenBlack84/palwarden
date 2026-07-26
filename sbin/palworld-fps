@@ -1,0 +1,707 @@
+#!/usr/bin/env python3
+"""Palworld FPS metrics sampler, reporter, graph generator, and Discord poster."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import math
+import mimetypes
+import os
+import sqlite3
+import statistics
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+DB_PATH = Path("/var/lib/palworld/metrics.sqlite3")
+RETENTION_SECONDS = 7 * 24 * 60 * 60
+API_HELPER = "/usr/local/sbin/palworld-api"
+NOTIFY_ENV = Path("/etc/palworld/notify.env")
+
+WINDOW_SECONDS = {
+    "5m": 5 * 60,
+    "60m": 60 * 60,
+    "24h": 24 * 60 * 60,
+    "7d": 7 * 24 * 60 * 60,
+}
+
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def iso_utc(ms: int) -> str:
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def connect(db_path: Path = DB_PATH) -> sqlite3.Connection:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA busy_timeout=5000")
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS fps_samples (
+            sampled_at_ms INTEGER NOT NULL PRIMARY KEY,
+            sampled_at_utc TEXT NOT NULL,
+            ok INTEGER NOT NULL,
+            serverfps REAL,
+            serverfpsaverage REAL,
+            serverframetime REAL,
+            currentplayernum INTEGER,
+            maxplayernum INTEGER,
+            uptime INTEGER,
+            basecampnum INTEGER,
+            days INTEGER,
+            error TEXT
+        )
+        """
+    )
+    con.execute("CREATE INDEX IF NOT EXISTS idx_fps_samples_ok_time ON fps_samples(ok, sampled_at_ms)")
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS fps_events (
+            event_at_ms INTEGER NOT NULL PRIMARY KEY,
+            event_at_utc TEXT NOT NULL,
+            label TEXT NOT NULL,
+            category TEXT NOT NULL DEFAULT 'manual',
+            details TEXT
+        )
+        """
+    )
+    con.execute("CREATE INDEX IF NOT EXISTS idx_fps_events_time ON fps_events(event_at_ms)")
+    return con
+
+
+def prune(con: sqlite3.Connection, retention_seconds: int = RETENTION_SECONDS) -> int:
+    cutoff_ms = now_ms() - retention_seconds * 1000
+    cur = con.execute("DELETE FROM fps_samples WHERE sampled_at_ms < ?", (cutoff_ms,))
+    con.commit()
+    return int(cur.rowcount or 0)
+
+
+def extract_json(text: str) -> dict[str, Any]:
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end < start:
+        raise ValueError("no JSON object found in API output")
+    return json.loads(text[start : end + 1])
+
+
+def fetch_metrics(timeout: int = 5) -> dict[str, Any]:
+    proc = subprocess.run(
+        [API_HELPER, "metrics"],
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+        check=False,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "unknown API error").strip()
+        raise RuntimeError(detail[:500])
+    return extract_json(proc.stdout)
+
+
+def insert_sample(con: sqlite3.Connection, metrics: dict[str, Any] | None, error: str | None = None) -> int:
+    sampled_at_ms = now_ms()
+    # Avoid rare primary-key collisions from manual back-to-back runs.
+    while con.execute("SELECT 1 FROM fps_samples WHERE sampled_at_ms=?", (sampled_at_ms,)).fetchone():
+        sampled_at_ms += 1
+    if metrics is None:
+        con.execute(
+            """
+            INSERT INTO fps_samples (sampled_at_ms, sampled_at_utc, ok, error)
+            VALUES (?, ?, 0, ?)
+            """,
+            (sampled_at_ms, iso_utc(sampled_at_ms), error or "unknown error"),
+        )
+    else:
+        con.execute(
+            """
+            INSERT INTO fps_samples (
+                sampled_at_ms, sampled_at_utc, ok, serverfps, serverfpsaverage,
+                serverframetime, currentplayernum, maxplayernum, uptime, basecampnum, days, error
+            ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+            """,
+            (
+                sampled_at_ms,
+                iso_utc(sampled_at_ms),
+                metrics.get("serverfps"),
+                metrics.get("serverfpsaverage"),
+                metrics.get("serverframetime"),
+                metrics.get("currentplayernum"),
+                metrics.get("maxplayernum"),
+                metrics.get("uptime"),
+                metrics.get("basecampnum"),
+                metrics.get("days"),
+            ),
+        )
+    con.commit()
+    return sampled_at_ms
+
+
+def sample(args: argparse.Namespace) -> int:
+    con = connect(Path(args.db))
+    try:
+        metrics = fetch_metrics(timeout=args.timeout)
+        ms = insert_sample(con, metrics)
+        deleted = prune(con, args.retention_days * 86400)
+        print(f"sampled ok at {iso_utc(ms)} serverfps={metrics.get('serverfps')} deleted_old={deleted}")
+        return 0
+    except Exception as exc:
+        ms = insert_sample(con, None, str(exc))
+        deleted = prune(con, args.retention_days * 86400)
+        print(f"sampled error at {iso_utc(ms)} error={str(exc)[:200]!r} deleted_old={deleted}")
+        return 0
+
+
+def insert_event(con: sqlite3.Connection, label: str, category: str = "manual", details: str | None = None, event_at_ms: int | None = None) -> int:
+    event_at_ms = event_at_ms or now_ms()
+    while con.execute("SELECT 1 FROM fps_events WHERE event_at_ms=?", (event_at_ms,)).fetchone():
+        event_at_ms += 1
+    con.execute(
+        """
+        INSERT INTO fps_events (event_at_ms, event_at_utc, label, category, details)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (event_at_ms, iso_utc(event_at_ms), label, category, details),
+    )
+    con.commit()
+    return event_at_ms
+
+
+def events_for_window(con: sqlite3.Connection, seconds: int) -> list[sqlite3.Row]:
+    cutoff_ms = now_ms() - seconds * 1000
+    return list(
+        con.execute(
+            """
+            SELECT * FROM fps_events
+            WHERE event_at_ms >= ?
+            ORDER BY event_at_ms ASC
+            """,
+            (cutoff_ms,),
+        )
+    )
+
+
+def mark(args: argparse.Namespace) -> int:
+    con = connect(Path(args.db))
+    ms = insert_event(con, args.label, args.category, args.details)
+    print(f"marked {iso_utc(ms)} [{args.category}] {args.label}")
+    return 0
+
+
+def list_events(args: argparse.Namespace) -> int:
+    con = connect(Path(args.db))
+    seconds = WINDOW_SECONDS[args.window]
+    rows = events_for_window(con, seconds)
+    if args.json:
+        print(json.dumps([dict(r) for r in rows], indent=2, sort_keys=True))
+        return 0
+    if not rows:
+        print(f"No FPS events found in the last {args.window}.")
+        return 0
+    for r in rows:
+        details = f" — {r['details']}" if r['details'] else ""
+        print(f"{r['event_at_utc']} [{r['category']}] {r['label']}{details}")
+    return 0
+
+
+def rows_for_window(con: sqlite3.Connection, seconds: int) -> list[sqlite3.Row]:
+    cutoff_ms = now_ms() - seconds * 1000
+    return list(
+        con.execute(
+            """
+            SELECT * FROM fps_samples
+            WHERE sampled_at_ms >= ?
+            ORDER BY sampled_at_ms ASC
+            """,
+            (cutoff_ms,),
+        )
+    )
+
+
+def good_fps(rows: list[sqlite3.Row]) -> list[float]:
+    return [float(r["serverfps"]) for r in rows if r["ok"] and r["serverfps"] is not None]
+
+
+def percentile(values: list[float], p: float) -> float | None:
+    if not values:
+        return None
+    values = sorted(values)
+    k = (len(values) - 1) * p
+    lo = math.floor(k)
+    hi = math.ceil(k)
+    if lo == hi:
+        return values[int(k)]
+    return values[lo] * (hi - k) + values[hi] * (k - lo)
+
+
+def percent_low(values: list[float], percent: float) -> float | None:
+    """Return the average FPS of the slowest N percent of samples.
+
+    This follows the gaming-performance convention where a "1% low" is
+    the mean of the worst 1% of observed FPS samples, not the p01 boundary.
+    For small windows, use at least one sample so the value remains defined.
+    """
+    if not values:
+        return None
+    values = sorted(values)
+    count = max(1, math.ceil(len(values) * (percent / 100.0)))
+    return statistics.fmean(values[:count])
+
+
+def rows_between(con: sqlite3.Connection, start_ms: int, end_ms: int) -> list[sqlite3.Row]:
+    return list(
+        con.execute(
+            """
+            SELECT * FROM fps_samples
+            WHERE sampled_at_ms >= ? AND sampled_at_ms < ?
+            ORDER BY sampled_at_ms ASC
+            """,
+            (start_ms, end_ms),
+        )
+    )
+
+
+def sample_stats(rows: list[sqlite3.Row]) -> dict[str, Any]:
+    fps = good_fps(rows)
+    failures = sum(1 for r in rows if not r["ok"])
+    players = [int(r["currentplayernum"]) for r in rows if r["ok"] and r["currentplayernum"] is not None]
+    return {
+        "samples": len(fps),
+        "failures": failures,
+        "avg": statistics.fmean(fps) if fps else None,
+        "low_1pct": percent_low(fps, 1.0),
+        "low_0_1pct": percent_low(fps, 0.1),
+        "min": min(fps) if fps else None,
+        "max": max(fps) if fps else None,
+        "p05": percentile(fps, 0.05),
+        "p95": percentile(fps, 0.95),
+        "avg_players": statistics.fmean(players) if players else None,
+        "max_players": max(players) if players else None,
+    }
+
+
+def find_event(con: sqlite3.Connection, query: str) -> sqlite3.Row:
+    row = con.execute(
+        """
+        SELECT * FROM fps_events
+        WHERE label LIKE ? OR category LIKE ? OR details LIKE ?
+        ORDER BY event_at_ms DESC
+        LIMIT 1
+        """,
+        tuple([f"%{query}%"] * 3),
+    ).fetchone()
+    if row is None:
+        raise RuntimeError(f"no event marker found matching {query!r}")
+    return row
+
+
+def compare_around_event(con: sqlite3.Connection, event_query: str, before_seconds: int, after_seconds: int) -> dict[str, Any]:
+    event = find_event(con, event_query)
+    event_ms = int(event["event_at_ms"])
+    before_rows = rows_between(con, event_ms - before_seconds * 1000, event_ms)
+    after_rows = rows_between(con, event_ms, event_ms + after_seconds * 1000)
+    before = sample_stats(before_rows)
+    after = sample_stats(after_rows)
+    delta: dict[str, Any] = {}
+    for key in ["avg", "low_1pct", "low_0_1pct", "min", "max", "p05", "p95", "avg_players", "max_players", "failures", "samples"]:
+        b = before.get(key)
+        a = after.get(key)
+        delta[key] = (a - b) if a is not None and b is not None else None
+    return {
+        "event": dict(event),
+        "before_seconds": before_seconds,
+        "after_seconds": after_seconds,
+        "before": before,
+        "after": after,
+        "delta": delta,
+    }
+
+
+def parse_duration(value: str) -> int:
+    raw = str(value).strip().lower()
+    if raw in WINDOW_SECONDS:
+        return WINDOW_SECONDS[raw]
+    multipliers = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    suffix = raw[-1:]
+    if suffix in multipliers:
+        return int(float(raw[:-1]) * multipliers[suffix])
+    return int(float(raw))
+
+
+def fmt_delta(value: Any, digits: int = 1) -> str:
+    if value is None:
+        return "n/a"
+    try:
+        val = float(value)
+        return f"{val:+.{digits}f}"
+    except Exception:
+        return str(value)
+
+
+def format_compare(result: dict[str, Any]) -> str:
+    event = result["event"]
+    before = result["before"]
+    after = result["after"]
+    delta = result["delta"]
+    lines = ["📊 **Palworld FPS Compare**", ""]
+    lines.append(f"Marker: `{event.get('event_at_utc')}` [{event.get('category')}] {event.get('label')}")
+    if event.get("details"):
+        lines.append(f"Details: {event.get('details')}")
+    lines.append("")
+    lines.append(f"Before window: `{result['before_seconds']}s` | After window: `{result['after_seconds']}s`")
+    lines.append("")
+    for title, stats in [("Before", before), ("After", after)]:
+        lines.append(f"{title}:")
+        lines.append(f"  samples: `{stats.get('samples', 0)}` | API failures: `{stats.get('failures', 0)}`")
+        lines.append(f"  avg FPS: `{fmt_num(stats.get('avg'))}` | 1% low: `{fmt_num(stats.get('low_1pct'))}` | 0.1% low: `{fmt_num(stats.get('low_0_1pct'))}`")
+        lines.append(f"  range: min `{fmt_num(stats.get('min'))}`, p05 `{fmt_num(stats.get('p05'))}`, p95 `{fmt_num(stats.get('p95'))}`, max `{fmt_num(stats.get('max'))}`")
+        lines.append(f"  players: avg `{fmt_num(stats.get('avg_players'))}`, max `{fmt_num(stats.get('max_players'), 0)}`")
+        lines.append("")
+    lines.append("Delta after-before:")
+    lines.append(f"  avg FPS: `{fmt_delta(delta.get('avg'))}` | 1% low: `{fmt_delta(delta.get('low_1pct'))}` | 0.1% low: `{fmt_delta(delta.get('low_0_1pct'))}`")
+    lines.append(f"  min: `{fmt_delta(delta.get('min'))}` | p05: `{fmt_delta(delta.get('p05'))}` | p95: `{fmt_delta(delta.get('p95'))}` | max: `{fmt_delta(delta.get('max'))}`")
+    lines.append(f"  players avg: `{fmt_delta(delta.get('avg_players'))}` | players max: `{fmt_delta(delta.get('max_players'), 0)}` | API failures: `{fmt_delta(delta.get('failures'), 0)}`")
+    return "\n".join(lines)
+
+
+def player_axis_top(max_observed_players: int | None, max_configured_players: int | None) -> int:
+    top = max(max_observed_players or 0, max_configured_players or 0, 1) + 1
+    return int(math.ceil(top))
+
+
+def graph_series_for_window(con: sqlite3.Connection, seconds: int, end_ms: int | None = None) -> dict[str, Any]:
+    end_ms = end_ms or now_ms()
+    rows = rows_between(con, end_ms - seconds * 1000, end_ms)
+    good = [r for r in rows if r["ok"] and r["serverfps"] is not None]
+    times = [datetime.fromtimestamp(r["sampled_at_ms"] / 1000).astimezone() for r in good]
+    fps = [float(r["serverfps"]) for r in good]
+    avg2_pairs = [(t, r["serverfpsaverage"]) for t, r in zip(times, good) if r["serverfpsaverage"] is not None]
+    player_pairs = [(t, r["currentplayernum"]) for t, r in zip(times, good) if r["currentplayernum"] is not None]
+    max_players = None
+    max_player_values = [int(r["maxplayernum"]) for r in good if r["maxplayernum"] is not None]
+    if max_player_values:
+        max_players = max(max_player_values)
+    return {
+        "rows": rows,
+        "good": good,
+        "times": times,
+        "fps": fps,
+        "avg2_times": [p[0] for p in avg2_pairs],
+        "avg2_vals": [float(p[1]) for p in avg2_pairs],
+        "player_times": [p[0] for p in player_pairs],
+        "players": [int(p[1]) for p in player_pairs],
+        "max_players": max_players,
+        "events": list(
+            con.execute(
+                """
+                SELECT * FROM fps_events
+                WHERE event_at_ms >= ? AND event_at_ms < ?
+                ORDER BY event_at_ms ASC
+                """,
+                (end_ms - seconds * 1000, end_ms),
+            )
+        ),
+    }
+
+
+def compare(args: argparse.Namespace) -> int:
+    con = connect(Path(args.db))
+    result = compare_around_event(con, args.mark, parse_duration(args.before), parse_duration(args.after))
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        print(format_compare(result))
+    return 0
+
+
+def summarize(con: sqlite3.Connection, live: dict[str, Any] | None = None) -> dict[str, Any]:
+    out: dict[str, Any] = {"generated_at": datetime.now().astimezone().isoformat(timespec="seconds")}
+    if live:
+        out["current"] = {
+            "serverfps": live.get("serverfps"),
+            "serverfpsaverage": live.get("serverfpsaverage"),
+            "serverframetime": live.get("serverframetime"),
+            "currentplayernum": live.get("currentplayernum"),
+            "maxplayernum": live.get("maxplayernum"),
+            "uptime": live.get("uptime"),
+            "days": live.get("days"),
+        }
+    windows: dict[str, Any] = {}
+    for name, seconds in WINDOW_SECONDS.items():
+        rows = rows_for_window(con, seconds)
+        windows[name] = sample_stats(rows)
+    out["windows"] = windows
+    out["events_24h"] = [dict(r) for r in events_for_window(con, WINDOW_SECONDS["24h"])]
+    return out
+
+
+def fmt_num(value: Any, digits: int = 1) -> str:
+    if value is None:
+        return "n/a"
+    try:
+        return f"{float(value):.{digits}f}"
+    except Exception:
+        return str(value)
+
+
+def format_summary(summary: dict[str, Any]) -> str:
+    current = summary.get("current", {})
+    windows = summary.get("windows", {})
+    lines = ["🎮 **Palworld Server FPS**", ""]
+    lines.append(f"Current: `{fmt_num(current.get('serverfps'))}` FPS")
+    lines.append(f"Server 2m Avg: `{fmt_num(current.get('serverfpsaverage'))}` FPS")
+    lines.append(f"Frame time: `{fmt_num(current.get('serverframetime'), 2)}` ms")
+    if current.get("currentplayernum") is not None:
+        lines.append(f"Players: `{current.get('currentplayernum')}/{current.get('maxplayernum')}`")
+    lines.append("")
+    for label in ["5m", "60m", "24h", "7d"]:
+        w = windows.get(label, {})
+        lines.append(
+            f"Avg {label}: `{fmt_num(w.get('avg'))}` FPS | "
+            f"1% low: `{fmt_num(w.get('low_1pct'))}` | "
+            f"0.1% low: `{fmt_num(w.get('low_0_1pct'))}` "
+            f"(samples `{w.get('samples', 0)}`, API failures `{w.get('failures', 0)}`)"
+        )
+    w24 = windows.get("24h", {})
+    if w24.get("samples"):
+        lines.append("")
+        lines.append(
+            "24h range: "
+            f"min `{fmt_num(w24.get('min'))}`, 1% low `{fmt_num(w24.get('low_1pct'))}`, "
+            f"0.1% low `{fmt_num(w24.get('low_0_1pct'))}`, p05 `{fmt_num(w24.get('p05'))}`, "
+            f"p95 `{fmt_num(w24.get('p95'))}`, max `{fmt_num(w24.get('max'))}` FPS"
+        )
+    events = summary.get("events_24h") or []
+    if events:
+        lines.append("")
+        lines.append("Events 24h:")
+        for event in events[-5:]:
+            lines.append(f"- `{event.get('event_at_utc')}` [{event.get('category')}] {event.get('label')}")
+        if len(events) > 5:
+            lines.append(f"- ...and {len(events) - 5} earlier event(s)")
+    lines.append("")
+    lines.append(f"Generated: `{summary.get('generated_at')}`")
+    return "\n".join(lines)
+
+
+def make_graph(con: sqlite3.Connection, output: Path, window: str) -> Path:
+    seconds = WINDOW_SECONDS[window]
+    series = graph_series_for_window(con, seconds)
+    if not series["good"]:
+        raise RuntimeError(f"no successful FPS samples for window {window}")
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.dates as mdates
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import MaxNLocator
+
+    fig, (ax, ax_players) = plt.subplots(
+        2,
+        1,
+        figsize=(12, 7.2),
+        dpi=140,
+        sharex=True,
+        constrained_layout=True,
+        gridspec_kw={"height_ratios": [3, 1]},
+    )
+    times = series["times"]
+    fps = series["fps"]
+    ax.plot(times, fps, label="serverfps", color="#3b82f6", linewidth=1.2)
+    if series["avg2_vals"]:
+        ax.plot(series["avg2_times"], series["avg2_vals"], label="serverfpsaverage (~2m)", color="#f97316", linewidth=1.1, alpha=0.85)
+    ax.axhline(60, color="#22c55e", linestyle="--", linewidth=0.9, alpha=0.8, label="60 FPS")
+    ax.set_title(f"Palworld Server FPS / Players - last {window}")
+    ax.set_ylabel("FPS")
+    ax.grid(True, alpha=0.25)
+    ax.set_ylim(bottom=max(0, min(fps) - 5), top=max(65, max(fps) + 5))
+
+    if series["players"]:
+        ax_players.step(series["player_times"], series["players"], where="post", label="players", color="#a855f7", linewidth=1.2)
+        top = player_axis_top(max(series["players"]), series["max_players"])
+        ax_players.set_ylim(bottom=0, top=top)
+    else:
+        ax_players.text(0.5, 0.5, "No player-count samples", transform=ax_players.transAxes, ha="center", va="center", color="#94a3b8")
+        ax_players.set_ylim(bottom=0, top=1)
+    ax_players.yaxis.set_major_locator(MaxNLocator(integer=True))
+    ax_players.set_ylabel("Players")
+    ax_players.set_xlabel("Time")
+    ax_players.grid(True, alpha=0.25)
+    if series["max_players"] is not None:
+        ax_players.axhline(series["max_players"], color="#64748b", linestyle="--", linewidth=0.8, alpha=0.55, label="max players")
+
+    graph_events = series["events"]
+    for idx, event in enumerate(graph_events):
+        event_time = datetime.fromtimestamp(event["event_at_ms"] / 1000).astimezone()
+        for event_ax in (ax, ax_players):
+            event_ax.axvline(event_time, color="#eab308", linestyle=":", linewidth=0.9, alpha=0.75)
+        if idx < 8:
+            label = str(event["label"])
+            if len(label) > 28:
+                label = label[:25] + "..."
+            ax.text(event_time, ax.get_ylim()[1], label, rotation=90, va="top", ha="right", fontsize=7, color="#fde68a")
+    ax.legend(loc="lower left")
+    ax_players.legend(loc="upper left")
+    if window in {"5m", "60m"}:
+        ax_players.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+    elif window == "24h":
+        ax_players.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
+    else:
+        ax_players.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d"))
+    plt.setp(ax_players.get_xticklabels(), rotation=30, ha="right")
+    failures = sum(1 for r in series["rows"] if not r["ok"])
+    fig.text(0.01, 0.01, f"samples={len(series['good'])} api_failures={failures} events={len(graph_events)} generated={datetime.now().astimezone().isoformat(timespec='seconds')}", fontsize=8)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output, format="png")
+    plt.close(fig)
+    return output
+
+
+def load_notify_env() -> dict[str, str]:
+    vals: dict[str, str] = {}
+    if not NOTIFY_ENV.exists():
+        return vals
+    for line in NOTIFY_ENV.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        vals[k] = v.strip().strip('"').strip("'")
+    return vals
+
+
+def multipart_post(url: str, payload: dict[str, Any], file_path: Path) -> int:
+    boundary = "----palworldfps" + base64.urlsafe_b64encode(os.urandom(12)).decode()
+    filename = file_path.name
+    content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    parts: list[bytes] = []
+    parts.append(
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"payload_json\"\r\n\r\n".encode()
+        + json.dumps(payload).encode("utf-8")
+        + b"\r\n"
+    )
+    parts.append(
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"files[0]\"; filename=\"{filename}\"\r\nContent-Type: {content_type}\r\n\r\n".encode()
+        + file_path.read_bytes()
+        + b"\r\n"
+    )
+    parts.append(f"--{boundary}--\r\n".encode())
+    body = b"".join(parts)
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}", "User-Agent": "palworld-fps/1.0"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        resp.read()
+        return int(resp.status)
+
+
+def report(args: argparse.Namespace) -> int:
+    con = connect(Path(args.db))
+    live = None
+    if not args.no_live:
+        try:
+            live = fetch_metrics(timeout=args.timeout)
+        except Exception as exc:
+            print(f"warning: live metrics fetch failed: {exc}", file=sys.stderr)
+    summary = summarize(con, live)
+    if args.json:
+        print(json.dumps(summary, indent=2, sort_keys=True))
+    else:
+        print(format_summary(summary))
+    if args.graph:
+        graph_path = make_graph(con, Path(args.graph), args.window)
+        print(f"graph={graph_path}")
+    return 0
+
+
+def discord(args: argparse.Namespace) -> int:
+    con = connect(Path(args.db))
+    try:
+        live = fetch_metrics(timeout=args.timeout)
+    except Exception as exc:
+        live = None
+        print(f"warning: live metrics fetch failed: {exc}", file=sys.stderr)
+    summary = summarize(con, live)
+    content = format_summary(summary)
+    with tempfile.TemporaryDirectory(prefix="palworld-fps-") as td:
+        graph = Path(td) / f"palworld-fps-{args.window}.png"
+        make_graph(con, graph, args.window)
+        if args.dry_run:
+            print(content)
+            print(f"dry_run_graph={graph} size={graph.stat().st_size}")
+            return 0
+        env = load_notify_env()
+        url = env.get("PALWORLD_DISCORD_WEBHOOK", "")
+        if not url:
+            raise RuntimeError(f"PALWORLD_DISCORD_WEBHOOK missing from {NOTIFY_ENV}")
+        name = env.get("PALWORLD_NOTIFY_NAME", "Palworld")
+        payload = {"content": content, "username": name}
+        status = multipart_post(url, payload, graph)
+        print(f"posted Discord FPS report status={status} graph_bytes={graph.stat().st_size}")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--db", default=str(DB_PATH))
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_sample = sub.add_parser("sample", help="collect one metrics sample into SQLite")
+    p_sample.add_argument("--timeout", type=int, default=5)
+    p_sample.add_argument("--retention-days", type=int, default=7)
+    p_sample.set_defaults(func=sample)
+
+    p_report = sub.add_parser("report", help="print summary and optionally generate graph")
+    p_report.add_argument("--timeout", type=int, default=5)
+    p_report.add_argument("--json", action="store_true")
+    p_report.add_argument("--no-live", action="store_true")
+    p_report.add_argument("--graph", help="PNG output path")
+    p_report.add_argument("--window", choices=sorted(WINDOW_SECONDS), default="24h")
+    p_report.set_defaults(func=report)
+
+    p_discord = sub.add_parser("discord", help="post summary + graph to Discord webhook")
+    p_discord.add_argument("--timeout", type=int, default=5)
+    p_discord.add_argument("--window", choices=sorted(WINDOW_SECONDS), default="24h")
+    p_discord.add_argument("--dry-run", action="store_true")
+    p_discord.set_defaults(func=discord)
+
+    p_mark = sub.add_parser("mark", help="record an event marker for FPS graphs/reports")
+    p_mark.add_argument("label")
+    p_mark.add_argument("--category", default="manual")
+    p_mark.add_argument("--details")
+    p_mark.set_defaults(func=mark)
+
+    p_events = sub.add_parser("events", help="list FPS event markers")
+    p_events.add_argument("--window", choices=sorted(WINDOW_SECONDS), default="24h")
+    p_events.add_argument("--json", action="store_true")
+    p_events.set_defaults(func=list_events)
+
+    p_compare = sub.add_parser("compare", help="compare FPS before/after an event marker")
+    p_compare.add_argument("--mark", required=True, help="event marker label/category/details substring")
+    p_compare.add_argument("--before", default="1h", help="window before marker, e.g. 30m, 1h, 24h")
+    p_compare.add_argument("--after", default="1h", help="window after marker, e.g. 30m, 1h, 24h")
+    p_compare.add_argument("--json", action="store_true")
+    p_compare.set_defaults(func=compare)
+
+    args = parser.parse_args()
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

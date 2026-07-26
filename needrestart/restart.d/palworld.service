@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# If an operator explicitly asks needrestart to restart palworld.service, route
+# through the Palworld REST API save/timed-shutdown helper instead of raw
+# `systemctl restart`.  The default selection is disabled in
+# /etc/needrestart/conf.d/99-palworld.conf, so unattended upgrades should not
+# call this automatically.
+exec /usr/local/sbin/palworld-graceful-restart \
+  --wait 300 \
+  --message 'Server maintenance: package update requires Palworld restart; saving and restarting in 5 minutes.'

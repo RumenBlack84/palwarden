@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""Create labeled Palworld config and operational snapshots."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+SNAPSHOT_ROOT = Path("/opt/palworld/config-snapshots")
+SERVER_CONFIG_DIR = Path("/opt/palworld/server/Pal/Saved/Config/LinuxServer")
+ENGINE_INI = SERVER_CONFIG_DIR / "Engine.ini"
+ENGINE_PRETTY = SERVER_CONFIG_DIR / "Engine.pretty.ini"
+PAL_SETTINGS = SERVER_CONFIG_DIR / "PalWorldSettings.ini"
+PAL_SETTINGS_PRETTY = SERVER_CONFIG_DIR / "PalWorldSettings.pretty.ini"
+ENGINE_ENV = Path("/etc/palworld/engine.env")
+SETTINGS_ENV = Path("/etc/palworld/settings.env")
+MANIFEST = Path("/opt/palworld/server/steamapps/appmanifest_2394010.acf")
+
+SECRET_ENV_RE = re.compile(r"^(\s*(?:ADMIN_PASSWORD|SERVER_PASSWORD|PALWORLD_DISCORD_WEBHOOK|DISCORD_WEBHOOK|.*SECRET.*|.*TOKEN.*|.*PASSWORD.*)\s*=).*$", re.I)
+
+
+def now_stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def slugify(label: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-")
+    slug = re.sub(r"-+", "-", slug)
+    return slug or "snapshot"
+
+
+def redact_env_text(text: str) -> str:
+    lines: list[str] = []
+    for line in text.splitlines():
+        m = SECRET_ENV_RE.match(line)
+        if m:
+            prefix = m.group(1)
+            quote = '"' if '"' in line.split("=", 1)[1][:1] else '"'
+            lines.append(f"{prefix}{quote}<redacted>{quote}")
+        else:
+            lines.append(line)
+    return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
+
+
+def copy_or_redact(src: Path, dest: Path, redact: bool = False) -> dict[str, Any]:
+    item: dict[str, Any] = {"source": str(src), "destination": str(dest.name), "exists": src.exists(), "redacted": redact}
+    if not src.exists():
+        return item
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if redact:
+        dest.write_text(redact_env_text(src.read_text(errors="replace")))
+    else:
+        shutil.copy2(src, dest)
+    st = dest.stat()
+    item.update({"bytes": st.st_size, "mode": oct(st.st_mode & 0o777)})
+    return item
+
+
+def run_command(name: str, cmd: list[str], cwd: Path | None = None, timeout: int = 30) -> dict[str, Any]:
+    proc = subprocess.run(cmd, cwd=str(cwd) if cwd else None, text=True, capture_output=True, timeout=timeout, check=False)
+    output = (proc.stdout or "")
+    if proc.stderr:
+        output += ("\n" if output else "") + "STDERR:\n" + proc.stderr
+    return {"name": name, "command": cmd, "exit_code": proc.returncode, "output": output}
+
+
+def write_command_output(snapshot_dir: Path, name: str, cmd: list[str], timeout: int = 30) -> dict[str, Any]:
+    result = run_command(name, cmd, timeout=timeout)
+    path = snapshot_dir / name
+    path.write_text(result["output"])
+    result["destination"] = name
+    result["bytes"] = path.stat().st_size
+    return result
+
+
+def read_buildid(path: Path = MANIFEST) -> str | None:
+    try:
+        if not path.exists():
+            return None
+        text = path.read_text(errors="replace")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        if '"buildid"' in line:
+            parts = line.split('"')
+            if len(parts) >= 4:
+                return parts[3]
+    return None
+
+
+def default_files() -> list[tuple[Path, str, bool]]:
+    return [
+        (ENGINE_INI, "Engine.ini", False),
+        (ENGINE_PRETTY, "Engine.pretty.ini", False),
+        (PAL_SETTINGS, "PalWorldSettings.ini", False),
+        (PAL_SETTINGS_PRETTY, "PalWorldSettings.pretty.ini", False),
+        (ENGINE_ENV, "engine.env", False),
+        (SETTINGS_ENV, "settings.env.redacted", True),
+    ]
+
+
+def default_commands() -> list[tuple[str, list[str]]]:
+    return [
+        ("engine-status.txt", ["/usr/local/sbin/palworld-engine-config", "status"]),
+        ("fps-report.txt", ["/usr/local/sbin/palworld-fps", "report", "--no-live"]),
+        ("fps-report.json", ["/usr/local/sbin/palworld-fps", "report", "--no-live", "--json"]),
+        ("events-24h.txt", ["/usr/local/sbin/palworld-fps", "events", "--window", "24h"]),
+        ("service-status.txt", ["systemctl", "show", "palworld.service", "-p", "ActiveState", "-p", "SubState", "-p", "MainPID", "-p", "ExecMainStartTimestamp", "-p", "NRestarts", "--no-pager"]),
+        ("api-metrics.json", ["/usr/local/sbin/palworld-api", "metrics"]),
+    ]
+
+
+def create_snapshot(
+    label: str,
+    output_root: Path = SNAPSHOT_ROOT,
+    files: list[tuple[Path, str] | tuple[Path, str, bool]] | None = None,
+    commands: list[tuple[str, list[str]]] | None = None,
+    metadata: dict[str, Any] | None = None,
+    mark: bool = True,
+) -> Path:
+    stamp = now_stamp()
+    snapshot_dir = output_root / f"{stamp}-{slugify(label)}"
+    suffix = 1
+    while snapshot_dir.exists():
+        suffix += 1
+        snapshot_dir = output_root / f"{stamp}-{slugify(label)}-{suffix}"
+    snapshot_dir.mkdir(parents=True, mode=0o755)
+
+    normalized_files: list[tuple[Path, str, bool]] = []
+    for item in files if files is not None else default_files():
+        if len(item) == 2:  # type: ignore[arg-type]
+            src, dest = item  # type: ignore[misc]
+            redact = False
+        else:
+            src, dest, redact = item  # type: ignore[misc]
+        normalized_files.append((Path(src), str(dest), bool(redact)))
+
+    manifest: dict[str, Any] = {
+        "label": label,
+        "created_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "snapshot_dir": str(snapshot_dir),
+        "metadata": metadata or {},
+        "buildid": read_buildid(),
+        "files": [],
+        "commands": [],
+    }
+
+    for src, dest_name, redact in normalized_files:
+        manifest["files"].append(copy_or_redact(src, snapshot_dir / dest_name, redact=redact))
+
+    for name, cmd in commands if commands is not None else default_commands():
+        try:
+            manifest["commands"].append(write_command_output(snapshot_dir, name, cmd))
+        except Exception as exc:
+            manifest["commands"].append({"name": name, "command": cmd, "exit_code": None, "error": str(exc), "destination": name})
+            (snapshot_dir / name).write_text(f"ERROR: {exc}\n")
+
+    (snapshot_dir / "buildid.txt").write_text(f"{manifest.get('buildid') or 'unknown'}\n")
+    (snapshot_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+
+    try:
+        shutil.chown(snapshot_dir, user="palworld", group="palworld")
+        for path in snapshot_dir.iterdir():
+            shutil.chown(path, user="palworld", group="palworld")
+    except Exception:
+        pass
+
+    if mark:
+        subprocess.run(
+            ["/usr/local/sbin/palworld-fps", "mark", "config snapshot created", "--category", "snapshot", "--details", f"label={label}; path={snapshot_dir}"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    return snapshot_dir
+
+
+def command_create(args: argparse.Namespace) -> int:
+    metadata = {"requested_by": "palworld-config-snapshot"}
+    path = create_snapshot(args.label, Path(args.output_root), metadata=metadata, mark=not args.no_mark)
+    print(f"Snapshot created: {path}")
+    print(f"Manifest: {path / 'manifest.json'}")
+    return 0
+
+
+def command_list(args: argparse.Namespace) -> int:
+    root = Path(args.output_root)
+    if not root.exists():
+        print(f"No snapshots found in {root}")
+        return 0
+    snaps = sorted([p for p in root.iterdir() if p.is_dir()], key=lambda p: p.stat().st_mtime, reverse=True)
+    if not snaps:
+        print(f"No snapshots found in {root}")
+        return 0
+    print("Available Palworld config snapshots:")
+    for p in snaps[: args.limit]:
+        print(f"- {p.name}")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--output-root", default=str(SNAPSHOT_ROOT))
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("create", help="create a labeled config snapshot")
+    p.add_argument("label")
+    p.add_argument("--no-mark", action="store_true", help="do not record an FPS event marker")
+    p.set_defaults(func=command_create)
+    p = sub.add_parser("list", help="list snapshots")
+    p.add_argument("--limit", type=int, default=20)
+    p.set_defaults(func=command_list)
+    args = ap.parse_args()
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+set -euo pipefail
+config_env=/etc/palworld/settings.env
+if [[ ! -r "$config_env" ]]; then echo "Cannot read $config_env" >&2; exit 1; fi
+# shellcheck disable=SC1090
+source "$config_env"
+REST_API_PORT="${REST_API_PORT:-8212}"
+REST_API_ENABLED="${REST_API_ENABLED:-False}"
+ADMIN_PASSWORD="${ADMIN_PASSWORD:-}"
+if [[ "$REST_API_ENABLED" != "True" ]]; then echo "REST API is not enabled in $config_env" >&2; exit 2; fi
+if [[ -z "$ADMIN_PASSWORD" ]]; then echo "ADMIN_PASSWORD is not set in $config_env" >&2; exit 2; fi
+action="${1:-}"; shift || true
+case "$action" in
+  save) method=POST; path=/v1/api/save; body='{}' ;;
+  stop) method=POST; path=/v1/api/shutdown; waittime="${1:-300}"; message="${2:-Server maintenance: saving and stopping in 5 minutes.}"; body=$(WAITTIME="$waittime" MESSAGE="$message" python3 - <<'PY2'
+import json, os
+print(json.dumps({"waittime": int(os.environ["WAITTIME"]), "message": os.environ["MESSAGE"]}))
+PY2
+) ;;
+  info) method=GET; path=/v1/api/info; body='' ;;
+  metrics) method=GET; path=/v1/api/metrics; body='' ;;
+  *) echo "Usage: $0 {save|stop [seconds] [message]|info|metrics}" >&2; exit 64 ;;
+esac
+PALWORLD_API_METHOD="$method" PALWORLD_API_URL="http://127.0.0.1:${REST_API_PORT}${path}" PALWORLD_API_PASSWORD="$ADMIN_PASSWORD" PALWORLD_API_BODY="$body" python3 - <<'PY2'
+import base64, os, sys, urllib.error, urllib.request
+method=os.environ['PALWORLD_API_METHOD']; url=os.environ['PALWORLD_API_URL']; password=os.environ['PALWORLD_API_PASSWORD']; body=os.environ.get('PALWORLD_API_BODY','')
+headers={"User-Agent":"palworld-api-helper/1.0", "Authorization":"Basic "+base64.b64encode(("admin:"+password).encode()).decode()}
+data=None
+if method != 'GET':
+    data=body.encode(); headers["Content-Type"]="application/json"
+req=urllib.request.Request(url, data=data, headers=headers, method=method)
+try:
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        payload=resp.read().decode('utf-8','replace')
+        print(f"HTTP {resp.status} {resp.reason}")
+        if payload: print(payload)
+except urllib.error.HTTPError as e:
+    print(f"HTTP {e.code} {e.reason}", file=sys.stderr)
+    err=e.read().decode('utf-8','replace')
+    if err: print(err, file=sys.stderr)
+    sys.exit(1)
+except Exception as e:
+    print(f"API request failed: {e}", file=sys.stderr)
+    sys.exit(1)
+PY2

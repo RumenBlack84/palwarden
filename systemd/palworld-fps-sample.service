@@ -1,0 +1,8 @@
+[Unit]
+Description=Collect one Palworld FPS metrics sample
+Wants=network-online.target
+After=network-online.target palworld.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/flock -n /run/palworld-fps-sample.lock /usr/local/sbin/palworld-fps sample --retention-days 7

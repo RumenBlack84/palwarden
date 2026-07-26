@@ -1,0 +1,20 @@
+Palworld tooling export summary
+
+Copied categories:
+- /usr/local/sbin/palworld* operational scripts, including dated backup/pre-change copies.
+- /usr/local/bin/palworld-config-parser binary helper.
+- /usr/local/lib/palworld* helper libraries/notification wrapper.
+- /etc/systemd/system/palworld* units/timers and drop-ins.
+- /etc/needrestart Palworld guard/restart hooks.
+- /etc/palworld/settings.env.example and /etc/palworld/engine.env.
+- /opt/palworld/tools documentation and static config web UI.
+
+Intentionally excluded:
+- /etc/palworld/settings.env (live settings/secrets)
+- /etc/palworld/notify.env (Discord webhook)
+- /var/lib/palworld/public-info.env (generated public join info/password state)
+- /var/lib/palworld/metrics.sqlite3 (telemetry data, not tooling)
+- __pycache__ and *.pyc
+
+Secret scan note:
+The scanner found placeholder/code references to passwords/webhooks but no copied live env secret files. Review before publishing anyway.

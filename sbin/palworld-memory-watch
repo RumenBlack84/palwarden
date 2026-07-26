@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source /usr/local/lib/palworld-notify || true
+SERVICE=palworld.service
+THRESHOLD=85
+WAIT_SECONDS=300
+MESSAGE="Server maintenance: memory usage is high; saving and restarting in 5 minutes."
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --threshold) THRESHOLD="$2"; shift 2 ;;
+    --wait|-w) WAIT_SECONDS="$2"; shift 2 ;;
+    --message|-m) MESSAGE="$2"; shift 2 ;;
+    --help|-h)
+      echo "Usage: $0 [--threshold percent] [--wait seconds] [--message text]"
+      exit 0
+      ;;
+    *) echo "Usage: $0 [--threshold percent] [--wait seconds] [--message text]" >&2; exit 64 ;;
+  esac
+done
+
+if ! systemctl is-active --quiet "$SERVICE"; then
+  echo "$SERVICE is not active; memory watchdog skipping."
+  exit 0
+fi
+
+read -r mem_total_kb mem_avail_kb < <(awk '/MemTotal:/ {t=$2} /MemAvailable:/ {a=$2} END {print t, a}' /proc/meminfo)
+mem_used_kb=$((mem_total_kb - mem_avail_kb))
+system_used_pct=$((mem_used_kb * 100 / mem_total_kb))
+mem_current="$(systemctl show -p MemoryCurrent --value "$SERVICE" 2>/dev/null || echo 0)"
+if [[ ! "$mem_current" =~ ^[0-9]+$ ]]; then mem_current=0; fi
+service_pct=$(awk -v b="$mem_current" -v kb="$mem_total_kb" 'BEGIN{printf "%.0f", (b/1024)/(kb)*100}')
+service_gib=$(awk -v b="$mem_current" 'BEGIN{printf "%.2f", b/1024/1024/1024}')
+avail_gib=$(awk -v kb="$mem_avail_kb" 'BEGIN{printf "%.1f", kb/1024/1024}')
+total_gib=$(awk -v kb="$mem_total_kb" 'BEGIN{printf "%.1f", kb/1024/1024}')
+
+if (( system_used_pct < THRESHOLD && service_pct < THRESHOLD )); then
+  echo "Memory OK: system ${system_used_pct}% used (${avail_gib} GiB available / ${total_gib} GiB), ${SERVICE} ${service_gib} GiB (${service_pct}%). Threshold ${THRESHOLD}%."
+  exit 0
+fi
+
+reason="system memory ${system_used_pct}% used"
+if (( service_pct >= THRESHOLD )); then
+  reason="${SERVICE} cgroup memory ${service_pct}% of host RAM (${service_gib} GiB)"
+fi
+
+palworld_notify warning "memory watchdog threshold crossed: ${reason}; initiating graceful restart with ${WAIT_SECONDS}s notice. Host memory: ${system_used_pct}% used, ${avail_gib} GiB available / ${total_gib} GiB. ${SERVICE}: ${service_gib} GiB (${service_pct}%)."
+/usr/bin/flock -n /run/palworld-memory-watch.lock /usr/local/sbin/palworld-graceful-restart --wait "$WAIT_SECONDS" --message "$MESSAGE"

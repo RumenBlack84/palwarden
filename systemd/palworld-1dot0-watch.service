@@ -1,0 +1,8 @@
+[Unit]
+Description=High-frequency Palworld 1.0 launch update watcher
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/palworld-launch-watch

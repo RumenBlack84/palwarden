@@ -1,0 +1,8 @@
+[Unit]
+Description=Restart Palworld gracefully if memory usage is too high
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/palworld-memory-watch --threshold 85 --wait 300

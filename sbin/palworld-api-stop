@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source /usr/local/lib/palworld-notify || true
+waittime="${1:-300}"
+message="${2:-Server maintenance: saving and stopping in 5 minutes.}"
+palworld_notify warning "REST API timed stop requested; players have ${waittime}s notice. Message: ${message}"
+/usr/local/sbin/palworld-api stop "$waittime" "$message"
+palworld_notify success "REST API timed stop request accepted; waiting ${waittime}s for server process to exit."

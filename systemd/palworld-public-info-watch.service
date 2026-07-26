@@ -1,0 +1,8 @@
+[Unit]
+Description=Publish Palworld join info when public IP/password/port changes
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/palworld-public-info-watch

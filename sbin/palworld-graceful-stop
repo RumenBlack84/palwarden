@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source /usr/local/lib/palworld-notify || true
+waittime=300
+message="Server maintenance: saving and stopping in 5 minutes."
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --wait|-w) waittime="$2"; shift 2 ;;
+    --message|-m) message="$2"; shift 2 ;;
+    *) echo "Usage: $0 [--wait seconds] [--message text]" >&2; exit 64 ;;
+  esac
+done
+if ! systemctl is-active --quiet palworld.service; then echo "palworld.service is not active; nothing to stop."; exit 0; fi
+echo "Calling Palworld REST API save..."
+/usr/local/sbin/palworld-api-save
+echo "Calling Palworld REST API timed stop with ${waittime}s notice..."
+/usr/local/sbin/palworld-api-stop "$waittime" "$message"
+deadline=$((SECONDS + waittime + 120))
+while systemctl is-active --quiet palworld.service; do
+  if (( SECONDS >= deadline )); then
+    palworld_notify error "graceful stop timed out; palworld.service is still active. Manual inspection needed."
+    echo "Timed out waiting for palworld.service to stop" >&2; exit 1
+  fi
+  sleep 5
+done
+palworld_notify success "graceful stop completed; palworld.service is inactive."
+echo "palworld.service is inactive."

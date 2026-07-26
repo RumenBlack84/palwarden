@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+palworld_notify() {
+  local level="${1:-info}"
+  local message="${2:-}"
+  local env_file="/etc/palworld/notify.env"
+  if [[ ! -r "$env_file" ]]; then
+    return 0
+  fi
+  # shellcheck disable=SC1090
+  source "$env_file"
+  if [[ -z "${PALWORLD_DISCORD_WEBHOOK:-}" ]]; then
+    return 0
+  fi
+  local host
+  host="$(hostname -f 2>/dev/null || hostname)"
+  local name="${PALWORLD_NOTIFY_NAME:-Palworld}"
+  local icon="ℹ️"
+  case "$level" in
+    success) icon="✅" ;;
+    warning) icon="⚠️" ;;
+    error|failed|failure) icon="❌" ;;
+    start|running) icon="🔄" ;;
+  esac
+  PALWORLD_NOTIFY_CONTENT="${icon} **${name}** on \`${host}\`: ${message}"
+  export PALWORLD_DISCORD_WEBHOOK PALWORLD_NOTIFY_CONTENT
+  python3 - <<"PY" >/dev/null 2>&1 || true
+import json, os, urllib.request
+url = os.environ.get("PALWORLD_DISCORD_WEBHOOK", "")
+content = os.environ.get("PALWORLD_NOTIFY_CONTENT", "")
+if url and content:
+    data = json.dumps({"content": content}).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json", "User-Agent": "palworld-notify/1.0"})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        resp.read()
+PY
+}

@@ -1,0 +1,13 @@
+[Unit]
+Description=Run Palworld 1.0 launch watcher every minute after 2026-07-09 23:30 ET
+
+[Timer]
+OnCalendar=2026-07-10 03:30:00 UTC
+OnUnitActiveSec=1min
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=false
+Unit=palworld-1dot0-watch.service
+
+[Install]
+WantedBy=timers.target

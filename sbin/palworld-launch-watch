@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source /usr/local/lib/palworld-notify || true
+START_EPOCH=$(date -u -d '2026-07-10 03:30:00 UTC' +%s)
+NOW_EPOCH=$(date -u +%s)
+if (( NOW_EPOCH < START_EPOCH )); then
+  echo "Launch watch not active yet; starts at 2026-07-10 03:30:00 UTC / 2026-07-09 23:30 ET."
+  exit 0
+fi
+
+version="unknown"
+if api_output=$(sudo /usr/local/sbin/palworld-api info 2>/dev/null); then
+  version=$(printf '%s\n' "$api_output" | python3 -c 'import sys,json,re; data=sys.stdin.read(); m=re.search(r"\{.*\}", data, re.S); print(json.loads(m.group(0)).get("version", "unknown") if m else "unknown")' 2>/dev/null || echo unknown)
+fi
+
+if [[ "$version" == v1.0* ]]; then
+  palworld_notify success "Palworld 1.0 detected already: version \`${version}\`. Disabling launch watch timer."
+  systemctl disable --now palworld-1dot0-watch.timer >/dev/null 2>&1 || true
+  exit 0
+fi
+
+echo "Palworld 1.0 not detected yet; current API version: ${version}. Running update check."
+/usr/bin/flock -n /run/palworld-update.lock /usr/local/sbin/palworld-update
+
+version="unknown"
+if api_output=$(sudo /usr/local/sbin/palworld-api info 2>/dev/null); then
+  version=$(printf '%s\n' "$api_output" | python3 -c 'import sys,json,re; data=sys.stdin.read(); m=re.search(r"\{.*\}", data, re.S); print(json.loads(m.group(0)).get("version", "unknown") if m else "unknown")' 2>/dev/null || echo unknown)
+fi
+
+if [[ "$version" == v1.0* ]]; then
+  palworld_notify success "Palworld 1.0 update confirmed: version \`${version}\`. Disabling launch watch timer."
+  systemctl disable --now palworld-1dot0-watch.timer >/dev/null 2>&1 || true
+else
+  echo "Palworld 1.0 still not detected after check; current API version: ${version}."
+fi

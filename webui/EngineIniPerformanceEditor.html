@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Palworld Engine.ini Performance Editor</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0f172a; --panel:#111827; --muted:#94a3b8; --text:#e5e7eb; --accent:#60a5fa; --warn:#fbbf24; --good:#22c55e; --bad:#ef4444; }
+    body { margin:0; font-family: system-ui, -apple-system, Segoe UI, sans-serif; background:linear-gradient(135deg,#0f172a,#1e1b4b); color:var(--text); }
+    header { padding: 28px 32px 12px; }
+    h1 { margin:0 0 8px; font-size: 2rem; }
+    h2 { margin-top:0; color:#bfdbfe; }
+    main { display:grid; grid-template-columns: minmax(360px, 1fr) minmax(420px, 1fr); gap:20px; padding: 0 32px 32px; }
+    section { background: rgba(17,24,39,.92); border:1px solid rgba(148,163,184,.25); border-radius:16px; padding:18px; box-shadow: 0 20px 60px rgba(0,0,0,.25); }
+    .full { grid-column:1 / -1; }
+    .setting { border-top:1px solid rgba(148,163,184,.18); padding:14px 0; display:grid; grid-template-columns: 1fr 180px 80px; gap:12px; align-items:center; }
+    .setting:first-of-type { border-top:0; }
+    label { font-weight:650; }
+    .desc { color:var(--muted); font-size:.9rem; margin-top:3px; }
+    input, select, textarea, button { font:inherit; border-radius:10px; border:1px solid rgba(148,163,184,.35); background:#020617; color:var(--text); padding:10px; }
+    input[type="checkbox"] { width:24px; height:24px; accent-color:var(--accent); }
+    textarea { width:100%; min-height:360px; box-sizing:border-box; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:.9rem; }
+    .buttons { display:flex; flex-wrap:wrap; gap:10px; margin:12px 0; }
+    button { cursor:pointer; background:#1d4ed8; border-color:#3b82f6; font-weight:700; }
+    button.secondary { background:#334155; border-color:#64748b; }
+    button.warn { background:#92400e; border-color:#f59e0b; }
+    .note { color:var(--muted); line-height:1.45; }
+    code { background:#020617; border:1px solid rgba(148,163,184,.2); padding:2px 5px; border-radius:6px; }
+    .pill { display:inline-block; background:#172554; color:#bfdbfe; padding:4px 8px; border-radius:999px; margin:2px; font-size:.85rem; }
+    @media(max-width: 1000px) { main { grid-template-columns:1fr; padding: 0 16px 16px; } header{padding:20px 16px 8px;} }
+  </style>
+</head>
+<body>
+<header>
+  <h1>Palworld Engine.ini Performance Editor</h1>
+  <p class="note">Client-side helper for curated Unreal/Palworld performance levers. It does not write to the server directly. Generate <code>engine.env</code>, copy it to <code>/etc/palworld/engine.env</code>, then run <code>sudo /usr/local/sbin/palworld-engine-config apply</code>.</p>
+</header>
+<main>
+  <section>
+    <h2>Presets</h2>
+    <p class="note">Presets only fill values in this browser. Review before applying. Higher tick rates may improve smoothness but can raise CPU/network load.</p>
+    <div class="buttons">
+      <button onclick="preset('conservative')">Conservative 30 TPS</button>
+      <button onclick="preset('balanced')">Balanced 60 TPS</button>
+      <button class="warn" onclick="preset('experimental')">Experimental 90 TPS</button>
+      <button class="secondary" onclick="clearAll()">Clear managed values</button>
+    </div>
+    <div><span class="pill">No direct server writes</span><span class="pill">Backed by /usr/local/sbin/palworld-engine-config</span><span class="pill">Restart required</span></div>
+  </section>
+
+  <section>
+    <h2>Current Engine.ini</h2>
+    <p class="note">Use this to load current managed values from the served read-only symlink.</p>
+    <div class="buttons">
+      <button onclick="loadCurrent()">Load current Engine.ini</button>
+      <button class="secondary" onclick="parseIni(document.getElementById('iniText').value)">Parse pasted INI</button>
+    </div>
+    <textarea id="iniText" placeholder="Paste Engine.ini here, or click Load current Engine.ini..."></textarea>
+  </section>
+
+  <section class="full">
+    <h2>Managed Performance Settings</h2>
+    <div id="settings"></div>
+  </section>
+
+  <section>
+    <h2>Generated engine.env</h2>
+    <p class="note">Only enabled rows are emitted. This is the recommended path for applying changes safely with backup and Discord diff.</p>
+    <div class="buttons">
+      <button onclick="generateEnv()">Generate engine.env</button>
+      <button class="secondary" onclick="copy('envOut')">Copy env</button>
+      <button class="secondary" onclick="download('engine.env', document.getElementById('envOut').value)">Download engine.env</button>
+    </div>
+    <textarea id="envOut"></textarea>
+  </section>
+
+  <section>
+    <h2>Generated Engine.ini fragment</h2>
+    <p class="note">Reference only. Prefer engine.env + apply script so backups, validation, ownership, pretty copy, and Discord notification happen consistently.</p>
+    <div class="buttons">
+      <button onclick="generateIni()">Generate INI fragment</button>
+      <button class="secondary" onclick="copy('iniOut')">Copy fragment</button>
+    </div>
+    <textarea id="iniOut"></textarea>
+  </section>
+
+  <section class="full">
+    <h2>Apply commands</h2>
+    <pre><code>sudo install -m 0644 -o root -g root engine.env /etc/palworld/engine.env
+sudo /usr/local/sbin/palworld-engine-config apply --dry-run
+sudo /usr/local/sbin/palworld-engine-config apply
+sudo /usr/local/sbin/palworld-graceful-restart</code></pre>
+  </section>
+</main>
+<script>
+const SETTINGS = [
+  {env:'NET_SERVER_MAX_TICK_RATE', section:'/Script/OnlineSubsystemUtils.IpNetDriver', key:'NetServerMaxTickRate', type:'number', min:15, max:120, step:1, desc:'Dedicated server network tick cap. 30 is conservative; 60 is a common balanced target.'},
+  {env:'MAX_CLIENT_RATE', section:'/Script/OnlineSubsystemUtils.IpNetDriver', key:'MaxClientRate', type:'number', min:10000, max:500000, step:1000, desc:'Maximum bytes/sec per LAN client.'},
+  {env:'MAX_INTERNET_CLIENT_RATE', section:'/Script/OnlineSubsystemUtils.IpNetDriver', key:'MaxInternetClientRate', type:'number', min:10000, max:500000, step:1000, desc:'Maximum bytes/sec per internet client.'},
+  {env:'CONNECTION_TIMEOUT', section:'/Script/OnlineSubsystemUtils.IpNetDriver', key:'ConnectionTimeout', type:'number', min:10, max:300, step:1, desc:'Seconds before stale network connections time out.'},
+  {env:'TOTAL_NET_BANDWIDTH', section:'/Script/Engine.GameNetworkManager', key:'TotalNetBandwidth', type:'number', min:10000, max:2000000, step:10000, desc:'Total network bandwidth budget.'},
+  {env:'MAX_DYNAMIC_BANDWIDTH', section:'/Script/Engine.GameNetworkManager', key:'MaxDynamicBandwidth', type:'number', min:10000, max:500000, step:1000, desc:'Maximum dynamic bandwidth per client.'},
+  {env:'MIN_DYNAMIC_BANDWIDTH', section:'/Script/Engine.GameNetworkManager', key:'MinDynamicBandwidth', type:'number', min:1000, max:250000, step:1000, desc:'Minimum dynamic bandwidth per client.'},
+  {env:'ASYNC_LOADING_THREAD_ENABLED', section:'/Script/Engine.StreamingSettings', key:'s.AsyncLoadingThreadEnabled', type:'bool', desc:'Enable async loading thread.'},
+  {env:'EVENT_DRIVEN_LOADER_ENABLED', section:'/Script/Engine.StreamingSettings', key:'s.EventDrivenLoaderEnabled', type:'bool', desc:'Enable event-driven loader.'},
+  {env:'USE_BACKGROUND_LEVEL_STREAMING', section:'/Script/Engine.StreamingSettings', key:'s.UseBackgroundLevelStreaming', type:'bool', desc:'Enable background level streaming.'},
+  {env:'LEVEL_STREAMING_ACTORS_UPDATE_TIME_LIMIT', section:'/Script/Engine.StreamingSettings', key:'s.LevelStreamingActorsUpdateTimeLimit', type:'number', min:0.5, max:20, step:0.1, desc:'Milliseconds budget for level streaming actor updates.'},
+  {env:'LEVEL_STREAMING_COMPONENTS_REGISTRATION_GRANULARITY', section:'/Script/Engine.StreamingSettings', key:'s.LevelStreamingComponentsRegistrationGranularity', type:'number', min:1, max:100, step:1, desc:'Component registration batch size.'},
+  {env:'ONE_FRAME_THREAD_LAG', section:'SystemSettings', key:'r.OneFrameThreadLag', type:'number', min:0, max:1, step:1, desc:'Allow one-frame render thread lag; usually irrelevant on dedicated server.'},
+  {env:'ALLOW_ASYNC_TICK_DISPATCH', section:'SystemSettings', key:'tick.AllowAsyncTickDispatch', type:'number', min:0, max:1, step:1, desc:'Allow async tick dispatch.'},
+  {env:'ALLOW_ASYNC_TICK_CLEANUP', section:'SystemSettings', key:'tick.AllowAsyncTickCleanup', type:'number', min:0, max:1, step:1, desc:'Allow async tick cleanup.'},
+];
+function el(id){return document.getElementById(id)}
+function render(){
+  const root=el('settings'); root.innerHTML='';
+  SETTINGS.forEach(s=>{
+    const row=document.createElement('div'); row.className='setting';
+    const label=document.createElement('div'); label.innerHTML=`<label for="${s.env}">${s.key}</label><div class="desc">[${s.section}]<br>${s.desc}<br><code>${s.env}</code></div>`;
+    const input=document.createElement('input'); input.id=s.env; input.dataset.env=s.env;
+    if(s.type==='bool'){ input.type='checkbox'; input.value='1'; } else { input.type='number'; input.min=s.min; input.max=s.max; input.step=s.step; input.placeholder='unmanaged'; }
+    input.addEventListener('input', ()=>{ el(s.env+'_enable').checked=true; generateEnv(); generateIni(); });
+    const en=document.createElement('input'); en.type='checkbox'; en.id=s.env+'_enable'; en.title='Manage this key'; en.addEventListener('change', ()=>{generateEnv(); generateIni();});
+    row.append(label,input,en); root.append(row);
+  });
+  generateEnv(); generateIni();
+}
+function clearAll(){ SETTINGS.forEach(s=>{el(s.env+'_enable').checked=false; if(s.type==='bool') el(s.env).checked=false; else el(s.env).value='';}); generateEnv(); generateIni(); }
+function setv(env,val){ const s=SETTINGS.find(x=>x.env===env), input=el(env); el(env+'_enable').checked=true; if(s.type==='bool') input.checked=!!val; else input.value=val; }
+function preset(name){ clearAll();
+  if(name==='conservative'){ setv('NET_SERVER_MAX_TICK_RATE',30); setv('MAX_CLIENT_RATE',80000); setv('MAX_INTERNET_CLIENT_RATE',80000); setv('TOTAL_NET_BANDWIDTH',320000); setv('MAX_DYNAMIC_BANDWIDTH',80000); setv('MIN_DYNAMIC_BANDWIDTH',20000); setv('ASYNC_LOADING_THREAD_ENABLED',true); setv('EVENT_DRIVEN_LOADER_ENABLED',true); setv('USE_BACKGROUND_LEVEL_STREAMING',true); }
+  if(name==='balanced'){ setv('NET_SERVER_MAX_TICK_RATE',60); setv('MAX_CLIENT_RATE',100000); setv('MAX_INTERNET_CLIENT_RATE',100000); setv('CONNECTION_TIMEOUT',60); setv('TOTAL_NET_BANDWIDTH',500000); setv('MAX_DYNAMIC_BANDWIDTH',100000); setv('MIN_DYNAMIC_BANDWIDTH',40000); setv('ASYNC_LOADING_THREAD_ENABLED',true); setv('EVENT_DRIVEN_LOADER_ENABLED',true); setv('USE_BACKGROUND_LEVEL_STREAMING',true); setv('LEVEL_STREAMING_ACTORS_UPDATE_TIME_LIMIT',5); setv('LEVEL_STREAMING_COMPONENTS_REGISTRATION_GRANULARITY',10); setv('ALLOW_ASYNC_TICK_DISPATCH',1); setv('ALLOW_ASYNC_TICK_CLEANUP',1); }
+  if(name==='experimental'){ setv('NET_SERVER_MAX_TICK_RATE',90); setv('MAX_CLIENT_RATE',150000); setv('MAX_INTERNET_CLIENT_RATE',150000); setv('CONNECTION_TIMEOUT',60); setv('TOTAL_NET_BANDWIDTH',750000); setv('MAX_DYNAMIC_BANDWIDTH',150000); setv('MIN_DYNAMIC_BANDWIDTH',50000); setv('ASYNC_LOADING_THREAD_ENABLED',true); setv('EVENT_DRIVEN_LOADER_ENABLED',true); setv('USE_BACKGROUND_LEVEL_STREAMING',true); setv('LEVEL_STREAMING_ACTORS_UPDATE_TIME_LIMIT',8); setv('LEVEL_STREAMING_COMPONENTS_REGISTRATION_GRANULARITY',20); setv('ALLOW_ASYNC_TICK_DISPATCH',1); setv('ALLOW_ASYNC_TICK_CLEANUP',1); }
+  generateEnv(); generateIni();
+}
+function currentValue(s){ const input=el(s.env); if(!el(s.env+'_enable').checked) return null; return s.type==='bool' ? (input.checked ? 'true' : 'false') : input.value; }
+function generateEnv(){ let lines=['# Palworld Engine.ini performance overrides','# Generated by Engine.ini Performance Editor']; SETTINGS.forEach(s=>{ const v=currentValue(s); if(v!==null && v!=='') lines.push(`${s.env}=${v}`); }); el('envOut').value=lines.join('\n')+'\n'; }
+function generateIni(){ const by={}; SETTINGS.forEach(s=>{ const v=currentValue(s); if(v!==null && v!==''){ (by[s.section] ||= []).push(`${s.key}=${s.type==='bool' ? (v==='true'?'1':'0') : v}`); }}); let lines=[]; Object.keys(by).forEach(sec=>{ lines.push(`[${sec}]`, ...by[sec], ''); }); el('iniOut').value=lines.join('\n'); }
+function parseIni(txt){ let section=''; const values={}; txt.split(/\r?\n/).forEach(line=>{ const m=line.match(/^\s*\[([^\]]+)\]/); if(m){section=m[1].trim(); return;} const eq=line.indexOf('='); if(eq<0) return; const key=line.slice(0,eq).trim(), val=line.slice(eq+1).trim(); SETTINGS.forEach(s=>{ if(s.section===section && s.key===key) values[s.env]=val; }); }); clearAll(); Object.entries(values).forEach(([env,val])=>{ const s=SETTINGS.find(x=>x.env===env); if(!s) return; el(env+'_enable').checked=true; if(s.type==='bool') el(env).checked = ['1','true','yes','on'].includes(String(val).toLowerCase()); else el(env).value=val; }); generateEnv(); generateIni(); }
+async function loadCurrent(){ const resp=await fetch('current/Engine.ini?ts='+Date.now()); if(!resp.ok) throw new Error('HTTP '+resp.status); const txt=await resp.text(); el('iniText').value=txt; parseIni(txt); }
+async function copy(id){ await navigator.clipboard.writeText(el(id).value); }
+function download(name,text){ const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([text],{type:'text/plain'})); a.download=name; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),1000); }
+render();
+</script>
+</body>
+</html>

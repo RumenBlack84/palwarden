@@ -1,0 +1,12 @@
+[Unit]
+Description=Check Palworld memory usage periodically
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+RandomizedDelaySec=30s
+Persistent=true
+Unit=palworld-memory-watch.service
+
+[Install]
+WantedBy=timers.target

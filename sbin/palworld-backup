@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source /usr/local/lib/palworld-notify
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+dest=/opt/palworld/backups/palworld-save-${stamp}.tar.gz
+palworld_notify start "backup started."
+if install -d -o palworld -g palworld -m 0755 /opt/palworld/backups \
+  && tar -C /opt/palworld/server/Pal/Saved -czf "$dest" SaveGames Config 2>/dev/null; then
+  chown palworld:palworld "$dest"
+  size=$(du -h "$dest" | cut -f1)
+  palworld_notify success "backup completed: \`$(basename "$dest")\` (${size})."
+  echo "$dest"
+else
+  rc=$?
+  palworld_notify error "backup failed with exit code ${rc}."
+  exit "$rc"
+fi

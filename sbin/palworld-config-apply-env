@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source /usr/local/lib/palworld-notify || true
+config_env=/etc/palworld/settings.env
+server_dir=/opt/palworld/server
+config_file="$server_dir/Pal/Saved/Config/LinuxServer/PalWorldSettings.ini"
+backup_dir=/opt/palworld/config-backups
+if [[ ! -r "$config_env" ]]; then
+  echo "Cannot read $config_env" >&2
+  exit 1
+fi
+set -a
+# shellcheck disable=SC1090
+source "$config_env"
+set +a
+if [[ "${REST_API_ENABLED:-False}" == "True" && -z "${ADMIN_PASSWORD:-}" ]]; then
+  echo "REST_API_ENABLED=True requires ADMIN_PASSWORD to be set." >&2
+  exit 2
+fi
+admin_password_present=0
+server_password_present=0
+if [[ ${ADMIN_PASSWORD+x} ]]; then admin_password_present=1; admin_password_value="$ADMIN_PASSWORD"; unset ADMIN_PASSWORD; fi
+if [[ ${SERVER_PASSWORD+x} ]]; then server_password_present=1; server_password_value="$SERVER_PASSWORD"; unset SERVER_PASSWORD; fi
+install -d -o palworld -g palworld -m 0755 "$backup_dir"
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+backup="$backup_dir/PalWorldSettings.ini.$stamp"
+cp -a "$config_file" "$backup"
+chown palworld:palworld "$backup"
+cd "$server_dir"
+parser_log=$(mktemp)
+if /usr/local/bin/palworld-config-parser >"$parser_log" 2>&1; then
+  parser_rc=0
+else
+  parser_rc=$?
+fi
+sed -E 's/(Validation failed for key: (AdminPassword|ServerPassword), value: ).*/\1<omitted-secret>/; s/(Updating key: (AdminPassword|ServerPassword) with value: ).*/\1<omitted-secret>/' "$parser_log"
+rm -f "$parser_log"
+if [[ "$parser_rc" -ne 0 ]]; then
+  exit "$parser_rc"
+fi
+if [[ "$admin_password_present" -eq 1 || "$server_password_present" -eq 1 ]]; then
+  ADMIN_PASSWORD_VALUE="${admin_password_value:-}" SERVER_PASSWORD_VALUE="${server_password_value:-}" ADMIN_PASSWORD_PRESENT="$admin_password_present" SERVER_PASSWORD_PRESENT="$server_password_present" python3 - <<'PYSECRET'
+from pathlib import Path
+import os
+p=Path('/opt/palworld/server/Pal/Saved/Config/LinuxServer/PalWorldSettings.ini')
+text=p.read_text(errors='ignore')
+def esc(v):
+    return v.replace('\\','\\\\').replace('"','\\"')
+def set_key(text,key,value):
+    marker=key+'='
+    pos=text.find(marker)
+    if pos < 0:
+        raise SystemExit(f'Key not found: {key}')
+    start=pos+len(marker)
+    i=start; in_str=False; escaped=False
+    while i < len(text):
+        ch=text[i]
+        if escaped:
+            escaped=False; i+=1; continue
+        if ch == '\\' and in_str:
+            escaped=True; i+=1; continue
+        if ch == '"':
+            in_str = not in_str; i+=1; continue
+        if not in_str and ch in ',)\n':
+            break
+        i+=1
+    return text[:start] + '"' + esc(value) + '"' + text[i:]
+if os.environ.get('ADMIN_PASSWORD_PRESENT') == '1':
+    text=set_key(text,'AdminPassword',os.environ.get('ADMIN_PASSWORD_VALUE',''))
+if os.environ.get('SERVER_PASSWORD_PRESENT') == '1':
+    text=set_key(text,'ServerPassword',os.environ.get('SERVER_PASSWORD_VALUE',''))
+p.write_text(text)
+PYSECRET
+fi
+chown palworld:palworld "$config_file"
+chmod 0644 "$config_file"
+/usr/local/sbin/palworld-config-pretty >/dev/null 2>&1 || true
+diff_text=$(/usr/local/lib/palworld-config-diff --discord "$backup" "$config_file" || true)
+if [[ -z "$diff_text" ]]; then
+  diff_text="No non-secret config changes detected."
+fi
+summary_text=$(/usr/local/lib/palworld-config-summary || true)
+if [[ -z "$summary_text" ]]; then
+  summary_text="Relevant server settings summary unavailable."
+fi
+printf -v notify_msg 'config parser applied environment changes; backup: `%s`. Restart palworld.service for config changes to take effect.\n\n%s\n\n%s' "$(basename "$backup")" "$diff_text" "$summary_text"
+palworld_notify success "$notify_msg"
+/usr/local/sbin/palworld-fps mark "PalWorldSettings.ini config applied" --category config --details "backup=$(basename "$backup")" >/dev/null 2>&1 || true
+echo "Updated $config_file"
+echo "Backup: $backup"
+printf "%s\n\n%s\n" "$diff_text" "$summary_text"

@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source /usr/local/lib/palworld-notify || true
+waittime=300
+empty_wait=15
+message="Server maintenance: saving and restarting in 5 minutes."
+empty_message="Server maintenance: no players are online; saving and restarting shortly."
+startup_timeout=180
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --wait|-w) waittime="$2"; shift 2 ;;
+    --empty-wait) empty_wait="$2"; shift 2 ;;
+    --message|-m) message="$2"; shift 2 ;;
+    --empty-message) empty_message="$2"; shift 2 ;;
+    --startup-timeout) startup_timeout="$2"; shift 2 ;;
+    *) echo "Usage: $0 [--wait seconds] [--empty-wait seconds] [--message text] [--empty-message text] [--startup-timeout seconds]" >&2; exit 64 ;;
+  esac
+done
+
+selected_wait="$waittime"
+selected_message="$message"
+player_context="players unknown; using normal player warning"
+metrics_output=""
+if metrics_output="$(sudo /usr/local/sbin/palworld-api metrics 2>&1)"; then
+  current_players="$(printf '%s\n' "$metrics_output" | python3 -c 'import sys,json,re; data=sys.stdin.read(); m=re.search(r"\{.*\}", data, re.S); print(json.loads(m.group(0)).get("currentplayernum", "unknown") if m else "unknown")' 2>/dev/null || echo unknown)"
+  if [[ "$current_players" =~ ^[0-9]+$ ]]; then
+    if (( current_players == 0 )); then
+      selected_wait="$empty_wait"
+      selected_message="$empty_message"
+      player_context="no players online; using ${empty_wait}s empty-server wait"
+    else
+      player_context="${current_players} player(s) online; using ${waittime}s player warning"
+    fi
+  fi
+fi
+
+palworld_notify start "graceful restart requested; ${player_context}; saving, stopping, then starting palworld.service again."
+/usr/local/sbin/palworld-fps mark "graceful restart requested" --category restart --details "wait=${selected_wait}s; message=${selected_message}; ${player_context}" >/dev/null 2>&1 || true
+/usr/local/sbin/palworld-graceful-stop --wait "$selected_wait" --message "$selected_message"
+
+palworld_notify start "palworld.service is stopped; starting server now."
+sudo systemctl start palworld.service
+palworld_notify start "palworld.service start command accepted; waiting for service and REST API health."
+
+# Wait for systemd active state first.
+deadline=$((SECONDS + startup_timeout))
+while ! systemctl is-active --quiet palworld.service; do
+  if (( SECONDS >= deadline )); then
+    state="$(systemctl is-active palworld.service || true)"
+    palworld_notify error "restart failed: palworld.service did not become active within ${startup_timeout}s; current state is \`${state}\`."
+    echo "palworld.service did not become active within ${startup_timeout}s; state=${state}" >&2
+    exit 1
+  fi
+  sleep 2
+done
+palworld_notify success "palworld.service is active after restart; waiting for REST API readiness."
+
+# Wait for API readiness. This proves the server is up enough to answer authenticated management calls.
+api_deadline=$((SECONDS + startup_timeout))
+api_output=""
+while true; do
+  if api_output="$(sudo /usr/local/sbin/palworld-api info 2>&1)"; then
+    break
+  fi
+  if (( SECONDS >= api_deadline )); then
+    palworld_notify error "restart warning: palworld.service is active, but REST API did not become ready within ${startup_timeout}s. Last API check: ${api_output}"
+    echo "palworld.service active, but REST API not ready. Last API check:" >&2
+    printf '%s\n' "$api_output" >&2
+    exit 1
+  fi
+  sleep 3
+done
+
+version="$(printf '%s\n' "$api_output" | python3 -c 'import sys,json,re; data=sys.stdin.read(); m=re.search(r"\{.*\}", data, re.S); print(json.loads(m.group(0)).get("version", "unknown") if m else "unknown")' 2>/dev/null || echo unknown)"
+servername="$(printf '%s\n' "$api_output" | python3 -c 'import sys,json,re; data=sys.stdin.read(); m=re.search(r"\{.*\}", data, re.S); print(json.loads(m.group(0)).get("servername", "unknown") if m else "unknown")' 2>/dev/null || echo unknown)"
+palworld_notify success "server is back up after graceful restart; REST API healthy; server \`${servername}\`, version \`${version}\`."
+/usr/local/sbin/palworld-fps mark "graceful restart completed" --category restart --details "server=${servername}; version=${version}" >/dev/null 2>&1 || true
+printf '%s\n' "$api_output"
+systemctl is-active palworld.service

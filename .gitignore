@@ -1,0 +1,16 @@
+# Python/runtime artifacts
+__pycache__/
+*.pyc
+
+# Local secrets / live config — never commit these.
+# The tooling reads them at runtime from /etc/palworld and /var/lib/palworld.
+settings.env
+notify.env
+public-info.env
+*.sqlite3
+*.pem
+*.key
+
+# Local editor state
+.DS_Store
+*.swp

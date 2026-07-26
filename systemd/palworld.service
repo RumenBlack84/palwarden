@@ -1,0 +1,24 @@
+[Unit]
+Description=Palworld Dedicated Server
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=palworld
+Group=palworld
+WorkingDirectory=/opt/palworld/server
+ExecStart=/opt/palworld/server/PalServer.sh -useperfthreads -NoAsyncLoadingThread -UseMultithreadForDS
+Restart=on-failure
+RestartSec=15
+TimeoutStartSec=180
+KillSignal=SIGINT
+TimeoutStopSec=120
+LimitNOFILE=100000
+Environment=SteamAppId=2394010
+Environment=LD_LIBRARY_PATH=/opt/palworld/server/linux64:/opt/palworld/server/Pal/Binaries/Linux
+StandardOutput=append:/var/log/palworld/server.log
+StandardError=append:/var/log/palworld/server.log
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source /usr/local/lib/palworld-notify || true
+palworld_notify start "REST API save requested."
+/usr/local/sbin/palworld-api save
+palworld_notify success "REST API save completed."

@@ -1,0 +1,11 @@
+[Unit]
+Description=Post daily Palworld FPS graph to Discord at 9am ET
+
+[Timer]
+OnCalendar=*-*-* 09:00:00
+RandomizedDelaySec=0
+Persistent=true
+Unit=palworld-fps-daily-report.service
+
+[Install]
+WantedBy=timers.target

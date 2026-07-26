@@ -1,0 +1,295 @@
+#!/usr/bin/env python3
+"""Read-only Palworld daily health report with FPS graph support."""
+from __future__ import annotations
+
+import argparse
+import base64
+import importlib.machinery
+import importlib.util
+import json
+import mimetypes
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+FPS_SCRIPT = "/usr/local/sbin/palworld-fps"
+ENGINE_CONFIG = "/usr/local/sbin/palworld-engine-config"
+API_HELPER = "/usr/local/sbin/palworld-api"
+NOTIFY_ENV = Path("/etc/palworld/notify.env")
+SNAPSHOT_ROOT = Path("/opt/palworld/config-snapshots")
+MANIFEST = Path("/opt/palworld/server/steamapps/appmanifest_2394010.acf")
+
+
+def load_fps_module():
+    loader = importlib.machinery.SourceFileLoader("palworld_fps_for_health", FPS_SCRIPT)
+    spec = importlib.util.spec_from_loader("palworld_fps_for_health", loader)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["palworld_fps_for_health"] = mod
+    loader.exec_module(mod)
+    return mod
+
+
+def run(cmd: list[str], timeout: int = 30) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(cmd, text=True, capture_output=True, timeout=timeout, check=False)
+
+
+def parse_systemctl_show(text: str) -> dict[str, str]:
+    raw = dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+    return {
+        "main_pid": raw.get("MainPID", ""),
+        "n_restarts": raw.get("NRestarts", ""),
+        "start_timestamp": raw.get("ExecMainStartTimestamp", ""),
+        "active_state": raw.get("ActiveState", "unknown"),
+        "sub_state": raw.get("SubState", "unknown"),
+    }
+
+
+def collect_service() -> dict[str, str]:
+    proc = run(["systemctl", "show", "palworld.service", "-p", "ActiveState", "-p", "SubState", "-p", "MainPID", "-p", "ExecMainStartTimestamp", "-p", "NRestarts", "--no-pager"])
+    data = parse_systemctl_show(proc.stdout)
+    data["ok"] = str(proc.returncode == 0)
+    return data
+
+
+def extract_json(text: str) -> dict[str, Any]:
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end < start:
+        raise ValueError("no JSON object found")
+    return json.loads(text[start:end+1])
+
+
+def collect_api(timeout: int = 5) -> dict[str, Any]:
+    proc = run([API_HELPER, "metrics"], timeout=timeout)
+    if proc.returncode != 0:
+        return {"ok": False, "error": (proc.stderr or proc.stdout or "unknown API error")[:500]}
+    try:
+        return {"ok": True, "metrics": extract_json(proc.stdout)}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def collect_fps(no_live: bool = True) -> dict[str, Any]:
+    cmd = [FPS_SCRIPT, "report", "--json"]
+    if no_live:
+        cmd.append("--no-live")
+    proc = run(cmd, timeout=60)
+    if proc.returncode != 0:
+        return {"error": (proc.stderr or proc.stdout)[:1000], "windows": {}, "events_24h": []}
+    return json.loads(proc.stdout)
+
+
+def collect_engine() -> dict[str, Any]:
+    check = run([ENGINE_CONFIG, "status", "--check"], timeout=30)
+    status = run([ENGINE_CONFIG, "status"], timeout=30)
+    profile = "unknown"
+    latest_backup = "unknown"
+    for line in status.stdout.splitlines():
+        if line.startswith("- ") and "match" in line:
+            profile = line[2:].split(":", 1)[0]
+        if line.startswith("- Engine.ini."):
+            latest_backup = line[2:]
+    return {"check_ok": check.returncode == 0, "check_text": check.stdout.strip() or check.stderr.strip(), "profile": profile, "latest_backup": latest_backup, "status_text": status.stdout}
+
+
+def latest_snapshot(root: Path = SNAPSHOT_ROOT) -> str | None:
+    if not root.exists():
+        return None
+    dirs = sorted([p for p in root.iterdir() if p.is_dir()], key=lambda p: p.name, reverse=True)
+    return dirs[0].name if dirs else None
+
+
+def read_buildid(path: Path = MANIFEST) -> str | None:
+    try:
+        text = path.read_text(errors="replace")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        if '"buildid"' in line:
+            parts = line.split('"')
+            if len(parts) >= 4:
+                return parts[3]
+    return None
+
+
+def collect_disk() -> list[dict[str, str]]:
+    proc = run(["df", "-h", "/opt/palworld", "/var/lib/palworld"], timeout=10)
+    rows = []
+    seen = set()
+    for line in proc.stdout.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) >= 6:
+            fs, size, used, avail, pct, target = parts[0], parts[1], parts[2], parts[3], parts[4], parts[5]
+            if target in seen:
+                continue
+            seen.add(target)
+            rows.append({"filesystem": fs, "size": size, "used": used, "avail": avail, "use_percent": pct, "target": target})
+    return rows
+
+
+def fmt(value: Any, digits: int = 1) -> str:
+    if value is None:
+        return "n/a"
+    try:
+        return f"{float(value):.{digits}f}"
+    except Exception:
+        return str(value)
+
+
+def collect_health(timeout: int = 5) -> dict[str, Any]:
+    return {
+        "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "service": collect_service(),
+        "api": collect_api(timeout=timeout),
+        "fps_summary": collect_fps(no_live=True),
+        "engine": collect_engine(),
+        "snapshot": {"latest": latest_snapshot()},
+        "buildid": read_buildid(),
+        "disk": collect_disk(),
+    }
+
+
+def format_health(data: dict[str, Any]) -> str:
+    service = data.get("service", {})
+    api = data.get("api", {})
+    metrics = api.get("metrics", {}) if api.get("ok") else {}
+    fps = data.get("fps_summary", {})
+    windows = fps.get("windows", {})
+    engine = data.get("engine", {})
+    lines = ["🩺 **Palworld Server Health**", ""]
+    lines.append("Service:")
+    lines.append(f"- palworld.service: `{service.get('active_state', 'unknown')}/{service.get('sub_state', 'unknown')}` PID `{service.get('main_pid', 'n/a')}` restarts `{service.get('n_restarts', 'n/a')}`")
+    if service.get("start_timestamp"):
+        lines.append(f"- Started: `{service.get('start_timestamp')}`")
+    lines.append("")
+    lines.append("API / Live:")
+    if api.get("ok"):
+        lines.append(f"- Players: `{metrics.get('currentplayernum')}/{metrics.get('maxplayernum')}` | Day `{metrics.get('days')}` | Bases `{metrics.get('basecampnum')}` | Uptime `{metrics.get('uptime')}s`")
+        lines.append(f"- Current Server FPS: `{fmt(metrics.get('serverfps'))}` | Server 2m Avg: `{fmt(metrics.get('serverfpsaverage'))}` | Frame time: `{fmt(metrics.get('serverframetime'), 2)} ms`")
+    else:
+        lines.append(f"- API: `FAILED` {api.get('error', '')}")
+    lines.append("")
+    lines.append("Performance:")
+    for label in ["5m", "60m", "24h", "7d"]:
+        w = windows.get(label, {})
+        lines.append(f"- Avg {label}: `{fmt(w.get('avg'))}` FPS | 1% low: `{fmt(w.get('low_1pct'))}` | 0.1% low: `{fmt(w.get('low_0_1pct'))}` | players avg/max `{fmt(w.get('avg_players'))}/{fmt(w.get('max_players'),0)}` | samples `{w.get('samples',0)}` failures `{w.get('failures',0)}`")
+    w24 = windows.get("24h", {})
+    if w24.get("samples"):
+        lines.append(f"- 24h range: min `{fmt(w24.get('min'))}`, p05 `{fmt(w24.get('p05'))}`, p95 `{fmt(w24.get('p95'))}`, max `{fmt(w24.get('max'))}` FPS")
+    lines.append("")
+    lines.append("Config / Build:")
+    lines.append(f"- Engine profile: `{engine.get('profile', 'unknown')}` | Engine.ini drift: `{'OK' if engine.get('check_ok') else 'FAILED'}`")
+    lines.append(f"- Latest Engine.ini backup: `{engine.get('latest_backup', 'unknown')}`")
+    lines.append(f"- Latest snapshot: `{(data.get('snapshot') or {}).get('latest') or 'none'}`")
+    lines.append(f"- Steam buildid: `{data.get('buildid') or 'unknown'}`")
+    disk = data.get("disk") or []
+    if disk:
+        lines.append("")
+        lines.append("Disk:")
+        for d in disk:
+            lines.append(f"- `{d.get('target')}`: `{d.get('used')}/{d.get('size')}` used `{d.get('use_percent')}`, avail `{d.get('avail')}`")
+    events = fps.get("events_24h") or []
+    if events:
+        lines.append("")
+        lines.append("Events 24h:")
+        for event in events[-6:]:
+            lines.append(f"- `{event.get('event_at_utc')}` [{event.get('category')}] {event.get('label')}")
+        if len(events) > 6:
+            lines.append(f"- ...and {len(events)-6} earlier event(s)")
+    lines.append("")
+    lines.append(f"Generated: `{data.get('generated_at')}`")
+    return "\n".join(lines)
+
+
+def load_notify_env() -> dict[str, str]:
+    vals = {}
+    if not NOTIFY_ENV.exists():
+        return vals
+    for line in NOTIFY_ENV.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        vals[k] = v.strip().strip('"').strip("'")
+    return vals
+
+
+def multipart_post(url: str, payload: dict[str, Any], file_path: Path) -> int:
+    boundary = "----palworldhealth" + base64.urlsafe_b64encode(os.urandom(12)).decode()
+    filename = file_path.name
+    content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    body = b"".join([
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"payload_json\"\r\n\r\n".encode() + json.dumps(payload).encode() + b"\r\n",
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"files[0]\"; filename=\"{filename}\"\r\nContent-Type: {content_type}\r\n\r\n".encode() + file_path.read_bytes() + b"\r\n",
+        f"--{boundary}--\r\n".encode(),
+    ])
+    req = urllib.request.Request(url, data=body, headers={"Content-Type": f"multipart/form-data; boundary={boundary}", "User-Agent": "palworld-health-report/1.0"}, method="POST")
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        resp.read()
+        return int(resp.status)
+
+
+def make_fps_graph(output: Path, window: str) -> Path:
+    fps_mod = load_fps_module()
+    con = fps_mod.connect(fps_mod.DB_PATH)
+    return fps_mod.make_graph(con, output, window)
+
+
+def command_report(args: argparse.Namespace) -> int:
+    data = collect_health(timeout=args.timeout)
+    if args.json:
+        print(json.dumps(data, indent=2, sort_keys=True))
+    else:
+        print(format_health(data))
+    if args.graph:
+        path = make_fps_graph(Path(args.graph), args.window)
+        print(f"graph={path}")
+    return 0
+
+
+def command_discord(args: argparse.Namespace) -> int:
+    data = collect_health(timeout=args.timeout)
+    content = format_health(data)
+    with tempfile.TemporaryDirectory(prefix="palworld-health-") as td:
+        graph = Path(td) / f"palworld-health-fps-{args.window}.png"
+        make_fps_graph(graph, args.window)
+        if args.dry_run:
+            print(content)
+            print(f"dry_run_graph={graph} size={graph.stat().st_size}")
+            return 0
+        env = load_notify_env()
+        url = env.get("PALWORLD_DISCORD_WEBHOOK", "")
+        if not url:
+            raise RuntimeError(f"PALWORLD_DISCORD_WEBHOOK missing from {NOTIFY_ENV}")
+        name = env.get("PALWORLD_NOTIFY_NAME", "Palworld")
+        status = multipart_post(url, {"content": content, "username": name}, graph)
+        print(f"posted Discord health report status={status} graph_bytes={graph.stat().st_size}")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("report", help="print health report")
+    p.add_argument("--timeout", type=int, default=5)
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--graph", help="write FPS/player graph PNG")
+    p.add_argument("--window", choices=["5m", "60m", "24h", "7d"], default="24h")
+    p.set_defaults(func=command_report)
+    p = sub.add_parser("discord", help="post health report + FPS graph to Discord")
+    p.add_argument("--timeout", type=int, default=5)
+    p.add_argument("--window", choices=["5m", "60m", "24h", "7d"], default="24h")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(func=command_discord)
+    args = ap.parse_args()
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

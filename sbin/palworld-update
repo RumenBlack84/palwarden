@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source /usr/local/lib/palworld-notify || true
+
+APP_ID=2394010
+INSTALL_DIR=/opt/palworld/server
+MANIFEST="$INSTALL_DIR/steamapps/appmanifest_${APP_ID}.acf"
+STEAMCMD=/usr/games/steamcmd
+SERVICE=palworld.service
+WAIT_SECONDS=300
+NOTICE_MESSAGE="Palworld server update detected: saving and stopping in 5 minutes."
+CHECK_ONLY=0
+NOTIFY_NO_UPDATE=0
+VALIDATE=1
+
+usage() {
+  cat >&2 <<EOF
+Usage: $0 [--check] [--wait seconds] [--message text] [--notify-no-update] [--no-validate]
+
+Checks Steam public branch buildid before stopping the server. If no update is
+available, exits 0 without touching palworld.service.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --check) CHECK_ONLY=1; shift ;;
+    --wait|-w) WAIT_SECONDS="$2"; shift 2 ;;
+    --message|-m) NOTICE_MESSAGE="$2"; shift 2 ;;
+    --notify-no-update) NOTIFY_NO_UPDATE=1; shift ;;
+    --no-validate) VALIDATE=0; shift ;;
+    --help|-h) usage; exit 0 ;;
+    *) usage; exit 64 ;;
+  esac
+done
+
+local_buildid() {
+  if [[ -r "$MANIFEST" ]]; then
+    awk -F'"' '/"buildid"/{print $4; exit}' "$MANIFEST"
+  fi
+}
+
+remote_buildid() {
+  sudo -u palworld "$STEAMCMD" +login anonymous +app_info_update 1 +app_info_print "$APP_ID" +quit 2>/dev/null \
+    | awk '
+      /"branches"/ {inbranches=1}
+      inbranches && /"public"/ {inpublic=1}
+      inpublic && /"buildid"/ {gsub(/"/, ""); print $2; exit}
+    '
+}
+
+current="$(local_buildid || true)"
+remote="$(remote_buildid || true)"
+
+if [[ -z "$remote" ]]; then
+  palworld_notify error "update check failed: could not determine remote Steam buildid for app ${APP_ID}."
+  echo "Could not determine remote buildid for app ${APP_ID}" >&2
+  exit 1
+fi
+
+if [[ -n "$current" && "$current" == "$remote" ]]; then
+  msg="no Palworld update available; buildid ${current} is current."
+  echo "$msg"
+  if [[ "$NOTIFY_NO_UPDATE" -eq 1 ]]; then
+    palworld_notify success "$msg"
+  fi
+  exit 0
+fi
+
+if [[ "$CHECK_ONLY" -eq 1 ]]; then
+  echo "Palworld update available: local=${current:-unknown}, remote=${remote}."
+  exit 10
+fi
+
+palworld_notify warning "Palworld update detected: local build \`${current:-unknown}\`, remote build \`${remote}\`. Starting graceful maintenance flow."
+/usr/local/sbin/palworld-fps mark "Palworld update detected" --category update --details "local=${current:-unknown}; remote=${remote}" >/dev/null 2>&1 || true
+
+was_active=0
+if systemctl is-active --quiet "$SERVICE"; then
+  was_active=1
+  if ss -H -lntp | grep -q ':8212'; then
+    /usr/local/sbin/palworld-graceful-stop --wait "$WAIT_SECONDS" --message "$NOTICE_MESSAGE"
+  else
+    palworld_notify warning "REST API not available; stopping ${SERVICE} through systemd before update."
+    systemctl stop "$SERVICE"
+  fi
+fi
+
+cmd=("$STEAMCMD" +force_install_dir "$INSTALL_DIR" +login anonymous +app_update "$APP_ID")
+if [[ "$VALIDATE" -eq 1 ]]; then
+  cmd+=(validate)
+fi
+cmd+=(+quit)
+
+palworld_notify start "downloading Palworld update to build \`${remote}\`${VALIDATE:+ with validation}."
+if sudo -u palworld "${cmd[@]}"; then
+  # SteamCMD runs as the palworld user, so updated files should already be
+  # owned correctly. Do not recursively chown /opt/palworld here: managed
+  # config files such as Engine.ini may be intentionally immutable, and a
+  # blanket chown can abort the update flow before the service is restarted.
+  chmod +x "$INSTALL_DIR/PalServer.sh"
+else
+  rc=$?
+  palworld_notify error "SteamCMD update failed with exit code ${rc}; attempting to restart existing server."
+  if [[ "$was_active" -eq 1 ]]; then systemctl start "$SERVICE" >/dev/null 2>&1 || true; fi
+  exit "$rc"
+fi
+
+new_local="$(local_buildid || true)"
+if [[ "$was_active" -eq 1 ]]; then
+  palworld_notify start "starting ${SERVICE} after update; installed build \`${new_local:-unknown}\`."
+  systemctl start "$SERVICE"
+  deadline=$((SECONDS + 240))
+  while ! systemctl is-active --quiet "$SERVICE"; do
+    if (( SECONDS >= deadline )); then
+      state="$(systemctl is-active "$SERVICE" || true)"
+      palworld_notify error "update installed but ${SERVICE} did not become active; state \`${state}\`."
+      systemctl --no-pager -l status "$SERVICE" || true
+      exit 1
+    fi
+    sleep 2
+  done
+  api_output=""
+  api_deadline=$((SECONDS + 240))
+  while true; do
+    if api_output="$(sudo /usr/local/sbin/palworld-api info 2>&1)"; then
+      break
+    fi
+    if (( SECONDS >= api_deadline )); then
+      palworld_notify warning "update installed and service is active, but REST API did not become ready. Last check: ${api_output}"
+      break
+    fi
+    sleep 3
+  done
+fi
+
+version=$(grep -a "Game version is" /var/log/palworld/server.log 2>/dev/null | tail -1 | sed "s/^.*Game version is //" || true)
+palworld_notify success "Palworld update complete: build \`${current:-unknown}\` → \`${new_local:-unknown}\`${version:+, game version ${version}}."
+/usr/local/sbin/palworld-fps mark "Palworld update completed" --category update --details "local=${current:-unknown}; installed=${new_local:-unknown}${version:+; version=${version}}" >/dev/null 2>&1 || true
+echo "Palworld update complete: build ${current:-unknown} -> ${new_local:-unknown}${version:+, game version ${version}}"

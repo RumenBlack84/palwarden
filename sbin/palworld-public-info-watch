@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source /usr/local/lib/palworld-notify || true
+
+STATE_FILE=/var/lib/palworld/public-info.env
+CONFIG_FILE=/opt/palworld/server/Pal/Saved/Config/LinuxServer/PalWorldSettings.ini
+HOSTNAME_VALUE="server.example.com"
+
+install -d -o root -g root -m 0755 /var/lib/palworld
+
+if [[ ! -r "$CONFIG_FILE" ]]; then
+  echo "Cannot read $CONFIG_FILE" >&2
+  exit 1
+fi
+
+read_config_value() {
+  local key="$1"
+  sudo python3 - "$CONFIG_FILE" "$key" <<'PY'
+from pathlib import Path
+import sys
+path,key=sys.argv[1],sys.argv[2]
+text=Path(path).read_text(errors='ignore')
+marker=key+'='
+pos=text.find(marker)
+if pos < 0:
+    print('')
+    raise SystemExit(0)
+start=pos+len(marker)
+i=start
+in_str=False
+escaped=False
+while i < len(text):
+    ch=text[i]
+    if escaped:
+        escaped=False; i+=1; continue
+    if ch == '\\' and in_str:
+        escaped=True; i+=1; continue
+    if ch == '"':
+        in_str = not in_str; i+=1; continue
+    if not in_str and ch in ',)\n':
+        break
+    i+=1
+val=text[start:i].strip()
+if len(val) >= 2 and val[0] == '"' and val[-1] == '"':
+    val=val[1:-1].replace('\\"','"').replace('\\\\','\\')
+print(val)
+PY
+}
+
+SERVER_PASSWORD="$(read_config_value ServerPassword)"
+SERVER_PORT="$(read_config_value PublicPort)"
+if [[ -z "$SERVER_PORT" ]]; then
+  SERVER_PORT="8211"
+fi
+PUBLIC_IP="$(curl -fsS --max-time 10 https://ifconfig.me/ip | tr -d '[:space:]')"
+if [[ -z "$PUBLIC_IP" ]]; then
+  echo "Could not determine public IP from ifconfig.me" >&2
+  exit 1
+fi
+
+tmp="$(mktemp)"
+chmod 0600 "$tmp"
+{
+  printf 'HOSTNAME=%q\n' "$HOSTNAME_VALUE"
+  printf 'PUBLIC_IP=%q\n' "$PUBLIC_IP"
+  printf 'SERVER_PORT=%q\n' "$SERVER_PORT"
+  printf 'SERVER_PASSWORD=%q\n' "$SERVER_PASSWORD"
+} > "$tmp"
+
+if [[ -f "$STATE_FILE" ]] && cmp -s "$tmp" "$STATE_FILE"; then
+  rm -f "$tmp"
+  echo "No public join-info change detected."
+  exit 0
+fi
+
+old_summary="none"
+if [[ -f "$STATE_FILE" ]]; then
+  old_summary="previous state existed"
+fi
+install -o root -g root -m 0600 "$tmp" "$STATE_FILE"
+rm -f "$tmp"
+
+password_display="blank"
+if [[ -n "$SERVER_PASSWORD" ]]; then
+  password_display="$SERVER_PASSWORD"
+fi
+
+printf -v discord_msg '🎮 **Server Information Updated!**\n\n🌐 **Hostname:** `%s`\n📡 **Public IP:** `%s`\n🔌 **Port:** `%s`\n🔑 **Password:** `%s`' "$HOSTNAME_VALUE" "$PUBLIC_IP" "$SERVER_PORT" "$password_display"
+palworld_notify success "$discord_msg"
+echo "Updated $STATE_FILE (${old_summary})."
+printf 'Server Information Updated!\nHostname: %s\nPublic IP: %s\nPort: %s\nPassword: %s\n' "$HOSTNAME_VALUE" "$PUBLIC_IP" "$SERVER_PORT" "$password_display"

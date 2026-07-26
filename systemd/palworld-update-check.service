@@ -1,0 +1,8 @@
+[Unit]
+Description=Check for Palworld server updates and apply when available
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/flock -n /run/palworld-update.lock /usr/local/sbin/palworld-update

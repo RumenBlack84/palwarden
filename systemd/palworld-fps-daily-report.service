@@ -1,0 +1,8 @@
+[Unit]
+Description=Post daily Palworld health report and FPS graph to Discord
+Wants=network-online.target
+After=network-online.target palworld.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/palworld-health-report discord --window 24h

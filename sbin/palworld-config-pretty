@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+src=/opt/palworld/server/Pal/Saved/Config/LinuxServer/PalWorldSettings.ini
+dst=/opt/palworld/server/Pal/Saved/Config/LinuxServer/PalWorldSettings.pretty.ini
+python3 - <<"PY"
+from pathlib import Path
+src=Path("/opt/palworld/server/Pal/Saved/Config/LinuxServer/PalWorldSettings.ini")
+dst=Path("/opt/palworld/server/Pal/Saved/Config/LinuxServer/PalWorldSettings.pretty.ini")
+text=src.read_text(errors="ignore").replace("\r\n","\n")
+lines=[]
+for line in text.splitlines():
+    if not line.startswith("OptionSettings=("):
+        lines.append(line); continue
+    body=line[len("OptionSettings=("):-1] if line.endswith(")") else line[len("OptionSettings=("):]
+    parts=[]; cur=[]; depth=0; in_str=False; esc=False
+    for ch in body:
+        if esc:
+            cur.append(ch); esc=False; continue
+        if ch=="\\" and in_str:
+            cur.append(ch); esc=True; continue
+        if ch=="\"":
+            in_str=not in_str; cur.append(ch); continue
+        if not in_str:
+            if ch=="(": depth+=1
+            elif ch==")" and depth: depth-=1
+            elif ch=="," and depth==0:
+                parts.append("".join(cur).strip()); cur=[]; continue
+        cur.append(ch)
+    if cur: parts.append("".join(cur).strip())
+    lines += ["; Human-readable reference only. PalworldSettings.ini remains canonical.", "; This is Unreal Engine config syntax, not JSON.", "OptionSettings=("]
+    lines += [f"    {p}{"," if i < len(parts)-1 else ""}" for i,p in enumerate(parts)]
+    lines.append(")")
+dst.write_text("\n".join(lines)+"\n")
+PY
+chown palworld:palworld "$dst"
+chmod 0644 "$dst"
+echo "$dst"

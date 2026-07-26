@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SERVICE=palworld.service
+CONFIG=/opt/palworld/server/Pal/Saved/Config/LinuxServer/PalWorldSettings.ini
+MANIFEST=/opt/palworld/server/steamapps/appmanifest_2394010.acf
+STATE_FILE=/var/lib/palworld/public-info.env
+
+echo "Palworld Status"
+echo "==============="
+printf 'Time: %s\n' "$(date -u '+%F %T UTC')"
+
+echo
+echo "Service"
+state="$(systemctl is-active "$SERVICE" || true)"
+enabled="$(systemctl is-enabled "$SERVICE" 2>/dev/null || true)"
+pid="$(systemctl show -p MainPID --value "$SERVICE" 2>/dev/null || echo 0)"
+mem_current="$(systemctl show -p MemoryCurrent --value "$SERVICE" 2>/dev/null || echo 0)"
+printf -- '- state: %s\n- enabled: %s\n- main PID: %s\n' "$state" "$enabled" "$pid"
+
+read -r mem_total_kb mem_avail_kb < <(awk '/MemTotal:/ {t=$2} /MemAvailable:/ {a=$2} END {print t, a}' /proc/meminfo)
+mem_used_kb=$((mem_total_kb - mem_avail_kb))
+mem_used_pct=$((mem_used_kb * 100 / mem_total_kb))
+mem_total_gib=$(awk -v kb="$mem_total_kb" 'BEGIN{printf "%.1f", kb/1024/1024}')
+mem_avail_gib=$(awk -v kb="$mem_avail_kb" 'BEGIN{printf "%.1f", kb/1024/1024}')
+if [[ "$mem_current" =~ ^[0-9]+$ && "$mem_current" -gt 0 ]]; then
+  svc_mem_gib=$(awk -v b="$mem_current" 'BEGIN{printf "%.2f", b/1024/1024/1024}')
+  svc_mem_pct=$(awk -v b="$mem_current" -v kb="$mem_total_kb" 'BEGIN{printf "%.1f", (b/1024)/(kb)*100}')
+else
+  svc_mem_gib="unknown"; svc_mem_pct="unknown"
+fi
+
+echo
+echo "Memory"
+printf -- '- system used: %s%%, available: %s GiB / %s GiB\n' "$mem_used_pct" "$mem_avail_gib" "$mem_total_gib"
+printf -- '- %s cgroup memory: %s GiB (%s%% of host RAM)\n' "$SERVICE" "$svc_mem_gib" "$svc_mem_pct"
+if [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 0 ]]; then
+  ps -o pid,rss,%mem,etime,cmd -p "$pid" | sed 's/^/- main process: /'
+fi
+pal_pid="$(pgrep -u palworld -f 'PalServer-Linux' | head -1 || true)"
+if [[ -n "$pal_pid" ]]; then
+  ps -o pid,rss,%mem,etime,cmd -p "$pal_pid" | sed 's/^/- game process: /'
+fi
+
+echo
+echo "Ports"
+ss -H -lntup | awk '/:8211|:8212|:27015|:8088/ {print "- " $0}' || true
+
+echo
+echo "API"
+if api_output="$(sudo /usr/local/sbin/palworld-api info 2>&1)"; then
+  API_OUTPUT="$api_output" python3 - <<'PY'
+import json,re,os
+text=os.environ.get('API_OUTPUT','')
+m=re.search(r'\{.*\}', text, re.S)
+if not m:
+    print('- healthy: yes')
+    raise SystemExit
+j=json.loads(m.group(0))
+print('- healthy: yes')
+for k in ['version','servername','description','worldguid']:
+    print(f'- {k}: {j.get(k, "")}' )
+PY
+else
+  echo "- healthy: no"
+  printf '%s\n' "$api_output" | sed 's/^/- last error: /'
+fi
+
+echo
+echo "Steam build"
+local_build=""
+if [[ -r "$MANIFEST" ]]; then local_build="$(sudo awk -F'\"' '/buildid/{print $4; exit}' "$MANIFEST")"; fi
+printf -- '- local buildid: %s\n' "${local_build:-unknown}"
+
+echo
+echo "Join info"
+if [[ -f "$STATE_FILE" ]]; then
+  sudo sed -E 's/(SERVER_PASSWORD=).*/\1[set]/' "$STATE_FILE" | sed 's/^/- /'
+else
+  echo "- state file missing"
+fi
+
+echo
+echo "Timers"
+systemctl list-timers --all 'palworld*' --no-pager | sed 's/^/- /'
+
+echo
+echo "Recent log tail"
+sudo tail -12 /var/log/palworld/server.log 2>/dev/null | tr '\0' ' ' | sed 's/^/- /' || true

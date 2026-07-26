@@ -1,0 +1,702 @@
+#!/usr/bin/env python3
+"""Apply curated Palworld Engine.ini performance overrides from engine.env."""
+
+from __future__ import annotations
+
+import argparse
+import difflib
+import os
+import re
+import shutil
+import subprocess
+import sys
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterable
+
+ENGINE_INI = Path("/opt/palworld/server/Pal/Saved/Config/LinuxServer/Engine.ini")
+ENGINE_ENV = Path("/etc/palworld/engine.env")
+BACKUP_DIR = Path("/opt/palworld/config-backups")
+PRETTY_INI = Path("/opt/palworld/server/Pal/Saved/Config/LinuxServer/Engine.pretty.ini")
+NOTIFY = "/usr/local/lib/palworld-notify"
+
+
+@dataclass(frozen=True)
+class Setting:
+    env: str
+    section: str
+    key: str
+    kind: str
+    minimum: float | None = None
+    maximum: float | None = None
+    description: str = ""
+
+
+SETTINGS: tuple[Setting, ...] = (
+    Setting("NET_SERVER_MAX_TICK_RATE", "/Script/OnlineSubsystemUtils.IpNetDriver", "NetServerMaxTickRate", "int", 15, 120, "Dedicated server network tick cap."),
+    Setting("MAX_CLIENT_RATE", "/Script/OnlineSubsystemUtils.IpNetDriver", "MaxClientRate", "int", 10000, 500000, "Maximum bytes/sec per LAN client."),
+    Setting("MAX_INTERNET_CLIENT_RATE", "/Script/OnlineSubsystemUtils.IpNetDriver", "MaxInternetClientRate", "int", 10000, 500000, "Maximum bytes/sec per internet client."),
+    Setting("CONNECTION_TIMEOUT", "/Script/OnlineSubsystemUtils.IpNetDriver", "ConnectionTimeout", "float", 10, 300, "Seconds before a stale connection times out."),
+    Setting("TOTAL_NET_BANDWIDTH", "/Script/Engine.GameNetworkManager", "TotalNetBandwidth", "int", 10000, 2000000, "Total network bandwidth budget."),
+    Setting("MAX_DYNAMIC_BANDWIDTH", "/Script/Engine.GameNetworkManager", "MaxDynamicBandwidth", "int", 10000, 500000, "Maximum dynamic bandwidth per client."),
+    Setting("MIN_DYNAMIC_BANDWIDTH", "/Script/Engine.GameNetworkManager", "MinDynamicBandwidth", "int", 1000, 250000, "Minimum dynamic bandwidth per client."),
+    Setting("ASYNC_LOADING_THREAD_ENABLED", "/Script/Engine.StreamingSettings", "s.AsyncLoadingThreadEnabled", "bool", description="Enable async loading thread."),
+    Setting("EVENT_DRIVEN_LOADER_ENABLED", "/Script/Engine.StreamingSettings", "s.EventDrivenLoaderEnabled", "bool", description="Enable event-driven loader."),
+    Setting("USE_BACKGROUND_LEVEL_STREAMING", "/Script/Engine.StreamingSettings", "s.UseBackgroundLevelStreaming", "bool", description="Enable background level streaming."),
+    Setting("LEVEL_STREAMING_ACTORS_UPDATE_TIME_LIMIT", "/Script/Engine.StreamingSettings", "s.LevelStreamingActorsUpdateTimeLimit", "float", 0.5, 20, "Milliseconds budget for streaming actor update."),
+    Setting("LEVEL_STREAMING_COMPONENTS_REGISTRATION_GRANULARITY", "/Script/Engine.StreamingSettings", "s.LevelStreamingComponentsRegistrationGranularity", "int", 1, 100, "Component registration batch size."),
+    Setting("ONE_FRAME_THREAD_LAG", "SystemSettings", "r.OneFrameThreadLag", "int", 0, 1, "Allow one-frame render thread lag; usually irrelevant on dedicated server."),
+    Setting("ALLOW_ASYNC_TICK_DISPATCH", "SystemSettings", "tick.AllowAsyncTickDispatch", "int", 0, 1, "Allow async tick dispatch."),
+    Setting("ALLOW_ASYNC_TICK_CLEANUP", "SystemSettings", "tick.AllowAsyncTickCleanup", "int", 0, 1, "Allow async tick cleanup."),
+)
+
+SETTING_BY_ENV = {s.env: s for s in SETTINGS}
+
+PROFILES: dict[str, dict[str, str]] = {
+    "Conservative 30 TPS": {
+        "NET_SERVER_MAX_TICK_RATE": "30",
+        "MAX_CLIENT_RATE": "80000",
+        "MAX_INTERNET_CLIENT_RATE": "80000",
+        "TOTAL_NET_BANDWIDTH": "320000",
+        "MAX_DYNAMIC_BANDWIDTH": "80000",
+        "MIN_DYNAMIC_BANDWIDTH": "20000",
+        "ASYNC_LOADING_THREAD_ENABLED": "1",
+        "EVENT_DRIVEN_LOADER_ENABLED": "1",
+        "USE_BACKGROUND_LEVEL_STREAMING": "1",
+    },
+    "Balanced 60 TPS": {
+        "NET_SERVER_MAX_TICK_RATE": "60",
+        "MAX_CLIENT_RATE": "100000",
+        "MAX_INTERNET_CLIENT_RATE": "100000",
+        "CONNECTION_TIMEOUT": "60",
+        "TOTAL_NET_BANDWIDTH": "500000",
+        "MAX_DYNAMIC_BANDWIDTH": "100000",
+        "MIN_DYNAMIC_BANDWIDTH": "40000",
+        "ASYNC_LOADING_THREAD_ENABLED": "1",
+        "EVENT_DRIVEN_LOADER_ENABLED": "1",
+        "USE_BACKGROUND_LEVEL_STREAMING": "1",
+        "LEVEL_STREAMING_ACTORS_UPDATE_TIME_LIMIT": "5",
+        "LEVEL_STREAMING_COMPONENTS_REGISTRATION_GRANULARITY": "10",
+        "ALLOW_ASYNC_TICK_DISPATCH": "1",
+        "ALLOW_ASYNC_TICK_CLEANUP": "1",
+    },
+    "Experimental 90 TPS": {
+        "NET_SERVER_MAX_TICK_RATE": "90",
+        "MAX_CLIENT_RATE": "150000",
+        "MAX_INTERNET_CLIENT_RATE": "150000",
+        "CONNECTION_TIMEOUT": "60",
+        "TOTAL_NET_BANDWIDTH": "750000",
+        "MAX_DYNAMIC_BANDWIDTH": "150000",
+        "MIN_DYNAMIC_BANDWIDTH": "50000",
+        "ASYNC_LOADING_THREAD_ENABLED": "1",
+        "EVENT_DRIVEN_LOADER_ENABLED": "1",
+        "USE_BACKGROUND_LEVEL_STREAMING": "1",
+        "LEVEL_STREAMING_ACTORS_UPDATE_TIME_LIMIT": "8",
+        "LEVEL_STREAMING_COMPONENTS_REGISTRATION_GRANULARITY": "20",
+        "ALLOW_ASYNC_TICK_DISPATCH": "1",
+        "ALLOW_ASYNC_TICK_CLEANUP": "1",
+    },
+}
+
+
+def parse_env(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for raw in path.read_text(errors="replace").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key in SETTING_BY_ENV:
+            values[key] = value
+    return values
+
+
+def normalize_value(setting: Setting, raw: str) -> str:
+    v = raw.strip()
+    if setting.kind == "bool":
+        low = v.lower()
+        if low in {"1", "true", "yes", "on"}:
+            return "1"
+        if low in {"0", "false", "no", "off"}:
+            return "0"
+        raise ValueError(f"{setting.env} must be boolean-like, got {raw!r}")
+    if setting.kind == "int":
+        try:
+            n = int(v)
+        except ValueError as e:
+            raise ValueError(f"{setting.env} must be an integer, got {raw!r}") from e
+        if setting.minimum is not None and n < setting.minimum:
+            raise ValueError(f"{setting.env} must be >= {setting.minimum}, got {n}")
+        if setting.maximum is not None and n > setting.maximum:
+            raise ValueError(f"{setting.env} must be <= {setting.maximum}, got {n}")
+        return str(n)
+    if setting.kind == "float":
+        try:
+            n = float(v)
+        except ValueError as e:
+            raise ValueError(f"{setting.env} must be numeric, got {raw!r}") from e
+        if setting.minimum is not None and n < setting.minimum:
+            raise ValueError(f"{setting.env} must be >= {setting.minimum}, got {n}")
+        if setting.maximum is not None and n > setting.maximum:
+            raise ValueError(f"{setting.env} must be <= {setting.maximum}, got {n}")
+        return f"{n:g}"
+    raise ValueError(f"unknown type for {setting.env}: {setting.kind}")
+
+
+def split_sections(text: str) -> list[tuple[str | None, list[str]]]:
+    sections: list[tuple[str | None, list[str]]] = []
+    current_name: str | None = None
+    current_lines: list[str] = []
+    for line in text.replace("\r\n", "\n").splitlines():
+        m = re.match(r"^\s*\[([^]]+)\]\s*$", line)
+        if m:
+            sections.append((current_name, current_lines))
+            current_name = m.group(1).strip()
+            current_lines = [line]
+        else:
+            current_lines.append(line)
+    sections.append((current_name, current_lines))
+    return sections
+
+
+def set_key_in_section(lines: list[str], key: str, value: str) -> tuple[list[str], str | None]:
+    out: list[str] = []
+    old: str | None = None
+    replaced = False
+    key_re = re.compile(rf"^\s*{re.escape(key)}\s*=")
+    for line in lines:
+        if key_re.match(line):
+            if old is None:
+                old = line.split("=", 1)[1].strip()
+            if not replaced:
+                out.append(f"{key}={value}")
+                replaced = True
+            # Drop duplicate occurrences of the managed key in the same section.
+            continue
+        out.append(line)
+    if not replaced:
+        if out and out[-1].strip() != "":
+            out.append(f"{key}={value}")
+        else:
+            out.append(f"{key}={value}")
+    return out, old
+
+
+def apply_settings(text: str, env_values: dict[str, str]) -> tuple[str, list[tuple[Setting, str | None, str]]]:
+    desired: dict[tuple[str, str], tuple[Setting, str]] = {}
+    for env, raw in env_values.items():
+        setting = SETTING_BY_ENV[env]
+        desired[(setting.section, setting.key)] = (setting, normalize_value(setting, raw))
+
+    sections = split_sections(text)
+    changes: list[tuple[Setting, str | None, str]] = []
+    seen_sections: set[str] = set()
+    new_sections: list[tuple[str | None, list[str]]] = []
+
+    for name, lines in sections:
+        if name is None:
+            new_sections.append((name, lines))
+            continue
+        seen_sections.add(name)
+        section_desired = [(s, v) for (section, _), (s, v) in desired.items() if section == name]
+        for setting, value in section_desired:
+            lines, old = set_key_in_section(lines, setting.key, value)
+            if old != value:
+                changes.append((setting, old, value))
+        new_sections.append((name, lines))
+
+    missing_by_section: dict[str, list[tuple[Setting, str]]] = {}
+    for (section, _), (setting, value) in desired.items():
+        if section in seen_sections:
+            continue
+        missing_by_section.setdefault(section, []).append((setting, value))
+    for section, items in missing_by_section.items():
+        lines = ["", f"[{section}]"]
+        for setting, value in items:
+            lines.append(f"{setting.key}={value}")
+            changes.append((setting, None, value))
+        new_sections.append((section, lines))
+        seen_sections.add(section)
+
+    out_lines: list[str] = []
+    for _, lines in new_sections:
+        out_lines.extend(lines)
+    return "\n".join(out_lines).rstrip() + "\n", changes
+
+
+def write_pretty(engine_ini: Path, pretty_ini: Path) -> None:
+    text = engine_ini.read_text(errors="replace").replace("\r\n", "\n")
+    managed = {(s.section, s.key): s for s in SETTINGS}
+    lines = ["; Human-readable reference copy. Engine.ini remains canonical.", "; Managed Palworld performance keys are annotated below.", ""]
+    current_section: str | None = None
+    for line in text.splitlines():
+        m = re.match(r"^\s*\[([^]]+)\]\s*$", line)
+        if m:
+            current_section = m.group(1).strip()
+            lines.append(line)
+            continue
+        if current_section and "=" in line:
+            key = line.split("=", 1)[0].strip()
+            setting = managed.get((current_section, key))
+            if setting:
+                lines.append(f"; {setting.env}: {setting.description}")
+        lines.append(line)
+    pretty_ini.write_text("\n".join(lines).rstrip() + "\n")
+
+
+def format_changes(changes: Iterable[tuple[Setting, str | None, str]]) -> str:
+    changes = list(changes)
+    if not changes:
+        return "No Engine.ini performance changes detected."
+    lines = ["Engine.ini performance changes:"]
+    for setting, old, new in changes:
+        lines.append(f"- [{setting.section}] {setting.key}: {old if old is not None else '<unset>'} → {new}")
+    return "\n".join(lines)
+
+
+def notify(message: str) -> None:
+    if not Path(NOTIFY).exists():
+        return
+    env = os.environ.copy()
+    env["PALWORLD_ENGINE_NOTIFY_MESSAGE"] = message
+    command = f'source {NOTIFY} || true; palworld_notify success "$PALWORLD_ENGINE_NOTIFY_MESSAGE" >/dev/null 2>&1 || true'
+    subprocess.run(
+        ["bash", "-lc", command],
+        env=env,
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def mark_event(label: str, category: str = "config", details: str | None = None) -> None:
+    cmd = ["/usr/local/sbin/palworld-fps", "mark", label, "--category", category]
+    if details:
+        cmd.extend(["--details", details])
+    subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def parse_ini_values(text: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    env_by_section_key = {(s.section, s.key): s.env for s in SETTINGS}
+    for section, lines in split_sections(text):
+        if section is None:
+            continue
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith((";", "#", "[")) or "=" not in stripped:
+                continue
+            key, value = stripped.split("=", 1)
+            env = env_by_section_key.get((section, key.strip()))
+            if env:
+                values[env] = value.strip()
+    return values
+
+
+def normalized_profile_values(profile: dict[str, str]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for env, raw in profile.items():
+        out[env] = normalize_value(SETTING_BY_ENV[env], raw)
+    return out
+
+
+def match_profile(values: dict[str, str]) -> dict[str, object]:
+    best: dict[str, object] | None = None
+    for name, raw_profile in PROFILES.items():
+        profile = normalized_profile_values(raw_profile)
+        missing = [env for env in profile if env not in values]
+        different = [
+            {"env": env, "expected": expected, "actual": values.get(env)}
+            for env, expected in profile.items()
+            if env in values and values.get(env) != expected
+        ]
+        extra = [env for env in values if env not in profile]
+        score = len(profile) - len(missing) - len(different) - len(extra)
+        result: dict[str, object] = {
+            "name": name,
+            "exact": not missing and not different and not extra,
+            "missing": missing,
+            "different": different,
+            "extra": extra,
+            "score": score,
+        }
+        if result["exact"]:
+            return result
+        if best is None or int(result["score"]) > int(best["score"]):
+            best = result
+    if best is None:
+        return {"name": "Custom/unknown", "exact": False, "missing": [], "different": [], "extra": list(values), "score": 0}
+    best = dict(best)
+    best["exact"] = False
+    if int(best.get("score", 0)) <= 0:
+        best["name"] = "Custom/unknown"
+    return best
+
+
+def _run_attr_command(cmd: list[str], runner=subprocess.run) -> subprocess.CompletedProcess:
+    return runner(cmd, check=True, text=True, capture_output=True)
+
+
+def file_is_immutable(path: Path, runner=subprocess.run) -> bool:
+    """Return True when lsattr shows the immutable bit for path."""
+    result = _run_attr_command(["lsattr", "--", str(path)], runner=runner)
+    attrs = result.stdout.split(maxsplit=1)[0] if result.stdout.strip() else ""
+    return "i" in attrs
+
+
+def set_immutable(path: Path, enabled: bool, runner=subprocess.run) -> None:
+    """Set or clear the Linux immutable bit on path."""
+    flag = "+i" if enabled else "-i"
+    _run_attr_command(["chattr", flag, "--", str(path)], runner=runner)
+
+
+@contextmanager
+def mutable_engine_file(path: Path, protect: bool = True, runner=subprocess.run):
+    """Temporarily make Engine.ini mutable, then optionally leave it immutable.
+
+    If protect is true, the file is locked at the end even when it was mutable
+    at entry. If protect is false, only a file that was immutable at entry is
+    restored to immutable.
+    """
+    was_immutable = file_is_immutable(path, runner=runner) if path.exists() else False
+    if was_immutable:
+        set_immutable(path, False, runner=runner)
+    try:
+        yield
+    finally:
+        if protect or was_immutable:
+            set_immutable(path, True, runner=runner)
+
+
+def format_immutable_status(path: Path) -> str:
+    if not path.exists():
+        return "unknown (file missing)"
+    try:
+        return "yes" if file_is_immutable(path) else "no"
+    except Exception as exc:
+        return f"unknown ({exc})"
+
+
+def list_backups(backup_dir: Path) -> list[Path]:
+    if not backup_dir.exists():
+        return []
+    return sorted(backup_dir.glob("Engine.ini.*"), key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def resolve_backup(name: str, backup_dir: Path) -> Path:
+    if "/" in name or "\\" in name:
+        raise ValueError("backup name must be a file name, not a path")
+    backup = backup_dir / name
+    if not backup.exists() or not backup.is_file():
+        raise FileNotFoundError(f"backup not found: {backup}")
+    return backup
+
+
+def rollback_engine(name: str, ini_path: Path, backup_dir: Path, pretty_path: Path, save_current: bool = True, protect: bool = True) -> Path:
+    backup = resolve_backup(name, backup_dir)
+    with mutable_engine_file(ini_path, protect=protect):
+        if save_current and ini_path.exists():
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            pre = backup_dir / f"Engine.ini.pre-rollback.{stamp}"
+            shutil.copy2(ini_path, pre)
+            try:
+                shutil.chown(pre, user="palworld", group="palworld")
+            except Exception:
+                pass
+        shutil.copy2(backup, ini_path)
+        try:
+            shutil.chown(ini_path, user="palworld", group="palworld")
+        except Exception:
+            pass
+        os.chmod(ini_path, 0o644)
+        write_pretty(ini_path, pretty_path)
+        try:
+            shutil.chown(pretty_path, user="palworld", group="palworld")
+        except Exception:
+            pass
+        os.chmod(pretty_path, 0o644)
+    return backup
+
+
+def expected_values_from_env(env_path: Path) -> dict[str, str]:
+    if not env_path.exists():
+        return {}
+    return normalized_profile_values(parse_env(env_path))
+
+
+def check_expected_values(values: dict[str, str], expected: dict[str, str]) -> dict[str, object]:
+    missing = [env for env in expected if env not in values]
+    different = [
+        {"env": env, "expected": want, "actual": values.get(env)}
+        for env, want in expected.items()
+        if env in values and values.get(env) != want
+    ]
+    return {"ok": not missing and not different, "missing": missing, "different": different}
+
+
+def format_check(check: dict[str, object]) -> str:
+    if check.get("ok"):
+        return "Engine.ini check OK: managed values match /etc/palworld/engine.env."
+    lines = ["Engine.ini check FAILED: managed values drifted from /etc/palworld/engine.env."]
+    missing = check.get("missing") or []
+    different = check.get("different") or []
+    if missing:
+        lines.append("Missing: " + ", ".join(missing))
+    if different:
+        lines.append("Different:")
+        for item in different:
+            lines.append(f"- {item['env']}: expected {item['expected']}, actual {item['actual']}")
+    return "\n".join(lines)
+
+
+def format_status(ini_path: Path, backup_dir: Path) -> str:
+    values = parse_ini_values(ini_path.read_text(errors="replace")) if ini_path.exists() else {}
+    match = match_profile(values)
+    lines = ["Engine.ini managed status", ""]
+    lines.append("Current profile:")
+    if match.get("exact"):
+        lines.append(f"- {match.get('name')}: exact match")
+    else:
+        lines.append(f"- {match.get('name')}: partial/custom match")
+        if match.get("different"):
+            lines.append("  Differences from nearest profile:")
+            for item in match.get("different", []):
+                lines.append(f"  - {item['env']}: expected {item['expected']}, actual {item['actual']}")
+        if match.get("missing"):
+            lines.append("  Missing from nearest profile: " + ", ".join(match.get("missing", [])))
+        if match.get("extra"):
+            lines.append("  Extra managed values: " + ", ".join(match.get("extra", [])))
+    lines.append("")
+    lines.append("Protection:")
+    lines.append(f"- Engine.ini immutable: {format_immutable_status(ini_path)}")
+    lines.append("")
+    lines.append("Managed values:")
+    for setting in SETTINGS:
+        if setting.env in values:
+            lines.append(f"[{setting.section}] {setting.key}={values[setting.env]}")
+        else:
+            lines.append(f"[{setting.section}] {setting.key}=<unset>")
+    backups = list_backups(backup_dir)
+    lines.append("")
+    lines.append("Latest Engine.ini backup:")
+    lines.append(f"- {backups[0].name}" if backups else "- <none>")
+    lines.append("")
+    lines.append("Reminder: Engine.ini changes require a graceful restart to take effect.")
+    return "\n".join(lines)
+
+
+def command_status(args: argparse.Namespace) -> int:
+    ini_path = Path(args.ini)
+    backup_dir = Path(args.backup_dir)
+    if args.check:
+        if not ini_path.exists():
+            print(f"Engine.ini check FAILED: cannot read {ini_path}", file=sys.stderr)
+            return 2
+        expected = expected_values_from_env(Path(args.env))
+        if not expected:
+            print(f"Engine.ini check FAILED: no managed values found in {args.env}", file=sys.stderr)
+            return 2
+        values = parse_ini_values(ini_path.read_text(errors="replace"))
+        check = check_expected_values(values, expected)
+        print(format_check(check))
+        return 0 if check.get("ok") else 1
+    print(format_status(ini_path, backup_dir))
+    return 0
+
+
+def command_rollback(args: argparse.Namespace) -> int:
+    backup_dir = Path(args.backup_dir)
+    if args.list:
+        backups = list_backups(backup_dir)
+        if not backups:
+            print(f"No Engine.ini backups found in {backup_dir}")
+            return 0
+        print("Available Engine.ini backups:")
+        for b in backups:
+            print(f"- {b.name}")
+        return 0
+    if not args.backup:
+        print("rollback requires a backup name, or use --list", file=sys.stderr)
+        return 64
+    ini_path = Path(args.ini)
+    pretty_path = Path(args.pretty)
+    try:
+        backup = resolve_backup(args.backup, backup_dir)
+    except (ValueError, FileNotFoundError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    if args.dry_run:
+        print(f"Would restore {backup} to {ini_path}")
+        print("Dry run only; no files changed.")
+        return 0
+    restored = rollback_engine(args.backup, ini_path, backup_dir, pretty_path, protect=not args.no_protect)
+    print(f"Restored {restored} to {ini_path}")
+    print(f"Regenerated {pretty_path}")
+    print(f"Engine.ini immutable protection: {'enabled' if not args.no_protect else 'disabled'}")
+    print("Restart palworld.service for Engine.ini rollback to take effect.")
+    notify(f"Engine.ini rollback restored `{restored.name}`. Restart palworld.service for rollback to take effect.")
+    mark_event("Engine.ini rollback applied", details=f"restored={restored.name}")
+    return 0
+
+
+def command_apply(args: argparse.Namespace) -> int:
+    env_path = Path(args.env)
+    ini_path = Path(args.ini)
+    backup_dir = Path(args.backup_dir)
+    pretty_path = Path(args.pretty)
+    if not env_path.exists():
+        print(f"Cannot read {env_path}", file=sys.stderr)
+        return 1
+    if not ini_path.exists():
+        print(f"Cannot read {ini_path}", file=sys.stderr)
+        return 1
+    env_values = parse_env(env_path)
+    if not env_values:
+        print(f"No known uncommented Engine.ini overrides found in {env_path}")
+        return 0
+    before = ini_path.read_text(errors="replace")
+    try:
+        after, changes = apply_settings(before, env_values)
+    except ValueError as exc:
+        print(f"Validation error: {exc}", file=sys.stderr)
+        return 2
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    backup = backup_dir / f"Engine.ini.{stamp}"
+    if not args.dry_run:
+        with mutable_engine_file(ini_path, protect=not args.no_protect):
+            shutil.copy2(ini_path, backup)
+            ini_path.write_text(after)
+            try:
+                shutil.chown(backup, user="palworld", group="palworld")
+                shutil.chown(ini_path, user="palworld", group="palworld")
+            except Exception:
+                pass
+            os.chmod(ini_path, 0o644)
+            write_pretty(ini_path, pretty_path)
+            try:
+                shutil.chown(pretty_path, user="palworld", group="palworld")
+            except Exception:
+                pass
+            os.chmod(pretty_path, 0o644)
+    summary = format_changes(changes)
+    print(summary)
+    if args.dry_run:
+        print("\nDry run only; no files changed.")
+        return 0
+    print(f"Updated {ini_path}")
+    print(f"Backup: {backup}")
+    print(f"Engine.ini immutable protection: {'enabled' if not args.no_protect else 'disabled'}")
+    print("Restart palworld.service for Engine.ini changes to take effect.")
+    notify(f"Engine.ini performance config applied; backup: `{backup.name}`. Restart palworld.service for changes to take effect.\n\n{summary}")
+    mark_event("Engine.ini performance config applied", details=f"backup={backup.name}; changes={len(changes)}")
+    return 0
+
+
+def command_pretty(args: argparse.Namespace) -> int:
+    write_pretty(Path(args.ini), Path(args.pretty))
+    print(args.pretty)
+    return 0
+
+
+def command_diff(args: argparse.Namespace) -> int:
+    before = Path(args.before).read_text(errors="replace")
+    after = Path(args.after).read_text(errors="replace")
+    diff = difflib.unified_diff(before.splitlines(), after.splitlines(), fromfile=args.before, tofile=args.after, lineterm="")
+    print("\n".join(diff))
+    return 0
+
+
+def command_template(_: argparse.Namespace) -> int:
+    print("# Palworld Engine.ini performance overrides")
+    print("# Uncomment only values you intentionally want to manage. Apply with:")
+    print("#   sudo /usr/local/sbin/palworld-engine-config apply")
+    print("# Then restart gracefully when ready:")
+    print("#   sudo /usr/local/sbin/palworld-graceful-restart")
+    print("")
+    for s in SETTINGS:
+        print(f"# {s.description}")
+        rng = []
+        if s.minimum is not None:
+            rng.append(f"min {s.minimum:g}")
+        if s.maximum is not None:
+            rng.append(f"max {s.maximum:g}")
+        if rng:
+            print(f"# Range: {', '.join(rng)}")
+        print(f"# {s.env}=")
+        print("")
+    return 0
+
+
+def command_lock(args: argparse.Namespace) -> int:
+    ini_path = Path(args.ini)
+    if not ini_path.exists():
+        print(f"Cannot read {ini_path}", file=sys.stderr)
+        return 1
+    set_immutable(ini_path, True)
+    print(f"Locked {ini_path} with chattr +i")
+    return 0
+
+
+def command_unlock(args: argparse.Namespace) -> int:
+    ini_path = Path(args.ini)
+    if not ini_path.exists():
+        print(f"Cannot read {ini_path}", file=sys.stderr)
+        return 1
+    set_immutable(ini_path, False)
+    print(f"Unlocked {ini_path} with chattr -i")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("apply")
+    p.add_argument("--env", default=str(ENGINE_ENV))
+    p.add_argument("--ini", default=str(ENGINE_INI))
+    p.add_argument("--backup-dir", default=str(BACKUP_DIR))
+    p.add_argument("--pretty", default=str(PRETTY_INI))
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--no-protect", action="store_true", help="leave Engine.ini mutable after writing instead of applying chattr +i")
+    p.set_defaults(func=command_apply)
+    p = sub.add_parser("pretty")
+    p.add_argument("--ini", default=str(ENGINE_INI))
+    p.add_argument("--pretty", default=str(PRETTY_INI))
+    p.set_defaults(func=command_pretty)
+    p = sub.add_parser("diff")
+    p.add_argument("before")
+    p.add_argument("after")
+    p.set_defaults(func=command_diff)
+    p = sub.add_parser("template")
+    p.set_defaults(func=command_template)
+    p = sub.add_parser("status", help="show managed Engine.ini values and profile match")
+    p.add_argument("--ini", default=str(ENGINE_INI))
+    p.add_argument("--backup-dir", default=str(BACKUP_DIR))
+    p.add_argument("--env", default=str(ENGINE_ENV), help="engine.env expected values for --check")
+    p.add_argument("--check", action="store_true", help="exit nonzero if Engine.ini differs from engine.env managed values")
+    p.set_defaults(func=command_status)
+    p = sub.add_parser("rollback", help="list or restore Engine.ini backups")
+    p.add_argument("backup", nargs="?", help="backup file name such as Engine.ini.20260710T182037Z")
+    p.add_argument("--list", action="store_true", help="list available Engine.ini backups")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--ini", default=str(ENGINE_INI))
+    p.add_argument("--backup-dir", default=str(BACKUP_DIR))
+    p.add_argument("--pretty", default=str(PRETTY_INI))
+    p.add_argument("--no-protect", action="store_true", help="leave Engine.ini mutable after rollback instead of applying chattr +i")
+    p.set_defaults(func=command_rollback)
+    p = sub.add_parser("lock", help="set chattr +i on Engine.ini")
+    p.add_argument("--ini", default=str(ENGINE_INI))
+    p.set_defaults(func=command_lock)
+    p = sub.add_parser("unlock", help="clear chattr -i on Engine.ini")
+    p.add_argument("--ini", default=str(ENGINE_INI))
+    p.set_defaults(func=command_unlock)
+    args = ap.parse_args()
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

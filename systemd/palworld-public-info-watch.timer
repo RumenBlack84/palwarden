@@ -1,0 +1,12 @@
+[Unit]
+Description=Check Palworld public join info periodically
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+RandomizedDelaySec=30s
+Persistent=true
+Unit=palworld-public-info-watch.service
+
+[Install]
+WantedBy=timers.target
