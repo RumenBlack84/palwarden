@@ -114,4 +114,19 @@ assert_eq "$(code -u "$CREDS" -X POST "$U/api/jobs")" "501" "POST /api/jobs is n
 assert_not_contains "$(cat "$WORK/server.log")" "pw-for-tests" "password never logged"
 assert_not_contains "$(cat "$WORK/server.log")" "tok-for-tests" "token never logged"
 
+# --- the real dashboard page is what gets served at / ---------------------
+REAL_ROOT="$DIR/../../webui"
+assert_rc 0 test -f "$REAL_ROOT/palwarden.html"
+assert_file_contains "$REAL_ROOT/palwarden.html" 'id="palwarden-dashboard"' "has the dashboard root element"
+assert_file_contains "$REAL_ROOT/palwarden.html" "/api/health" "fetches health"
+assert_file_contains "$REAL_ROOT/palwarden.html" "sessionStorage" "keeps the token in sessionStorage"
+# the shared component vocabulary from the design spec, so later pages can reuse it
+assert_file_contains "$REAL_ROOT/palwarden.html" "--pw-bg" "declares the design tokens"
+assert_file_contains "$REAL_ROOT/palwarden.html" "pw-card" "uses the card component"
+assert_file_contains "$REAL_ROOT/palwarden.html" "pw-pill--ok" "uses state pills"
+# it must not ship a hardcoded credential
+assert_file_not_contains "$REAL_ROOT/palwarden.html" "WEBUI_PASSWORD" "no credential baked into the page"
+# and the vendored editors must remain untouched
+assert_rc 0 git -C "$DIR/../.." diff --quiet -- webui/PalWorldSettingsEditor.html webui/EngineIniPerformanceEditor.html
+
 assert_report
