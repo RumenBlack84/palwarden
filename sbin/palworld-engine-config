@@ -371,15 +371,25 @@ def list_backups(backup_dir: Path) -> list[Path]:
     return sorted(backup_dir.glob("Engine.ini.*"), key=lambda p: p.stat().st_mtime, reverse=True)
 
 
-# --- rollback source handling ------------------------------------------------
-# BACKUP_DIR is writable by a *less privileged* user than the one running a
-# rollback: the web UI's unprivileged process owns it, and this tool then runs as
-# root (from palwarden-jobd, or from an admin's sudo). A rollback ends in "copy
-# this file over Engine.ini, chown it to the palworld user, chmod 0644", so a
-# symlink in that directory would publish any root-readable file — settings.env,
-# /etc/shadow — to a lesser user.
+# --- the untrusted backup directory ------------------------------------------
+# BACKUP_DIR is writable by a *less privileged* user than the one running this
+# tool: the web UI's unprivileged process owns it, and this tool then runs as root
+# (from palwarden-jobd, or from an admin's sudo). Every entry in it — names,
+# symlinks, existing files alike — is therefore attacker-controlled, and traffic
+# goes in *both* directions:
 #
-# Two guards, and both are needed:
+#   * reads out of it (rollback's source) — a symlink would publish any
+#     root-readable file: settings.env, /etc/shadow;
+#   * writes into it (apply's backup, rollback's pre-rollback copy) — a symlink
+#     pre-planted at the name we are about to create would redirect root's write
+#     onto an arbitrary file. The names are `Engine.ini.<UTC stamp>` at
+#     second resolution, so guessing them is trivial: plant a handful of stamps a
+#     few seconds ahead and one of them lands.
+#
+# Reads use read_backup_nofollow; writes use write_new_nofollow. Both push the
+# decision into the kernel at the moment of use rather than checking first.
+#
+# For the read, two guards, and both are needed:
 #
 #   * `is_symlink()` in resolve_backup gives the *caller* a clear refusal, and is
 #     what --dry-run and the pre-flight path can report on. It cannot close the
@@ -397,6 +407,29 @@ def list_backups(backup_dir: Path) -> list[Path]:
 # own, and reading through a hardlink it *does* own discloses nothing it could not
 # already read. Reading via a descriptor also means we never hand the destination
 # path back to a follow-capable copy.
+
+
+def write_new_nofollow(path: Path, data: bytes, mode: int = 0o644) -> None:
+    """Create a NEW file at `path`, refusing to follow a symlink or clobber.
+
+    For writes *into* the untrusted backup directory. `O_EXCL | O_NOFOLLOW` means
+    the kernel refuses if anything already exists at the name — including a
+    symlink, dangling or not — so a pre-planted link cannot redirect the write,
+    and there is no check-then-use window for one to appear in.
+
+    The trade this makes deliberately: two backups written in the same UTC second
+    now fail instead of the second silently overwriting the first. The stamp is
+    second-resolution, so that is possible in principle; failing loudly is the
+    right outcome, because the alternative is being unable to tell an innocent
+    collision from an attack.
+
+    Note this is *not* used for the Engine.ini destination write, which has the
+    opposite requirement: it must truncate a file that already exists, and it
+    targets a path the attacker does not control.
+    """
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(data)
 
 
 def read_backup_nofollow(backup: Path) -> tuple[bytes, os.stat_result]:
@@ -450,13 +483,7 @@ def rollback_engine(name: str, ini_path: Path, backup_dir: Path, pretty_path: Pa
     if save_current and ini_path.exists():
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         pre = backup_dir / f"Engine.ini.pre-rollback.{stamp}"
-        # O_EXCL|O_NOFOLLOW for the same reason in the other direction: this
-        # writes *into* the web-writable directory, and a pre-planted symlink at
-        # the (predictable, second-resolution) name would otherwise redirect
-        # root's write onto an arbitrary file.
-        pre_fd = os.open(pre, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
-        with os.fdopen(pre_fd, "wb") as fh:
-            fh.write(ini_path.read_bytes())
+        write_new_nofollow(pre, ini_path.read_bytes())
         try:
             shutil.chown(pre, user=PALWORLD_USER, group=PALWORLD_GROUP)
         except Exception:
@@ -685,7 +712,14 @@ def command_apply(args: argparse.Namespace) -> int:
     backup_dir.mkdir(parents=True, exist_ok=True)
     backup = backup_dir / f"Engine.ini.{stamp}"
     if not args.dry_run:
-            shutil.copy2(ini_path, backup)
+            # Reachable from the web UI as the engine_apply / engine_save_apply_restart
+            # jobd actions, so the backup name is a write into a directory the
+            # requester owns; see write_new_nofollow.
+            try:
+                write_new_nofollow(backup, ini_path.read_bytes())
+            except OSError as exc:
+                print(f"Cannot write backup {backup}: {exc.strerror}", file=sys.stderr)
+                return 1
             ini_path.write_text(after)
             try:
                 shutil.chown(backup, user="palworld", group="palworld")

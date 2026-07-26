@@ -188,4 +188,42 @@ EOF
 assert_contains "$raced" "REFUSED" "O_NOFOLLOW refuses a link swapped in after validation"
 assert_file_not_contains "$INI" "ADMIN_PASSWORD" "the raced swap still published nothing"
 
+# --- apply: writes INTO the backup dir must not follow a planted symlink -----
+# The same hole in the other direction, reachable as the engine_apply /
+# engine_save_apply_restart jobd actions: the backup name is `Engine.ini.<UTC
+# stamp>` at second resolution, so the web user can pre-plant links at the next
+# few stamps and redirect root's write onto a file of its choosing.
+apply_cfg() {
+  PALWORLD_ENGINE_INI="$INI" PALWORLD_ENGINE_ENV="$ENV_FILE" \
+  PALWORLD_BACKUP_DIR="$WORK/backups" PALWORLD_ENGINE_PRETTY_INI="$WORK/Engine.pretty.ini" \
+  PALWORLD_FPS_BIN=/bin/true \
+    python3 "$ENGINE" apply 2>&1
+}
+
+# a normal apply still works, and still leaves a real backup behind
+rm -f "$WORK/backups"/Engine.ini.* "$WORK/backups"/notabackup
+printf '[/Script/OnlineSubsystemUtils.IpNetDriver]\nNetServerMaxTickRate=30\n' > "$INI"
+out="$(apply_cfg)"; rc=$?
+assert_eq "$rc" "0" "a normal apply still succeeds"
+assert_file_contains "$INI" "NetServerMaxTickRate=60" "apply wrote the managed value"
+backup_count="$(find "$WORK/backups" -maxdepth 1 -name 'Engine.ini.*' -type f | wc -l | tr -d ' ')"
+assert_eq "$backup_count" "1" "apply left exactly one real backup file"
+
+# now pre-plant symlinks at the next few stamps and prove the write is refused
+printf 'ROOT_ONLY_SECRET_CONTENT\n' > "$WORK/victim"
+chmod 0600 "$WORK/victim"
+for i in 0 1 2 3 4 5; do
+  ln -sf "$WORK/victim" "$WORK/backups/Engine.ini.$(date -u -d "+$i seconds" +%Y%m%dT%H%M%SZ)"
+done
+printf '[/Script/OnlineSubsystemUtils.IpNetDriver]\nNetServerMaxTickRate=30\n' > "$INI"
+out="$(apply_cfg)"; rc=$?
+assert_ne "$rc" "0" "apply refuses to write its backup through a planted symlink"
+assert_contains "$out" "Cannot write backup" "explains which write it refused"
+assert_not_contains "$out" "Traceback" "the refusal is a message, not a crash"
+assert_file_not_contains "$WORK/victim" "NetServerMaxTickRate" "root's write never reached the victim"
+assert_file_contains "$WORK/victim" "ROOT_ONLY_SECRET_CONTENT" "the victim is untouched"
+assert_eq "$(stat -c %a "$WORK/victim")" "600" "the victim's mode is untouched"
+# refusing the backup must abort the apply: never edit Engine.ini with no backup
+assert_file_contains "$INI" "NetServerMaxTickRate=30" "Engine.ini left alone when the backup failed"
+
 assert_report
