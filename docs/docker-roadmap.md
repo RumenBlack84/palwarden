@@ -53,22 +53,45 @@ Config via env vars → an entrypoint renders `settings.env` and runs
 `palworld-config-apply-env` on boot, so the container is configured the
 "12-factor" way while still reusing the existing apply logic.
 
-## Suggested increments
+## Chosen architecture: one all-in-one image, MODE-toggled
 
-1. **Containerize the server alone** (server + volumes + ports), no tooling —
-   prove SteamCMD-on-volume + save persistence.
-2. **Add a supervisor** and port the long-running pieces (server + web UI).
-3. **Port the timers** one at a time to cron/s6, starting with `fps-sample` and
-   `update-check`.
+Rather than separate server and tools images, `palwarden` is a **single image**
+that plays one of two roles at runtime via `PALWARDEN_MODE`:
+
+- **`embedded`** — install/update and run the Palworld server here, with the
+  tooling alongside talking to it over localhost. Self-contained.
+- **`external`** — do not run the server; the tooling targets an existing server
+  at `PALWORLD_TARGET_HOST`. Lean, because game files live in a volume, not the
+  image.
+
+This matches the original "all-in-one docker including the actual server" goal
+while still letting one artifact manage an external server. A slim tools-only
+image variant (no SteamCMD layer) is a possible future addition for
+external-only users.
+
+## Increments
+
+1. **Server component + embedded/external toggle** — ✅ **done** (this increment).
+   All-in-one image on `cm2network/steamcmd`, non-root, mutable game volume,
+   entrypoint per runbook §12, compose profiles for the two modes. Lives in
+   [`../docker/`](../docker/). Server runs as PID 1 via `exec` (no supervisor
+   yet). Verified: image builds, mode dispatch works, tooling baked in; a full
+   embedded game-download boot was not run end-to-end.
+2. **Add a supervisor** (s6-overlay) so the server + web UI + timers can coexist;
+   convert the server from a bare `exec` to an s6 service.
+3. **Port the timers** to cron/s6 one at a time, starting with `fps-sample` and
+   `update-check`. This is where **external** mode becomes functional.
 4. **Abstract host-isms** (`systemctl`/cgroup) behind a small status helper with
    a container backend, so `status`/`memory-watch`/`health-report` work.
-5. **Entrypoint config rendering** from env → `settings.env` → apply on boot.
+5. **Entrypoint config rendering** from env → `settings.env` →
+   `palworld-config-apply-env` on boot (12-factor config).
 
 ## Open questions
 
-- Base image: `steamcmd/steamcmd` vs. a slim Debian + SteamCMD install.
 - Supervisor choice: s6-overlay (smaller, container-native) vs. supervisord
-  (simpler to author).
+  (simpler to author). Leaning s6-overlay.
+- Whether to also publish a **slim tools-only image** for external-only users
+  who don't want the SteamCMD base layer.
 - How to handle the `palworld-config-parser` binary — keep vendored, or replace
   with an in-repo Python parser so the image has no opaque binary. Purely a
   maintainability call now; licensing is settled (the project and the binary are

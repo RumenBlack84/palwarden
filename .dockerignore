@@ -1,0 +1,23 @@
+# Keep the build context small. The image only needs the tooling + docker/.
+.git
+.gitignore
+docs
+systemd
+needrestart
+config
+install.sh
+README.md
+CREDITS.md
+LICENSE
+*.md
+
+# Never ship secrets or local state into the build context.
+**/settings.env
+**/notify.env
+**/public-info.env
+**/*.sqlite3
+**/*.pem
+**/*.key
+docker/.env
+__pycache__/
+*.pyc

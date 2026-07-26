@@ -1,0 +1,68 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Brian Grant
+#
+# palwarden compose stack.
+#
+# Two modes, selected with COMPOSE_PROFILES + PALWARDEN_MODE (see .env.example):
+#
+#   Embedded (self-contained): run the Palworld server in this stack.
+#     COMPOSE_PROFILES=embedded docker compose up -d
+#
+#   External (manage an existing server): do not start the server here; point the
+#     tooling at your existing box via PALWORLD_TARGET_HOST. The management
+#     service that consumes that target is added in the next increment.
+#
+# Build context is the repository root so the image can bake in the tooling.
+name: palwarden
+
+services:
+  # The Palworld dedicated server, running the all-in-one image in embedded mode.
+  # Only started when the "embedded" profile is active.
+  palworld-server:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: palwarden:latest
+    container_name: palwarden-server
+    profiles: ["embedded"]
+    environment:
+      PALWARDEN_MODE: embedded
+      UPDATE_ON_START: ${UPDATE_ON_START:-true}
+    ports:
+      - "${PALWORLD_GAME_PORT:-8211}:8211/udp"
+      # REST API (8212) is deliberately NOT published to the host. Tooling reaches
+      # it over the internal compose network. Do not expose it publicly.
+    volumes:
+      # Whole game install: persists SteamCMD downloads across restarts.
+      - palworld-server:/opt/palworld/server
+      # Saves + config broken out for easy backup (nested submount of the above).
+      - palworld-saved:/opt/palworld/server/Pal/Saved
+    stop_signal: SIGINT
+    stop_grace_period: 120s
+    ulimits:
+      nofile:
+        soft: 100000
+        hard: 100000
+    restart: on-failure
+
+  # --- NEXT INCREMENT: management tooling ---------------------------------
+  # The same image run in a management role. In embedded mode it targets the
+  # in-stack server; in external mode it targets PALWORLD_TARGET_HOST. Left
+  # commented until the tooling processes are wired under a supervisor.
+  #
+  # palwarden-tools:
+  #   image: palwarden:latest
+  #   container_name: palwarden-tools
+  #   environment:
+  #     PALWARDEN_MODE: ${PALWARDEN_MODE:-embedded}
+  #     PALWORLD_TARGET_HOST: ${PALWORLD_TARGET_HOST:-palworld-server}
+  #     PALWORLD_REST_PORT: ${PALWORLD_REST_PORT:-8212}
+  #   volumes:
+  #     - palworld-saved:/opt/palworld/server/Pal/Saved   # embedded: read config/saves
+  #     - palwarden-state:/var/lib/palworld               # telemetry DB, public-info
+  #   restart: unless-stopped
+
+volumes:
+  palworld-server:
+  palworld-saved:
+  # palwarden-state:   # enabled with the tooling service next increment

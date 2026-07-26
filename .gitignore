@@ -14,3 +14,6 @@ public-info.env
 # Local editor state
 .DS_Store
 *.swp
+
+# Docker local env
+docker/.env

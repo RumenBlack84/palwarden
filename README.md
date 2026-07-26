@@ -53,7 +53,24 @@ diagram and file/directory map.
 
 ---
 
-## Requirements
+## Two ways to run it
+
+- **Bare metal / VM** (systemd) — the original deployment; use `install.sh`. See
+  [Quick start](#quick-start) below.
+- **Docker (all-in-one)** — a single image that either **runs the server
+  itself** (self-contained) or **manages an existing server** elsewhere, chosen
+  by the `PALWARDEN_MODE` toggle. The server/embedded half is working today;
+  the tooling side is being containerized incrementally. See
+  [`docker/README.md`](docker/README.md).
+
+  ```bash
+  cd docker && cp .env.example .env
+  COMPOSE_PROFILES=embedded docker compose up -d --build
+  ```
+
+---
+
+## Requirements (bare-metal install)
 
 - Linux with **systemd** (developed on Ubuntu).
 - **Python 3** (standard library only — used for the REST API client, telemetry,
