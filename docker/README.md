@@ -4,28 +4,59 @@ An **all-in-one image** for Palworld: one artifact that can either **run the
 dedicated server itself** (self-contained) or **manage/monitor an existing
 server** elsewhere. Which role it plays is chosen at runtime, not at build time.
 
-> **Status — increment 3:** **external mode is now functional for telemetry.**
-> Under s6, the embedded container runs the server + config web UI, and — in
-> either mode, when `ADMIN_PASSWORD` is set — the **FPS/player telemetry
-> sampler**. Remaining background jobs (update-check, memory watchdog,
-> public-info watcher, daily report) need the systemctl/cgroup host-isms
-> abstracted and land in the next increment. See
+> **Status — increment 4:** the maintenance loop now runs in-container. Under
+> s6: the server, config web UI, telemetry sampler, **memory watchdog**, and a
+> **daily Discord report** (with FPS/player graphs via matplotlib). Host-isms
+> (`systemctl`/cgroup/`sudo`) are handled by small shims so the tooling scripts
+> run unchanged. Still deferred: `update-check` (in-container self-update) and
+> `public-info-watch`, plus full server-config rendering — see
 > [`../docs/docker-roadmap.md`](../docs/docker-roadmap.md).
 
 ## Process model
 
-`s6-overlay` is PID 1 (as root) and supervises the workloads; **every workload
-runs unprivileged as `steam`** (uid/gid 1000). Which services run is decided at
-start by the entrypoint from `PALWARDEN_MODE` + config:
+`s6-overlay` is PID 1 (as root) and supervises the services below. Workloads run
+unprivileged as `steam` (uid/gid 1000) — except the memory watchdog, which runs
+as root because restarting the server's s6 service requires it. Which services
+run is decided at start by the entrypoint from `PALWARDEN_MODE` + config:
 
-| Service | embedded | external | Needs |
-|---------|:---:|:---:|-------|
-| `palworld-server` | ✅ | — | game volume |
-| `config-webui` | ✅ | — | — |
-| `fps-sample` (telemetry) | ✅ | ✅ | `ADMIN_PASSWORD` + reachable REST API |
+| Service | embedded | external | Runs as | Needs |
+|---------|:---:|:---:|:---:|-------|
+| `palworld-server` | ✅ | — | steam | game volume |
+| `config-webui` | ✅ | — | steam | — |
+| `fps-sample` (telemetry) | ✅ | ✅ | steam | `ADMIN_PASSWORD` + reachable REST API |
+| `memory-watch` (watchdog) | ✅ | — | root | — |
+| `daily-report` | ✅ | ✅ | steam | `DISCORD_WEBHOOK` |
 
-On stop, s6 receives SIGTERM and the server service forwards **SIGINT** to the
-game so it saves (within the 120s grace).
+The server binary is supervised directly, with the service's **`down-signal` set
+to SIGINT** — so stop/restart (and container shutdown) tell Palworld to save its
+world, matching the VM's `KillSignal=SIGINT`. A container-native
+`palworld-graceful-restart` brings the service down (SIGINT save) and back up.
+
+### Graceful shutdown (saves the world)
+
+Stopping the container gracefully stops the **palworld-server** service first:
+s6 sends it SIGINT, Palworld saves the world and exits, then the container
+finishes shutting down. The server is given up to ~115s to save (its
+`timeout-kill`), so **give the stop enough time**:
+
+```bash
+docker compose down        # uses stop_grace_period: 120s (recommended)
+# or, for a raw container:
+docker stop --time 120 palwarden
+```
+
+Plain `docker stop` (Docker's **10s** default) is only safe if the world saves
+in under ~10s; for anything larger it may cut the save short. Compose is
+configured with a 120s grace, so `docker compose down/stop` is the safe path.
+
+### Host-ism shims
+
+The tooling was written for a systemd host. Two shims (installed only in the
+image, ahead of any real binary on PATH) let the scripts run unchanged:
+
+- **`systemctl`** → s6/cgroup: `is-active`, `is-enabled`, `MemoryCurrent`/
+  `MainPID`, `start`/`stop`/`restart` map to `s6-svc`/`s6-svstat`.
+- **`sudo`** → passthrough (workloads already run as the owning user).
 
 ## The two modes
 

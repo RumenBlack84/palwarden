@@ -1,0 +1,14 @@
+#!/command/with-contenv bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Brian Grant
+#
+# Daily Discord report. Replaces palworld-fps-daily-report.timer.
+#   embedded -> full health report (server state + FPS/player graph)
+#   external -> FPS/player report over the collected telemetry
+# Runs as the unprivileged steam user; needs DISCORD_WEBHOOK configured.
+if [[ "${PALWARDEN_MODE:-embedded}" == "external" ]]; then
+  set -- palworld-fps discord --window 24h
+else
+  set -- palworld-health-report discord --window 24h
+fi
+exec s6-setuidgid steam palwarden-run-daily "${DAILY_REPORT_AT:-09:00}" daily-report "$@"

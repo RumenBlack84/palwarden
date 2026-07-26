@@ -19,6 +19,33 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# In-container: the server is an s6 longrun, and its stop handler already
+# forwards SIGINT so the world saves. A graceful restart is therefore an s6
+# restart of the service; we skip the systemd/REST timed-shutdown dance (which
+# would fight s6's auto-restart of the longrun).
+if [[ "${PALWARDEN_CONTAINER:-0}" == "1" ]]; then
+  PATH="/command:$PATH"   # ensure s6 tools are reachable
+  svcdir="${PALWARDEN_S6_SVC_DIR:-/run/service}/palworld-server"
+  palworld_notify start "graceful restart requested (container); restarting the server service (SIGINT save)."
+  /usr/local/sbin/palworld-fps mark "graceful restart requested" --category restart --details "container s6 restart" >/dev/null 2>&1 || true
+  # Bring the service down (s6 sends the service's down-signal = SIGINT, so the
+  # world saves), wait until it's fully down, then bring it back up.
+  s6-svc -wD -T $(( startup_timeout * 1000 )) -d "$svcdir" || true
+  s6-svc -u "$svcdir"
+  deadline=$((SECONDS + startup_timeout))
+  until sudo /usr/local/sbin/palworld-api info >/dev/null 2>&1; do
+    if (( SECONDS >= deadline )); then
+      palworld_notify warning "server restart issued, but REST API not ready within ${startup_timeout}s."
+      echo "REST API not ready within ${startup_timeout}s after restart" >&2
+      exit 0
+    fi
+    sleep 3
+  done
+  palworld_notify success "server service restarted (container); REST API healthy."
+  /usr/local/sbin/palworld-fps mark "graceful restart completed" --category restart --details "container s6 restart" >/dev/null 2>&1 || true
+  exit 0
+fi
+
 selected_wait="$waittime"
 selected_message="$message"
 player_context="players unknown; using normal player warning"

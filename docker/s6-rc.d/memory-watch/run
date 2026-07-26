@@ -1,0 +1,14 @@
+#!/command/with-contenv bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Brian Grant
+#
+# Memory watchdog (embedded only). Replaces palworld-memory-watch.timer.
+#
+# Runs as ROOT (not steam): its job is to restart the server's s6 service when
+# memory is high, and s6 service control requires root. It reads host memory
+# from /proc/meminfo and the container's memory from cgroup v2 (via the
+# systemctl shim's MemoryCurrent), and triggers a container-native graceful
+# restart (s6-svc -r, which forwards SIGINT so the world saves).
+exec palwarden-run-periodic \
+  "${MEMORY_CHECK_INTERVAL:-300}" memory-watch \
+  palworld-memory-watch --threshold "${MEMORY_THRESHOLD:-85}" --wait "${MEMORY_WAIT:-300}"

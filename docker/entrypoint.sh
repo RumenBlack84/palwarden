@@ -79,7 +79,9 @@ fi
 mkdir -p "$S6_USER_CONTENTS"
 rm -f "$S6_USER_CONTENTS"/palworld-server \
       "$S6_USER_CONTENTS"/config-webui \
-      "$S6_USER_CONTENTS"/fps-sample
+      "$S6_USER_CONTENTS"/fps-sample \
+      "$S6_USER_CONTENTS"/memory-watch \
+      "$S6_USER_CONTENTS"/daily-report
 enable_service() { : > "$S6_USER_CONTENTS/$1"; log "service enabled: $1"; }
 
 if [[ "$MODE" == "embedded" ]]; then
@@ -109,16 +111,31 @@ if [[ "$MODE" == "embedded" ]]; then
     $AS_STEAM cp "$INSTALL_DIR/DefaultPalWorldSettings.ini" "$CFG"
   fi
   $AS_STEAM chmod +x "$INSTALL_DIR/PalServer.sh" || true
+  # Replicate PalServer.sh's binary prep so we can supervise the game binary
+  # directly (clean SIGINT delivery): copy steamclient.so and mark it +x.
+  if [[ -f "$INSTALL_DIR/linux64/steamclient.so" ]]; then
+    $AS_STEAM install -Dm644 "$INSTALL_DIR/linux64/steamclient.so" \
+      "$INSTALL_DIR/Pal/Binaries/Linux/steamclient.so" 2>/dev/null || true
+  fi
+  $AS_STEAM chmod +x "$INSTALL_DIR/Pal/Binaries/Linux/PalServer-Linux-Shipping" 2>/dev/null || true
   # NOTE: env-driven rendering of the server's own PalWorldSettings.ini (enabling
   # the REST API, etc.) lands in a later increment. For embedded telemetry to
   # collect data, enable the REST API in that file with a matching ADMIN_PASSWORD.
 
   enable_service palworld-server
   enable_service config-webui
+  # Memory watchdog runs as root (needs s6 service control) and restarts the
+  # server's s6 service when memory is high.
+  enable_service memory-watch
 fi
 
 if [[ "$TELEMETRY_READY" == "1" ]]; then
   enable_service fps-sample
+fi
+
+# Daily Discord report (both modes) when a webhook is configured.
+if [[ -n "${DISCORD_WEBHOOK:-}" ]]; then
+  enable_service daily-report
 fi
 
 # Nothing to do (external mode without telemetry configured)?

@@ -13,12 +13,11 @@ set -u
 interval="${1:?usage: palwarden-run-periodic <interval> <label> <command...>}"; shift
 label="${1:?usage: palwarden-run-periodic <interval> <label> <command...>}"; shift
 
-# Exit promptly when s6 stops the service.
-trap 'exit 0' TERM INT
-
+# No SIGTERM trap: on stop, the default action terminates this runner promptly so
+# it never delays container shutdown. (A bash trap here does not fire reliably
+# under s6 supervision, which would make s6 wait out S6_KILL_GRACETIME.)
 printf '[periodic:%s] every %ss: %s\n' "$label" "$interval" "$*"
 while true; do
   "$@" || printf '[periodic:%s] command exited %s\n' "$label" "$?"
-  # background sleep + wait so the trap can interrupt it immediately on stop
-  sleep "$interval" & wait $!
+  sleep "$interval"
 done

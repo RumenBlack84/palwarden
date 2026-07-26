@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Brian Grant
+#
+# Minimal systemctl -> s6 adapter, installed ONLY in the palwarden container
+# (ahead of any real systemctl on PATH). It implements the small subset of
+# systemctl the tooling scripts actually call, translating to s6 supervision and
+# cgroup v2 reads, so those scripts run unchanged in the container. On bare metal
+# this shim is not installed and the real systemctl is used.
+set -u
+
+# s6 tools live in /command; ensure they're reachable regardless of caller PATH.
+PATH="/command:$PATH"
+S6_SVC_DIR="${PALWARDEN_S6_SVC_DIR:-/run/service}"
+
+map_svc() {
+  case "$1" in
+    palworld.service|palworld) echo "palworld-server" ;;
+    *.service) echo "${1%.service}" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+cmd="${1:-}"; shift || true
+quiet=0; value=0; prop=""; positional=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --quiet|-q) quiet=1; shift ;;
+    --value) value=1; shift ;;
+    --no-pager|--all|--full|-l|--plain) shift ;;
+    -p) prop="$2"; shift 2 ;;
+    -p*) prop="${1#-p}"; shift ;;
+    --property=*) prop="${1#--property=}"; shift ;;
+    -*) shift ;;
+    *) positional+=("$1"); shift ;;
+  esac
+done
+
+svc_raw="${positional[0]:-}"
+svc="$(map_svc "$svc_raw")"
+svcdir="$S6_SVC_DIR/$svc"
+
+svc_up() { s6-svstat "$svcdir" 2>/dev/null | grep -q '^up'; }
+svc_pid() { s6-svstat "$svcdir" 2>/dev/null | grep -oE 'pid [0-9]+' | grep -oE '[0-9]+' | head -1; }
+
+case "$cmd" in
+  is-active)
+    if svc_up; then [[ $quiet -eq 1 ]] || echo active; exit 0
+    else [[ $quiet -eq 1 ]] || echo inactive; exit 3; fi ;;
+  is-enabled)
+    if [[ -e "/etc/s6-overlay/s6-rc.d/user/contents.d/$svc" ]]; then echo enabled; exit 0
+    else echo disabled; exit 1; fi ;;
+  is-failed) exit 1 ;;
+  show)
+    out=""
+    case "$prop" in
+      MemoryCurrent) out="$(cat /sys/fs/cgroup/memory.current 2>/dev/null || echo 0)" ;;
+      MainPID)       out="$(svc_pid)"; out="${out:-0}" ;;
+      *) out="" ;;
+    esac
+    if [[ $value -eq 1 ]]; then echo "$out"; else echo "${prop}=${out}"; fi
+    exit 0 ;;
+  start)   s6-svc -u "$svcdir" 2>/dev/null; exit $? ;;
+  stop)    s6-svc -wD -d "$svcdir" 2>/dev/null; exit $? ;;
+  restart) s6-svc -r "$svcdir" 2>/dev/null; exit $? ;;
+  daemon-reload|enable|disable) exit 0 ;;
+  list-timers) echo "container: timers run as s6 services (palwarden-run-periodic/-daily)"; exit 0 ;;
+  cat) echo "# container: ${svc_raw:-service} is managed by s6, not systemd"; exit 0 ;;
+  *) echo "systemctl-shim: '$cmd' not implemented in container" >&2; exit 0 ;;
+esac

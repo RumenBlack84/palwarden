@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Brian Grant
+#
+# palwarden-run-daily <HH:MM> <label> <command> [args...]
+#
+# Run the command once per day at the given time (UTC), sleeping until then.
+# Replaces the systemd OnCalendar daily timer. Command failures are logged, not
+# fatal. Launched by an s6 service.
+set -u
+
+at="${1:?usage: palwarden-run-daily <HH:MM> <label> <command...>}"; shift
+label="${1:?usage: palwarden-run-daily <HH:MM> <label> <command...>}"; shift
+hh="${at%%:*}"; mm="${at##*:}"
+
+# No SIGTERM trap: default termination on stop keeps container shutdown prompt
+# (a bash trap does not fire reliably under s6 supervision).
+while true; do
+  now="$(date -u +%s)"
+  target="$(date -u -d "today ${hh}:${mm}" +%s 2>/dev/null || echo 0)"
+  if [[ "$target" -le "$now" ]]; then
+    target="$(date -u -d "tomorrow ${hh}:${mm}" +%s 2>/dev/null || echo $((now + 86400)))"
+  fi
+  sleep_for=$(( target - now ))
+  printf '[daily:%s] next run in %ss (at %s UTC)\n' "$label" "$sleep_for" "$at"
+  sleep "$sleep_for"
+  "$@" || printf '[daily:%s] command exited %s\n' "$label" "$?"
+done

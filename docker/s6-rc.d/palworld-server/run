@@ -2,29 +2,16 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # SPDX-FileCopyrightText: 2026 Brian Grant
 #
-# Palworld dedicated server, supervised by s6 and run as the unprivileged
-# `steam` user. Preserves the VM launch flags and the SIGINT save-on-stop
-# behavior from the systemd unit / runbook.
-set -u
+# Palworld dedicated server, supervised by s6 as the unprivileged `steam` user.
+#
+# We exec the game binary DIRECTLY (the work PalServer.sh does — copying
+# steamclient.so and chmod'ing the binary — is done once in the entrypoint
+# bootstrap). Supervising the binary directly means s6 can deliver the stop
+# signal to the actual process. The service's `down-signal` is SIGINT, which is
+# how Palworld saves its world on shutdown/restart (matching KillSignal=SIGINT
+# from the systemd unit).
 cd /opt/palworld/server || exit 1
-
-term() {
-  # Palworld saves its world on SIGINT. On stop (s6 sends SIGTERM), forward
-  # SIGINT to the actual game process — PalServer.sh does not reliably propagate
-  # signals — falling back to the launched child if the game isn't found yet.
-  pkill -INT -f 'PalServer-Linux-Shipping' 2>/dev/null \
-    || kill -INT "${child:-0}" 2>/dev/null \
-    || true
-}
-trap term TERM INT
-
-s6-setuidgid steam ./PalServer.sh \
+exec s6-setuidgid steam ./Pal/Binaries/Linux/PalServer-Linux-Shipping Pal \
   -useperfthreads \
   -NoAsyncLoadingThread \
-  -UseMultithreadForDS &
-child=$!
-
-# Re-enter wait after the trap interrupts it, until the server has really exited.
-while kill -0 "$child" 2>/dev/null; do
-  wait "$child" && break
-done
+  -UseMultithreadForDS

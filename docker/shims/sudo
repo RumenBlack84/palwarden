@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Brian Grant
+#
+# Passthrough `sudo` for the palwarden container, installed ONLY in the image
+# (ahead of any real sudo on PATH). The container's workloads already run as the
+# user that owns their files, so privilege elevation is unnecessary; this simply
+# strips sudo's options and execs the command. On bare metal, real sudo is used.
+set -u
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|-E|-H|-S|-k|-K|-b|-i|-s) shift ;;          # value-less flags: ignore
+    -u|-g|-p|-C|-r|-t|-U|-h|-c) shift 2 ;;          # option + value: ignore both
+    --) shift; break ;;
+    -*) shift ;;                                    # any other option: ignore
+    *) break ;;
+  esac
+done
+
+# If nothing remains (e.g. `sudo -n true` reduced to nothing), succeed quietly.
+[[ $# -eq 0 ]] && exit 0
+exec "$@"

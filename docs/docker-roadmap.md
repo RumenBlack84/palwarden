@@ -92,12 +92,21 @@ external-only users.
    sampling a live REST stub. **Deferred to increment 4** (need host-ism
    abstraction): `update-check` (systemctl→s6 restart), `memory-watch` (cgroup),
    `public-info-watch`, and the daily report (+ matplotlib for graphs).
-4. **Abstract host-isms** (`systemctl`/cgroup/`sudo`) behind small container
-   backends, then port the remaining timers and make `status`/`memory-watch`/
-   `health-report` work in-container.
+4. **Abstract host-isms** — ✅ **done**. `systemctl`/`sudo` shims map to
+   s6/cgroup so the scripts run unchanged. Ported the **memory watchdog** (runs
+   as root; restarts via s6 down-signal SIGINT) and a **daily Discord report**
+   (matplotlib graphs included). Switched the server to direct-binary
+   supervision with `down-signal=SIGINT` so stop/restart/shutdown save cleanly;
+   `palworld-graceful-restart`/`-stop` gained container branches. Verified:
+   all five services up under s6, shims resolve, graceful restart cycles the
+   service, watchdog OK path, clean SIGINT shutdown, matplotlib graph rendered.
+   **Deferred to increment 5:** `update-check` (in-container self-update:
+   s6 down → SteamCMD → up) and `public-info-watch` (needs a configurable
+   hostname + IP source).
 5. **Full server-config rendering** from env → `PalWorldSettings.ini` (enable
    REST API, server name, limits, …) via `palworld-config-apply-env` on boot, so
-   embedded telemetry/management works without hand-editing the config.
+   embedded telemetry/management works without hand-editing the config; then
+   finish porting `update-check` and `public-info-watch`.
 
 ## Open questions
 

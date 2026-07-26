@@ -12,6 +12,19 @@ while [[ $# -gt 0 ]]; do
     *) echo "Usage: $0 [--wait seconds] [--message text]" >&2; exit 64 ;;
   esac
 done
+
+# In-container: bring the server's s6 service down (its stop handler forwards
+# SIGINT so the world saves) and keep it down. Avoids fighting s6 auto-restart.
+if [[ "${PALWARDEN_CONTAINER:-0}" == "1" ]]; then
+  PATH="/command:$PATH"   # ensure s6 tools are reachable
+  svcdir="${PALWARDEN_S6_SVC_DIR:-/run/service}/palworld-server"
+  palworld_notify start "graceful stop requested (container); bringing the server service down (SIGINT save)."
+  s6-svc -wD -d "$svcdir"
+  palworld_notify success "server service stopped (container)."
+  echo "server service stopped."
+  exit 0
+fi
+
 if ! systemctl is-active --quiet palworld.service; then echo "palworld.service is not active; nothing to stop."; exit 0; fi
 echo "Calling Palworld REST API save..."
 /usr/local/sbin/palworld-api-save
