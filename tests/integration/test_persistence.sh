@@ -18,7 +18,7 @@ WORK="$(mktemp -d)"
 
 export COMPOSE_PROFILES=embedded
 export UPDATE_ON_START=false
-export ADMIN_PASSWORD=persistTest
+export ADMIN_PASSWORD=not-a-real-admin-password
 export PALWORLD_GAME_PORT=18211
 export WEBUI_PORT=18088
 

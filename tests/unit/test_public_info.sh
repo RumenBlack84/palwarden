@@ -26,7 +26,7 @@ chmod +x "$WORK/bin/curl" "$WORK/bin/sudo"
 
 cat > "$WORK/config.ini" <<'EOF'
 [/Script/Pal.PalGameWorldSettings]
-OptionSettings=(ServerName="Ygg",ServerPassword="hunter2",PublicPort=8888,RESTAPIEnabled=True)
+OptionSettings=(ServerName="Ygg",ServerPassword="not-a-real-join-password",PublicPort=8888,RESTAPIEnabled=True)
 EOF
 
 state="$WORK/state.env"
@@ -38,7 +38,7 @@ PATH="$WORK/bin:$PATH" \
 
 assert_file_contains "$state" "PUBLIC_IP=203.0.113.5" "public IP detected"
 assert_file_contains "$state" "SERVER_PORT=8888"       "public port read from config"
-assert_file_contains "$state" "SERVER_PASSWORD=hunter2" "server password read from config"
+assert_file_contains "$state" "SERVER_PASSWORD=not-a-real-join-password" "server password read from config"
 assert_file_contains "$state" "HOSTNAME=pal.example"   "hostname from PUBLIC_HOSTNAME"
 
 # Second run with no change -> no rewrite (mtime unchanged)

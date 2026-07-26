@@ -3,12 +3,12 @@
 # SPDX-FileCopyrightText: 2026 Brian Grant
 #
 # Test fixture: a minimal stand-in for the Palworld REST API. Requires HTTP Basic
-# auth (admin:$PALWORLD_STUB_PW, default "secret123") and answers /v1/api/metrics
+# auth (admin:$PALWORLD_STUB_PW, default "not-a-real-admin-password") and answers /v1/api/metrics
 # and /v1/api/info, so the tooling can be exercised without a real server.
 import base64, json, os
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-PW = os.environ.get("PALWORLD_STUB_PW", "secret123")
+PW = os.environ.get("PALWORLD_STUB_PW", "not-a-real-admin-password")
 
 class H(BaseHTTPRequestHandler):
     def _auth_ok(self):

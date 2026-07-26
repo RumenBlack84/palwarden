@@ -48,7 +48,7 @@ assert_eq "$(docker exec pw-it-a systemctl is-active palworld.service)" "active"
 
 # --- Scenario B: embedded, ADMIN_PASSWORD + PALWORLD_CFG_* -------------------
 run_c pw-it-b -e PALWARDEN_MODE=embedded -e UPDATE_ON_START=false \
-  -e ADMIN_PASSWORD=secret123 -e "PALWORLD_CFG_SERVER_NAME=Yggdrasil" \
+  -e ADMIN_PASSWORD=not-a-real-admin-password -e "PALWORLD_CFG_SERVER_NAME=Yggdrasil" \
   -v "$FAKE":/opt/palworld/server "$IMG"
 wait_up pw-it-b palworld-server || fail "B: server did not come up"
 docker exec pw-it-b sh -c 'sleep 2'
@@ -57,7 +57,7 @@ assert_contains "$svcB" "fps-sample" "B: telemetry enabled with password"
 # settings.env was rendered in-container from env (values are shell-quoted)
 assert_rc 0 docker exec pw-it-b grep -qF 'REST_API_ENABLED="True"' /etc/palworld/settings.env
 assert_rc 0 docker exec pw-it-b grep -qF 'SERVER_NAME="Yggdrasil"' /etc/palworld/settings.env
-assert_rc 0 docker exec pw-it-b grep -qF 'ADMIN_PASSWORD="secret123"' /etc/palworld/settings.env
+assert_rc 0 docker exec pw-it-b grep -qF 'ADMIN_PASSWORD="not-a-real-admin-password"' /etc/palworld/settings.env
 # and the config was actually applied to the server's INI (REST enabled)
 assert_rc 0 docker exec pw-it-b grep -qF 'RESTAPIEnabled=True' /opt/palworld/server/Pal/Saved/Config/LinuxServer/PalWorldSettings.ini
 # config apply was attempted at boot
@@ -71,7 +71,7 @@ docker network create "$NET" >/dev/null 2>&1 || true
 CIDS+=(pw-it-stub); docker rm -f pw-it-stub >/dev/null 2>&1 || true
 docker run -d --name pw-it-stub --network "$NET" -v "$STUB":/stub.py:ro --entrypoint python3 "$IMG" /stub.py >/dev/null
 run_c pw-it-c --network "$NET" -e PALWARDEN_MODE=external -e PALWORLD_TARGET_HOST=pw-it-stub \
-  -e ADMIN_PASSWORD=secret123 -e FPS_SAMPLE_INTERVAL=1 "$IMG"
+  -e ADMIN_PASSWORD=not-a-real-admin-password -e FPS_SAMPLE_INTERVAL=1 "$IMG"
 svcC="$(services_of pw-it-c)"
 assert_contains "$svcC" "fps-sample" "C: telemetry enabled"
 assert_not_contains "$svcC" "palworld-server" "C: no server in external mode"

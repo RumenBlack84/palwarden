@@ -69,6 +69,15 @@ install/boot path is exercised only by a manual embedded boot (last verified
 against Palworld v1.0.1.100619: game installs, server boots, REST API healthy,
 config applied, graceful save-on-stop, and config survives repeated restarts).
 
+## Test credentials
+
+Nothing in here is a real secret. The suites need *a* password to exercise the
+REST/auth paths against dummy servers, so they use self-labelling placeholders
+(`not-a-real-admin-password`, `not-a-real-join-password`) — chosen so a secret
+scanner and a human reader can both tell at a glance. If you add a test that needs
+a credential, follow the same convention rather than inventing something that looks
+plausible.
+
 ## Adding tests
 
 Unit tests: create `unit/test_*.sh`, `source ../lib/assert.sh`, assert, and end

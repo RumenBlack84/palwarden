@@ -89,11 +89,11 @@ assert_eq "$(value_of "$cfg" ServerName)" '""' "empty value clears the setting"
 
 # --- secrets are applied but never echoed ----------------------------------
 cfg="$WORK/h.ini"; make_ini "$cfg"
-out="$(run_parser "$cfg" ADMIN_PASSWORD="sup3rSecret" SERVER_PASSWORD="joinPw" 2>&1)"
-assert_eq "$(value_of "$cfg" AdminPassword)"  '"sup3rSecret"' "admin password applied"
-assert_eq "$(value_of "$cfg" ServerPassword)" '"joinPw"'      "server password applied"
-assert_not_contains "$out" "sup3rSecret" "admin password not echoed"
-assert_not_contains "$out" "joinPw"      "server password not echoed"
+out="$(run_parser "$cfg" ADMIN_PASSWORD="not-a-real-admin-password" SERVER_PASSWORD="not-a-real-join-password" 2>&1)"
+assert_eq "$(value_of "$cfg" AdminPassword)"  '"not-a-real-admin-password"' "admin password applied"
+assert_eq "$(value_of "$cfg" ServerPassword)" '"not-a-real-join-password"'      "server password applied"
+assert_not_contains "$out" "not-a-real-admin-password" "admin password not echoed"
+assert_not_contains "$out" "not-a-real-join-password"      "server password not echoed"
 
 # --- ambient environment is ignored, not misapplied -------------------------
 # Process-env mode must silently ignore anything that isn't a real setting

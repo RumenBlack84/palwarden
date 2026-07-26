@@ -21,11 +21,11 @@ isset() { ( set -a; source "$1" 2>/dev/null; [ -n "${!2+x}" ] && echo yes || ech
 
 # --- embedded with ADMIN_PASSWORD: REST connection for localhost -------------
 s="$WORK/s1"; n="$WORK/n1"
-render "$s" "$n" PALWARDEN_MODE=embedded ADMIN_PASSWORD=secret123 >/dev/null
+render "$s" "$n" PALWARDEN_MODE=embedded ADMIN_PASSWORD=not-a-real-admin-password >/dev/null
 assert_eq "$(val "$s" REST_API_ENABLED)" "True"      "embedded enables REST"
 assert_eq "$(val "$s" REST_API_HOST)"    "127.0.0.1" "embedded targets localhost"
 assert_eq "$(val "$s" REST_API_PORT)"    "8212"      "default REST port"
-assert_eq "$(val "$s" ADMIN_PASSWORD)"   "secret123" "admin password written"
+assert_eq "$(val "$s" ADMIN_PASSWORD)"   "not-a-real-admin-password" "admin password written"
 
 # secrets file should be private (0600)
 perms="$(stat -c '%a' "$s" 2>/dev/null || stat -f '%Lp' "$s" 2>/dev/null)"
@@ -33,7 +33,7 @@ assert_eq "$perms" "600" "settings.env is 0600"
 
 # --- external: REST host is the target --------------------------------------
 s="$WORK/s2"; n="$WORK/n2"
-render "$s" "$n" PALWARDEN_MODE=external PALWORLD_TARGET_HOST=palbox.example ADMIN_PASSWORD=pw PALWORLD_REST_PORT=9999 >/dev/null
+render "$s" "$n" PALWARDEN_MODE=external PALWORLD_TARGET_HOST=palbox.example ADMIN_PASSWORD=not-a-real-admin-password PALWORLD_REST_PORT=9999 >/dev/null
 assert_eq "$(val "$s" REST_API_HOST)" "palbox.example" "external targets remote host"
 assert_eq "$(val "$s" REST_API_PORT)" "9999"           "custom REST port"
 

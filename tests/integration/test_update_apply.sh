@@ -44,7 +44,7 @@ docker build -q -f "$REPO/docker/Dockerfile" -t "$IMG" "$REPO" >/dev/null 2>&1 |
 
 docker rm -f "$C" >/dev/null 2>&1 || true
 docker run -d --name "$C" \
-  -e PALWARDEN_MODE=embedded -e UPDATE_ON_START=false -e ADMIN_PASSWORD=updpw \
+  -e PALWARDEN_MODE=embedded -e UPDATE_ON_START=false -e ADMIN_PASSWORD=not-a-real-admin-password \
   -v "$WORK/server":/opt/palworld/server \
   -v "$WORK/fake-steamcmd":/fake-steamcmd:ro \
   "$IMG" >/dev/null
