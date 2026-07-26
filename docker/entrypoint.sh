@@ -58,8 +58,14 @@ if [[ -f /etc/palworld/notify.env ]]; then
 fi
 
 # Web UI credentials (root-only file; generated once, honouring WEBUI_* from env).
-palwarden-webui --init-credentials || log "could not initialise web UI credentials."
-chown steam:steam /etc/palworld/webui.env 2>/dev/null || true
+# Suppress stdout: on first creation this prints the generated WEBUI_PASSWORD/
+# WEBUI_TOKEN, which must never land in `docker logs`.
+palwarden-webui --init-credentials >/dev/null || log "could not initialise web UI credentials."
+# Owned by root, readable by the unprivileged webui server's group (steam) only.
+# The webui server itself must never be able to rewrite WEBUI_TOKEN, which the
+# root job worker (increment 2) will trust.
+chown root:steam /etc/palworld/webui.env 2>/dev/null || true
+chmod 0640 /etc/palworld/webui.env 2>/dev/null || true
 
 TELEMETRY_READY=0
 if [[ -n "${ADMIN_PASSWORD:-}" ]]; then

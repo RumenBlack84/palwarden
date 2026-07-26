@@ -87,8 +87,18 @@ else
   install_files 0644 /etc/palworld "$REPO_DIR"/config/engine.env
 fi
 
-# 4b. Web UI credentials (generated once; never overwritten).
+# 4b. Web UI credentials (generated once; never overwritten). Owned by root,
+# readable only by the webui service group, so the unprivileged palwarden-webui
+# process (User=palworld) can read it but never rewrite WEBUI_TOKEN, which a
+# future root job worker will trust.
 run /usr/local/sbin/palwarden-webui --init-credentials
+if getent group "$SVC_GROUP" >/dev/null 2>&1; then
+  run chown root:"$SVC_GROUP" /etc/palworld/webui.env
+  run chmod 0640 /etc/palworld/webui.env
+else
+  echo "    note: group '$SVC_GROUP' not found; webui.env left root:root 0600." \
+       "Create the group and 'chown root:$SVC_GROUP /etc/palworld/webui.env; chmod 0640 ...' before starting the service."
+fi
 
 # 5. Web UI and reference docs under /opt/palworld/tools.
 install_files 0644 /opt/palworld/tools/config-webui "$REPO_DIR"/webui/*
