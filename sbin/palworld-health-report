@@ -43,12 +43,20 @@ def run(cmd: list[str], timeout: int = 30) -> subprocess.CompletedProcess[str]:
 
 def parse_systemctl_show(text: str) -> dict[str, str]:
     raw = dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+
+    def get(key: str, default: str) -> str:
+        # Treat an empty value as absent: in the container some properties are
+        # genuinely unknown (s6 keeps no restart counter), and a blank field in
+        # the daily report is less useful than saying so.
+        value = raw.get(key, "").strip()
+        return value or default
+
     return {
-        "main_pid": raw.get("MainPID", ""),
-        "n_restarts": raw.get("NRestarts", ""),
-        "start_timestamp": raw.get("ExecMainStartTimestamp", ""),
-        "active_state": raw.get("ActiveState", "unknown"),
-        "sub_state": raw.get("SubState", "unknown"),
+        "main_pid": get("MainPID", "n/a"),
+        "n_restarts": get("NRestarts", "n/a"),
+        "start_timestamp": get("ExecMainStartTimestamp", "n/a"),
+        "active_state": get("ActiveState", "unknown"),
+        "sub_state": get("SubState", "unknown"),
     }
 
 

@@ -3,13 +3,16 @@
 Goal: a single **all-in-one image** that runs the Palworld dedicated server
 *and* the `palwarden` tooling, so the whole stack deploys as one container.
 
-This is a planning sketch, not a committed design. It records what has to change
-because the tooling currently assumes a full systemd host.
+> **Status: done.** The port is complete and verified against the real game — see
+> [Verified against a real server](#verified-against-a-real-server) below, and
+> [`../docker/README.md`](../docker/README.md) for how to actually run it. The
+> sections that follow are kept as the record of what had to change and why,
+> which is useful when touching the container again.
 
-## What doesn't translate as-is
+## What didn't translate as-is
 
-The tooling was built for a VM and leans on host features a container normally
-lacks:
+The tooling was built for a VM and leaned on host features a container normally
+lacks. Each of these is now resolved (see [Increments](#increments)):
 
 | Assumption today | Why it's a problem in a container | Direction |
 |------------------|-----------------------------------|-----------|
@@ -123,17 +126,32 @@ external-only users.
    backward compatible. Unit tests cover the buildid check and join-info write.
    The full apply-update path (real Steam build event) is not exercised E2E.
 
+## Verified against a real server
+
+The port is complete and has been exercised against the actual game
+(**v1.0.1.100619**), not just dummies:
+
+- A full embedded boot: SteamCMD installs ~5GB into the volume, s6 starts the
+  server, it reaches `Running Palworld dedicated server on :8211`, the REST API
+  answers, env-driven config is applied, and `docker stop` saves the world.
+- Config durability: with both config files mutable, custom settings survived
+  repeated restarts and all 119 `PalWorldSettings.ini` keys were retained — which
+  is why the `chattr +i` protection was removed again.
+
+Automated suites cover the rest with dummy servers, a REST stub and a fake
+SteamCMD (see [`../tests/README.md`](../tests/README.md)).
+
 ## Still open / optional
 
-- A **real embedded boot** with the actual multi-GB SteamCMD download remains a
-  manual check (all increments were verified with dummy servers + a REST stub).
 - A **slim tools-only image** variant (no SteamCMD layer) for external-only users.
-- A **fully rootless** supervisor variant (s6 currently runs as PID 1 root).
+- A **fully rootless** supervisor variant (s6 currently runs as PID 1 root; all
+  workloads already drop to `steam`).
+- Publishing the image (e.g. GHCR) once the repo has a remote.
+- From [`backlog.md`](backlog.md): a crash/restart watchdog summary, and wiring
+  health-report failures into alert-only notifications.
 
 ## Open questions
 
-- Supervisor choice: s6-overlay (smaller, container-native) vs. supervisord
-  (simpler to author). Leaning s6-overlay.
 - Whether to also publish a **slim tools-only image** for external-only users
   who don't want the SteamCMD base layer.
 - ~~How to handle the `palworld-config-parser` binary~~ — **resolved**: replaced

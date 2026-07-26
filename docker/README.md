@@ -4,11 +4,11 @@ An **all-in-one image** for Palworld: one artifact that can either **run the
 dedicated server itself** (self-contained) or **manage/monitor an existing
 server** elsewhere. Which role it plays is chosen at runtime, not at build time.
 
-> **Status — increment 6:** all the VM's background jobs now run in-container.
-> Added (opt-in) **Steam auto-update** (`UPDATE_CHECK=true` — graceful stop →
-> SteamCMD → restart, all via s6) and the **public join-info watcher**
-> (`PUBLIC_HOSTNAME=…`). The full tooling is ported; test suites live in
-> [`../tests/`](../tests/). See [`../docs/docker-roadmap.md`](../docs/docker-roadmap.md).
+Everything the bare-metal VM did now runs in the container: the server itself,
+the config web UI, FPS/player telemetry, a memory watchdog, a daily Discord
+report, and (opt-in) Steam auto-update plus a public join-info watcher. Verified
+against a real server — see [`../tests/`](../tests/) for the suites and
+[`../docs/docker-roadmap.md`](../docs/docker-roadmap.md) for how it got here.
 
 ## Process model
 

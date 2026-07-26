@@ -53,6 +53,31 @@ assert_eq "$(run_shim show -p MemoryCurrent --value palworld.service)" "10485760
 # MainPID parsed from svstat
 assert_eq "$(run_shim show -p MainPID --value palworld.service)" "4242" "MainPID value"
 
+# --- multi-property `show`, as palworld-health-report calls it ---------------
+# It asks for five properties in one go and parses KEY=value lines; the shim must
+# answer all of them or the daily report shows `unknown/unknown` with no PID.
+out="$(run_shim show palworld.service -p ActiveState -p SubState -p MainPID -p ExecMainStartTimestamp -p NRestarts --no-pager)"
+assert_contains "$out" "ActiveState=active"  "multi-show: ActiveState"
+assert_contains "$out" "SubState=running"    "multi-show: SubState"
+assert_contains "$out" "MainPID=4242"        "multi-show: MainPID"
+assert_contains "$out" "ExecMainStartTimestamp=" "multi-show: start timestamp present"
+assert_contains "$out" "NRestarts="          "multi-show: NRestarts key present"
+# one line per requested property, nothing extra
+assert_eq "$(printf '%s\n' "$out" | grep -c '=')" "5" "multi-show: one line per property"
+
+# down service reports inactive/dead so the report reads correctly
+printf 'down' > "$WORK/state_palworld-server"
+out="$(run_shim show palworld.service -p ActiveState -p SubState -p MainPID)"
+assert_contains "$out" "ActiveState=inactive" "multi-show: inactive when down"
+assert_contains "$out" "SubState=dead"        "multi-show: dead when down"
+assert_contains "$out" "MainPID=0"            "multi-show: no PID when down"
+printf 'up (pid 4242 pgid 4242) 5 seconds' > "$WORK/state_palworld-server"
+
+# an unrecognised property yields an empty value rather than an error
+out="$(run_shim show palworld.service -p SomethingUnsupported)"
+assert_eq "$out" "SomethingUnsupported=" "unknown property returns an empty value"
+assert_rc 0 run_shim show palworld.service -p SomethingUnsupported
+
 # is-enabled reflects the s6 user-bundle marker. The shim looks under
 # /etc/s6-overlay/... which we can't fake without root, so just assert the
 # command runs and returns a known token.

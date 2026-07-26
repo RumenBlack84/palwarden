@@ -59,8 +59,8 @@ Unit tests cover the first-party logic with no dependencies: the container glue
 Integration tests cover container behavior end-to-end using a dummy server — they
 do **not** download or run the real Palworld server, so the real SteamCMD
 install/boot path is exercised only by a manual embedded boot (last verified
-against Palworld v1.0.1: game installs, server boots, REST API healthy, config
-applied, graceful save-on-stop).
+against Palworld v1.0.1.100619: game installs, server boots, REST API healthy,
+config applied, graceful save-on-stop, and config survives repeated restarts).
 
 ## Adding tests
 

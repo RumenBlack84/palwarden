@@ -138,4 +138,15 @@ assert_rc 0 docker exec pw-it-g grep -qF "NetServerMaxTickRate=60" \
 out="$(docker exec --user root pw-it-g palworld-engine-config status --check 2>&1)"; rc=$?
 assert_eq "$rc" "0" "G: drift check passes right after apply"
 
+# --- Scenario H: the daily health report knows the service state in-container -
+# It asks systemctl for five properties in one call; before the shim handled
+# multi -p this line read `unknown/unknown` with a blank PID every day.
+out="$(docker exec pw-it-g palworld-health-report report 2>&1)"
+assert_contains "$out" "active/running" "H: health report sees the service as active/running"
+assert_not_contains "$out" "unknown/unknown" "H: no unknown service state"
+assert_contains "$out" "restarts \`n/a\`" "H: unknown restart count reads n/a, not blank"
+# palworld-status agrees
+out="$(docker exec pw-it-g palworld-status 2>&1)"
+assert_contains "$out" "state: active" "H: status reports active"
+
 assert_report
