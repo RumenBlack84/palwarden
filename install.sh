@@ -87,6 +87,9 @@ else
   install_files 0644 /etc/palworld "$REPO_DIR"/config/engine.env
 fi
 
+# 4b. Web UI credentials (generated once; never overwritten).
+run /usr/local/sbin/palwarden-webui --init-credentials
+
 # 5. Web UI and reference docs under /opt/palworld/tools.
 install_files 0644 /opt/palworld/tools/config-webui "$REPO_DIR"/webui/*
 install_files 0644 /opt/palworld/tools "$REPO_DIR"/docs/config-tools.md "$REPO_DIR"/docs/backlog.md

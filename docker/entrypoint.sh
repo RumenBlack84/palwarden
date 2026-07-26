@@ -57,6 +57,10 @@ if [[ -f /etc/palworld/notify.env ]]; then
   chown steam:steam /etc/palworld/notify.env 2>/dev/null || true
 fi
 
+# Web UI credentials (root-only file; generated once, honouring WEBUI_* from env).
+palwarden-webui --init-credentials || log "could not initialise web UI credentials."
+chown steam:steam /etc/palworld/webui.env 2>/dev/null || true
+
 TELEMETRY_READY=0
 if [[ -n "${ADMIN_PASSWORD:-}" ]]; then
   TELEMETRY_READY=1

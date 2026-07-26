@@ -119,6 +119,22 @@ pretty copies, `engine.env`, a **redacted** `settings.env`, engine status, FPS
 report (text+json), 24h events, service status, API metrics, buildid, and a
 `manifest.json`. Records a quiet event marker unless `--no-mark`.
 
+### `palwarden-webui`
+`/usr/local/sbin/palwarden-webui {--serve|--init-credentials}`
+
+Serves the web UI and a read-only JSON API on `127.0.0.1:8088`. **Every path
+requires HTTP Basic auth**, including the vendored editors, using credentials in
+`/etc/palworld/webui.env` (`--init-credentials` generates them once, as root;
+`install.sh` and the container entrypoint call it for you).
+
+Read endpoints: `/api/health`, `/api/fps`, `/api/events`, `/api/service-events`,
+`/api/engine`, `/api/config` (passwords redacted), `/api/backups`,
+`/api/snapshots`. Mutating endpoints answer `501` until the job worker lands.
+
+Runs unprivileged and refuses to start as root. Basic auth over plain HTTP is
+safe here only because the listener is loopback-bound; reach it through an SSH
+tunnel (`ssh -L 8088:127.0.0.1:8088 <host>`), never expose it directly.
+
 ---
 
 ## Telemetry & reporting

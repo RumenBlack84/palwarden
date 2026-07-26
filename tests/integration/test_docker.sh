@@ -72,7 +72,13 @@ CIDS+=(pw-it-stub); docker rm -f pw-it-stub >/dev/null 2>&1 || true
 docker run -d --name pw-it-stub --network "$NET" -v "$STUB":/stub.py:ro --entrypoint python3 "$IMG" /stub.py >/dev/null
 run_c pw-it-c --network "$NET" -e PALWARDEN_MODE=external -e PALWORLD_TARGET_HOST=pw-it-stub \
   -e ADMIN_PASSWORD=not-a-real-admin-password -e FPS_SAMPLE_INTERVAL=1 "$IMG"
-svcC="$(services_of pw-it-c)"
+# Poll briefly: the entrypoint (credential bootstrap + config render) needs a
+# moment before the s6 user-bundle marker appears.
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  svcC="$(services_of pw-it-c)"
+  [[ "$svcC" == *fps-sample* ]] && break
+  sleep 0.5
+done
 assert_contains "$svcC" "fps-sample" "C: telemetry enabled"
 assert_not_contains "$svcC" "palworld-server" "C: no server in external mode"
 docker exec pw-it-c sh -c 'sleep 6'
@@ -157,5 +163,25 @@ assert_not_contains "$out" "Traceback" "H: service-events summary does not crash
 # palworld-status agrees
 out="$(docker exec pw-it-g palworld-status 2>&1)"
 assert_contains "$out" "state: active" "H: status reports active"
+
+# --- Scenario I: the web UI is authenticated and read-only -----------------
+# Basic auth guards every path (the vendored editors included), the API returns
+# real JSON, and the server does not run as root.
+creds="$(docker exec pw-it-g cat /etc/palworld/webui.env 2>/dev/null)"
+assert_contains "$creds" "WEBUI_PASSWORD=" "I: entrypoint generated web UI credentials"
+webui_user="$(docker exec pw-it-g sh -c 'sed -n "s/^WEBUI_USER=\"\(.*\)\"$/\1/p" /etc/palworld/webui.env')"
+webui_pass="$(docker exec pw-it-g sh -c 'sed -n "s/^WEBUI_PASSWORD=\"\(.*\)\"$/\1/p" /etc/palworld/webui.env')"
+
+code() { docker exec pw-it-g sh -c "curl -s -o /dev/null -w '%{http_code}' $1"; }
+assert_eq "$(code 'http://127.0.0.1:8088/')" "401" "I: dashboard requires auth"
+assert_eq "$(code 'http://127.0.0.1:8088/PalWorldSettingsEditor.html')" "401" "I: editor requires auth"
+assert_eq "$(code "-u '$webui_user:$webui_pass' http://127.0.0.1:8088/")" "200" "I: authenticated dashboard loads"
+body="$(docker exec pw-it-g sh -c "curl -s -u '$webui_user:$webui_pass' http://127.0.0.1:8088/api/health")"
+assert_contains "$body" '"ok"' "I: /api/health returns JSON"
+# mutations are not available yet
+assert_eq "$(code "-u '$webui_user:$webui_pass' -X POST http://127.0.0.1:8088/api/jobs")" "501" "I: POST not implemented yet"
+# and the server is unprivileged
+owner="$(docker exec pw-it-g sh -c 'ps -o user= -p $(pgrep -f palwarden-webui | head -1)' | tr -d " ")"
+assert_eq "$owner" "steam" "I: webui runs as steam, not root"
 
 assert_report

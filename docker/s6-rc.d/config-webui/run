@@ -14,4 +14,8 @@ cd "$WEBUI_DIR" || exit 1
 # Expose the live config read-only at /current/ so the editors can load it.
 ln -sfn /opt/palworld/server/Pal/Saved/Config/LinuxServer current 2>/dev/null || true
 
-exec s6-setuidgid steam python3 -m http.server 8088 --bind 0.0.0.0
+# Compose publishes this to 127.0.0.1 only, so bind all interfaces inside the
+# container namespace.
+export PALWARDEN_WEBUI_BIND="${PALWARDEN_WEBUI_BIND:-0.0.0.0}"
+
+exec s6-setuidgid steam palwarden-webui --serve

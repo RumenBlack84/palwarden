@@ -131,6 +131,15 @@ Players connect on `UDP 8211`; the config web UI is at
 `http://127.0.0.1:8088/PalWorldSettingsEditor.html`. Stop gracefully with
 `docker compose down` (server saves via SIGINT).
 
+The panel is at `http://127.0.0.1:8088/` and **requires Basic auth**. Credentials
+are generated on first start; read them with:
+
+```bash
+docker compose exec palwarden cat /etc/palworld/webui.env
+```
+
+Set `WEBUI_USER` / `WEBUI_PASSWORD` in `.env` to choose your own instead.
+
 ## Quick start — external (monitor an existing server)
 
 ```bash
