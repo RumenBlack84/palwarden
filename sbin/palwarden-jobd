@@ -150,12 +150,27 @@ def validate_backup(params: dict) -> str:
     """Validate a rollback source in the *web-writable* backup directory.
 
     BACKUP_DIR is owned by the unprivileged web user, so anything in it — names
-    and symlinks alike — is attacker-controlled. A rollback ends in
-    `shutil.copy2(<backup>, Engine.ini)` followed by chown-to-palworld and
-    chmod 0644, so accepting a symlink here would publish any root-readable
-    file (settings.env, /etc/shadow) to the web user. Hence: never stat through
-    the link before the name is validated, reject links outright, and require
-    the exact name shape palworld-engine-config itself writes.
+    and symlinks alike — is attacker-controlled. A rollback ends in "copy
+    <backup> over Engine.ini", chown-to-palworld, chmod 0644, so accepting a
+    symlink here would publish any root-readable file (settings.env,
+    /etc/shadow) to the web user. Hence: never stat through the link before the
+    name is validated, reject links outright, and require the exact name shape
+    palworld-engine-config itself writes.
+
+    These checks are a *pre-flight*, not the security boundary. jobd validates
+    the name and then spawns palworld-engine-config as a separate process, which
+    re-resolves it — the entry can be swapped for a symlink inside that window,
+    and the attacker can retry by re-enqueueing. What actually closes that race
+    is palworld-engine-config opening the source with O_NOFOLLOW (see
+    read_backup_nofollow there): a kernel refusal at the moment of use, with no
+    check-then-use gap. Refusing here still matters — it fails the job with a
+    clear reason instead of relying on the tool's error path.
+
+    A *hardlink* with a legitimate-looking name passes every check below (it is
+    a regular file, not a symlink). Considered and deliberately not checked:
+    `fs.protected_hardlinks=1` (default on the target distros) stops an
+    unprivileged user hardlinking a file it does not own, and the O_NOFOLLOW
+    read covers what remains.
     """
     value = params.get("backup")
     if not isinstance(value, str) or "/" in value or "\\" in value:
@@ -169,12 +184,11 @@ def validate_backup(params: dict) -> str:
         raise ValueError(f"backup must not be a symlink: {value!r}")
     if not candidate.is_file():
         raise ValueError(f"backup not found: {value!r}")
-    # Belt and braces for a symlinked *parent*: after resolving everything, the
-    # target must still sit directly inside the real backup directory.
-    real_dir = os.path.realpath(BACKUP_DIR)
-    real_candidate = os.path.realpath(candidate)
-    if os.path.dirname(real_candidate) != real_dir:
-        raise ValueError(f"backup resolves outside {real_dir}: {value!r}")
+    # No containment check on the resolved path: with a bare name (no separators)
+    # that is not itself a symlink, realpath resolves a symlinked *parent*
+    # identically on both sides of any comparison, so such a check could never
+    # fire. Containment is structural here; the target's O_NOFOLLOW open is what
+    # enforces it at the moment of use.
     return value
 
 
@@ -313,6 +327,16 @@ def _argv_graceful_restart(params: dict) -> list[list[str]]:
     if wait is not None:  # absent wait: let the tool's own default stand
         argv += ["--wait", str(wait)]
     if message is not None:
+        # No `--` protects an option *value*: a terminator can only mark the end
+        # of options, so a flag-shaped message ("--force") is safe here purely
+        # because of what the targets do with it — not because of anything jobd
+        # can add. Current chain: palworld-graceful-restart →
+        # palworld-graceful-stop → palworld-api-stop → palworld-api, every hop
+        # bash positionals, and the message itself ends up in an environment
+        # variable consumed by json.dumps. No argparse, no shell interpolation.
+        # That is a property of today's targets, not an invariant: if any of them
+        # becomes argparse-based, the fix is the single-token `--message=<value>`
+        # form (argparse never treats the value as a separate option), not a `--`.
         argv += ["--message", message]
     return [argv]
 
@@ -324,7 +348,7 @@ def _argv_graceful_stop(params: dict) -> list[list[str]]:
     if wait is not None:
         argv += ["--wait", str(wait)]
     if message is not None:
-        argv += ["--message", message]
+        argv += ["--message", message]  # see _argv_graceful_restart on `--`
     return [argv]
 
 
@@ -510,6 +534,14 @@ def poll_once() -> None:
         # on. KeyboardInterrupt/SystemExit are BaseException and still escape.
         traceback.print_exc()
         try:
+            # Say *something* on the job itself: the traceback only goes to the
+            # service log, and a job that flipped to "failed" with no output at
+            # all is indistinguishable in the UI from a tool that printed nothing.
+            jobs.append_output(job["id"],
+                               "worker hit an internal error; see the service log\n")
+        except Exception:  # noqa: BLE001 - the job file may genuinely be gone
+            pass
+        try:
             jobs.update_job(job["id"], state="failed", exit_code=1,
                             finished_at=int(time.time()))
         except Exception:  # noqa: BLE001 - nothing left to record it on
@@ -524,8 +556,17 @@ def acquire_lock() -> int | None:
     would mark a 20-minute update_apply as failed while it kept running, and
     would race the daemon in claim_next.
     """
-    JOBD_LOCK.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(JOBD_LOCK, os.O_CREAT | os.O_RDWR, 0o600)
+    # Opening the lock is now on the path of *every* mode, including the one-shots
+    # an operator may try by hand. The default lives in /run, which only root can
+    # write, so a non-root invocation used to die with a raw PermissionError
+    # traceback; say what is actually wrong instead.
+    try:
+        JOBD_LOCK.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(JOBD_LOCK, os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError as exc:
+        raise SystemExit(
+            f"cannot open lock {JOBD_LOCK}: {exc.strerror}; "
+            "palwarden-jobd must run as root") from exc
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:

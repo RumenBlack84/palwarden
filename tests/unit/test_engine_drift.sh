@@ -126,4 +126,66 @@ assert_ne "$rc" "0" "conflicting duplicate exits nonzero"
 assert_contains "$out" "NET_SERVER_MAX_TICK_RATE" "names the conflicting setting"
 assert_contains "$out" "more than once" "explains the duplicate"
 
+# --- rollback: real backups only, and never through a symlink ---------------
+# The backup directory is writable by the unprivileged web user while this tool
+# runs as root, so a symlink planted there must not be copied over Engine.ini
+# (which then gets chmod 0644). The name check alone cannot close that — the
+# entry can be swapped between check and open — so the read uses O_NOFOLLOW.
+rollback() {
+  PALWORLD_ENGINE_INI="$INI" PALWORLD_ENGINE_ENV="$ENV_FILE" \
+  PALWORLD_BACKUP_DIR="$WORK/backups" PALWORLD_ENGINE_PRETTY_INI="$WORK/Engine.pretty.ini" \
+  PALWORLD_FPS_BIN=/bin/true \
+    python3 "$ENGINE" rollback "$@" 2>&1
+}
+
+printf '[/Script/OnlineSubsystemUtils.IpNetDriver]\nNetServerMaxTickRate=42\n' \
+  > "$WORK/backups/Engine.ini.20260710T182037Z"
+printf '[/Script/OnlineSubsystemUtils.IpNetDriver]\nNetServerMaxTickRate=60\n' > "$INI"
+out="$(rollback -- Engine.ini.20260710T182037Z)"; rc=$?
+assert_eq "$rc" "0" "a legitimate regular-file backup rolls back"
+assert_contains "$out" "Restored" "reports the restore"
+assert_file_contains "$INI" "NetServerMaxTickRate=42" "restored the backup's contents"
+
+# --list must keep working (it lists names, it does not open anything)
+out="$(rollback --list)"
+assert_contains "$out" "Engine.ini.20260710T182037Z" "--list still lists backups"
+
+# a symlink to a 0600 secret outside the backup dir must be refused, and must
+# leave Engine.ini untouched
+printf 'ADMIN_PASSWORD=hunter2\n' > "$WORK/secret.env"
+chmod 0600 "$WORK/secret.env"
+ln -sf "$WORK/secret.env" "$WORK/backups/Engine.ini.20260101T000000Z"
+out="$(rollback -- Engine.ini.20260101T000000Z)"; rc=$?
+assert_ne "$rc" "0" "a symlinked backup is refused"
+assert_contains "$out" "symlink" "says why the symlink was refused"
+assert_not_contains "$out" "Traceback" "the refusal is a message, not a crash"
+assert_file_not_contains "$INI" "ADMIN_PASSWORD" "the secret never reached Engine.ini"
+assert_file_contains "$INI" "NetServerMaxTickRate=42" "Engine.ini left as it was"
+
+# the same refusal must come from the *open*, not only the pre-flight check:
+# call rollback_engine directly with the check monkey-patched away, standing in
+# for the entry being swapped after validation by a separate process.
+raced="$(PALWORLD_BACKUP_DIR="$WORK/backups" PALWORLD_FPS_BIN=/bin/true python3 - "$ENGINE" "$WORK" <<'EOF' 2>&1
+import importlib.machinery, importlib.util, sys
+from pathlib import Path
+loader = importlib.machinery.SourceFileLoader("engine_cfg", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+mod = importlib.util.module_from_spec(spec)
+sys.modules[loader.name] = mod  # dataclasses needs the module registered
+loader.exec_module(mod)
+work = Path(sys.argv[2])
+name = "Engine.ini.20260101T000000Z"
+# pretend validation already passed: the symlink appeared afterwards
+mod.resolve_backup = lambda n, d: d / n
+try:
+    mod.rollback_engine(name, work / "Engine.ini", work / "backups",
+                        work / "Engine.pretty.ini", save_current=False)
+    print("COPIED")
+except ValueError as exc:
+    print("REFUSED:", exc)
+EOF
+)"
+assert_contains "$raced" "REFUSED" "O_NOFOLLOW refuses a link swapped in after validation"
+assert_file_not_contains "$INI" "ADMIN_PASSWORD" "the raced swap still published nothing"
+
 assert_report

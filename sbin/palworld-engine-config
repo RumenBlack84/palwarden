@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import errno
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -369,10 +371,71 @@ def list_backups(backup_dir: Path) -> list[Path]:
     return sorted(backup_dir.glob("Engine.ini.*"), key=lambda p: p.stat().st_mtime, reverse=True)
 
 
+# --- rollback source handling ------------------------------------------------
+# BACKUP_DIR is writable by a *less privileged* user than the one running a
+# rollback: the web UI's unprivileged process owns it, and this tool then runs as
+# root (from palwarden-jobd, or from an admin's sudo). A rollback ends in "copy
+# this file over Engine.ini, chown it to the palworld user, chmod 0644", so a
+# symlink in that directory would publish any root-readable file — settings.env,
+# /etc/shadow — to a lesser user.
+#
+# Two guards, and both are needed:
+#
+#   * `is_symlink()` in resolve_backup gives the *caller* a clear refusal, and is
+#     what --dry-run and the pre-flight path can report on. It cannot close the
+#     hole on its own: it is a check-then-use, and the name it validated can be
+#     replaced with a symlink before (or by another process, between) the open.
+#     jobd's own validate_backup has exactly that gap — it validates the name and
+#     then spawns *this* tool, which re-resolves it tens of milliseconds later.
+#   * `O_NOFOLLOW` on the actual read makes the *kernel* refuse to traverse a
+#     link at open() time. That is what actually closes the race: there is no
+#     window between the decision and the use, because they are the same syscall.
+#
+# A *hardlink* with a legitimate-looking name passes both (it is a regular file,
+# not a symlink). Deliberately not checked: `fs.protected_hardlinks=1` (default
+# on the target distros) stops an unprivileged user hardlinking a file it does not
+# own, and reading through a hardlink it *does* own discloses nothing it could not
+# already read. Reading via a descriptor also means we never hand the destination
+# path back to a follow-capable copy.
+
+
+def read_backup_nofollow(backup: Path) -> tuple[bytes, os.stat_result]:
+    """Read a rollback source, refusing to traverse a symlink, via one open().
+
+    Returns the contents plus the fstat of the descriptor we actually read, so
+    the caller can carry over metadata from the file it really read rather than
+    re-stat'ing the (possibly since-swapped) path.
+    """
+    try:
+        fd = os.open(backup, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        # Linux reports ELOOP for O_NOFOLLOW on a symlink; some BSDs use EMLINK.
+        if exc.errno in (errno.ELOOP, errno.EMLINK):
+            raise ValueError(f"backup must not be a symlink: {backup}") from exc
+        raise FileNotFoundError(f"backup not readable: {backup} ({exc.strerror})") from exc
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError(f"backup must be a regular file: {backup}")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(fd, 1 << 20)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+    return b"".join(chunks), st
+
+
 def resolve_backup(name: str, backup_dir: Path) -> Path:
     if "/" in name or "\\" in name:
         raise ValueError("backup name must be a file name, not a path")
     backup = backup_dir / name
+    # is_symlink() uses lstat, so it decides on the entry itself; exists()/
+    # is_file() below both follow the link and would happily accept it.
+    if backup.is_symlink():
+        raise ValueError(f"backup must not be a symlink: {backup}")
     if not backup.exists() or not backup.is_file():
         raise FileNotFoundError(f"backup not found: {backup}")
     return backup
@@ -380,15 +443,31 @@ def resolve_backup(name: str, backup_dir: Path) -> Path:
 
 def rollback_engine(name: str, ini_path: Path, backup_dir: Path, pretty_path: Path, save_current: bool = True) -> Path:
     backup = resolve_backup(name, backup_dir)
+    # Read the source *before* touching anything, and through a descriptor the
+    # kernel refused to open via a symlink: if the entry was swapped since
+    # resolve_backup looked at it, this raises instead of copying a secret.
+    data, src_st = read_backup_nofollow(backup)
     if save_current and ini_path.exists():
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         pre = backup_dir / f"Engine.ini.pre-rollback.{stamp}"
-        shutil.copy2(ini_path, pre)
+        # O_EXCL|O_NOFOLLOW for the same reason in the other direction: this
+        # writes *into* the web-writable directory, and a pre-planted symlink at
+        # the (predictable, second-resolution) name would otherwise redirect
+        # root's write onto an arbitrary file.
+        pre_fd = os.open(pre, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+        with os.fdopen(pre_fd, "wb") as fh:
+            fh.write(ini_path.read_bytes())
         try:
             shutil.chown(pre, user=PALWORLD_USER, group=PALWORLD_GROUP)
         except Exception:
             pass
-    shutil.copy2(backup, ini_path)
+    # Replaces shutil.copy2(backup, ini_path): same content, and mtime/atime are
+    # carried over as copy2 did. The mode copy2 also propagated is dropped, which
+    # changes nothing — the chmod 0644 below always overwrote it.
+    ini_fd = os.open(ini_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    with os.fdopen(ini_fd, "wb") as fh:
+        fh.write(data)
+    os.utime(ini_path, ns=(src_st.st_atime_ns, src_st.st_mtime_ns))
     try:
         shutil.chown(ini_path, user=PALWORLD_USER, group=PALWORLD_GROUP)
     except Exception:
@@ -565,7 +644,14 @@ def command_rollback(args: argparse.Namespace) -> int:
         print(f"Would restore {backup} to {ini_path}")
         print("Dry run only; no files changed.")
         return 0
-    restored = rollback_engine(args.backup, ini_path, backup_dir, pretty_path)
+    # rollback_engine re-resolves and re-opens the name: the entry can have been
+    # swapped for a symlink since the check above, and O_NOFOLLOW turns that into
+    # a ValueError. Report it the same way as a failed pre-flight, not a traceback.
+    try:
+        restored = rollback_engine(args.backup, ini_path, backup_dir, pretty_path)
+    except (ValueError, FileNotFoundError, OSError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     print(f"Restored {restored} to {ini_path}")
     print(f"Regenerated {pretty_path}")
     print("Restart palworld.service for Engine.ini rollback to take effect.")
