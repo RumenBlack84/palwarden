@@ -113,10 +113,22 @@ external-only users.
    integration test suites under `tests/`. Verified end-to-end: env →
    `settings.env` → `RESTAPIEnabled=True` + `ServerName`/`AdminPassword` applied.
 
-6. **Finish the last timers** (deferred): `update-check` (in-container
-   self-update — s6 down → SteamCMD → up, with a lock) and `public-info-watch`
-   (needs a configurable hostname + IP source). Optional: a slim tools-only image
-   variant for external-only users.
+6. **Finish the last timers** — ✅ **done**. `update-check` (opt-in
+   `UPDATE_CHECK=true`) runs as root and reuses the systemctl shim + container
+   graceful-stop for a s6 down → SteamCMD → up flow; SteamCMD drops to steam via
+   `PALWORLD_DROP_PRIV`. `public-info-watch` (opt-in `PUBLIC_HOSTNAME`) runs as
+   steam. `palworld-update`/`public-info-watch` gained env overrides
+   (`PALWORLD_STEAMCMD`, `PALWORLD_DROP_PRIV`, `PALWORLD_INSTALL_DIR`,
+   `PALWORLD_CONFIG_FILE`, `PALWORLD_PUBLIC_INFO_FILE`, `PUBLIC_HOSTNAME`) — all
+   backward compatible. Unit tests cover the buildid check and join-info write.
+   The full apply-update path (real Steam build event) is not exercised E2E.
+
+## Still open / optional
+
+- A **real embedded boot** with the actual multi-GB SteamCMD download remains a
+  manual check (all increments were verified with dummy servers + a REST stub).
+- A **slim tools-only image** variant (no SteamCMD layer) for external-only users.
+- A **fully rootless** supervisor variant (s6 currently runs as PID 1 root).
 
 ## Open questions
 

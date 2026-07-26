@@ -4,13 +4,11 @@ An **all-in-one image** for Palworld: one artifact that can either **run the
 dedicated server itself** (self-contained) or **manage/monitor an existing
 server** elsewhere. Which role it plays is chosen at runtime, not at build time.
 
-> **Status — increment 5:** the server is now **configured from the environment
-> on boot** — `ADMIN_PASSWORD` enables the REST API and any `PALWORLD_CFG_<KEY>`
-> is applied to `PalWorldSettings.ini` via `palworld-config-apply-env`, so
-> embedded telemetry works out of the box with no hand-editing. Test suites
-> (unit + docker integration) live in [`../tests/`](../tests/). Still deferred:
-> `update-check` (in-container self-update) and `public-info-watch` — see
-> [`../docs/docker-roadmap.md`](../docs/docker-roadmap.md).
+> **Status — increment 6:** all the VM's background jobs now run in-container.
+> Added (opt-in) **Steam auto-update** (`UPDATE_CHECK=true` — graceful stop →
+> SteamCMD → restart, all via s6) and the **public join-info watcher**
+> (`PUBLIC_HOSTNAME=…`). The full tooling is ported; test suites live in
+> [`../tests/`](../tests/). See [`../docs/docker-roadmap.md`](../docs/docker-roadmap.md).
 
 ## Process model
 
@@ -26,6 +24,8 @@ run is decided at start by the entrypoint from `PALWARDEN_MODE` + config:
 | `fps-sample` (telemetry) | ✅ | ✅ | steam | `ADMIN_PASSWORD` + reachable REST API |
 | `memory-watch` (watchdog) | ✅ | — | root | — |
 | `daily-report` | ✅ | ✅ | steam | `DISCORD_WEBHOOK` |
+| `update-check` (auto-update) | ✅ | — | root | `UPDATE_CHECK=true` |
+| `public-info-watch` | ✅ | — | steam | `PUBLIC_HOSTNAME` |
 
 The server binary is supervised directly, with the service's **`down-signal` set
 to SIGINT** — so stop/restart (and container shutdown) tell Palworld to save its

@@ -94,4 +94,19 @@ docker stop --time 60 pw-it-e >/dev/null 2>&1
 assert_eq "$(docker inspect -f '{{.State.ExitCode}}' pw-it-e)" "0" "E: clean exit (graceful, not SIGKILL)"
 assert_contains "$(docker logs pw-it-e 2>&1)" "world saved, exiting cleanly" "E: server saved on stop"
 
+# --- Scenario F: opt-in services (update-check, public-info-watch) -----------
+# PALWORLD_STEAMCMD=/bin/true keeps the update checker from attempting a real
+# multi-GB update against the dummy (remote buildid comes back empty -> no-op).
+run_c pw-it-f -e PALWARDEN_MODE=embedded -e UPDATE_ON_START=false -e ADMIN_PASSWORD=x \
+  -e UPDATE_CHECK=true -e PALWORLD_STEAMCMD=/bin/true -e PUBLIC_HOSTNAME=pal.example \
+  -v "$FAKE":/opt/palworld/server "$IMG"
+wait_up pw-it-f palworld-server || fail "F: server did not come up"
+docker exec pw-it-f sh -c 'sleep 1'
+svcF="$(services_of pw-it-f)"
+assert_contains "$svcF" "update-check" "F: update-check enabled by UPDATE_CHECK=true"
+assert_contains "$svcF" "public-info-watch" "F: public-info-watch enabled by PUBLIC_HOSTNAME"
+# and they are NOT enabled by default (scenario A had neither flag)
+assert_not_contains "$svcA" "update-check" "F: update-check off by default"
+assert_not_contains "$svcA" "public-info-watch" "F: public-info-watch off by default"
+
 assert_report

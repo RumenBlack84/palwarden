@@ -5,9 +5,12 @@ set -euo pipefail
 source /usr/local/lib/palworld-notify || true
 
 APP_ID=2394010
-INSTALL_DIR=/opt/palworld/server
+INSTALL_DIR="${PALWORLD_INSTALL_DIR:-/opt/palworld/server}"
 MANIFEST="$INSTALL_DIR/steamapps/appmanifest_${APP_ID}.acf"
-STEAMCMD=/usr/games/steamcmd
+STEAMCMD="${PALWORLD_STEAMCMD:-/usr/games/steamcmd}"
+# Command prefix used to run SteamCMD as the unprivileged service account.
+# Bare metal: `sudo -u palworld`; container overrides to `s6-setuidgid steam`.
+DROP_PRIV="${PALWORLD_DROP_PRIV-sudo -u palworld}"
 SERVICE=palworld.service
 WAIT_SECONDS=300
 NOTICE_MESSAGE="Palworld server update detected: saving and stopping in 5 minutes."
@@ -43,7 +46,7 @@ local_buildid() {
 }
 
 remote_buildid() {
-  sudo -u palworld "$STEAMCMD" +login anonymous +app_info_update 1 +app_info_print "$APP_ID" +quit 2>/dev/null \
+  $DROP_PRIV "$STEAMCMD" +login anonymous +app_info_update 1 +app_info_print "$APP_ID" +quit 2>/dev/null \
     | awk '
       /"branches"/ {inbranches=1}
       inbranches && /"public"/ {inpublic=1}
@@ -95,7 +98,7 @@ fi
 cmd+=(+quit)
 
 palworld_notify start "downloading Palworld update to build \`${remote}\`${VALIDATE:+ with validation}."
-if sudo -u palworld "${cmd[@]}"; then
+if $DROP_PRIV "${cmd[@]}"; then
   # SteamCMD runs as the palworld user, so updated files should already be
   # owned correctly. Do not recursively chown /opt/palworld here: managed
   # config files such as Engine.ini may be intentionally immutable, and a

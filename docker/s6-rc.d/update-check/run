@@ -1,0 +1,12 @@
+#!/command/with-contenv bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Brian Grant
+#
+# Steam update checker (embedded only). Replaces palworld-update-check.timer.
+#
+# Runs as ROOT: applying an update stops/starts the server's s6 service (needs
+# root) while SteamCMD itself runs as steam (via PALWORLD_DROP_PRIV, set in the
+# image). palworld-update only touches the server when a new build is available.
+exec palwarden-run-periodic \
+  "${UPDATE_CHECK_INTERVAL:-1800}" update-check \
+  palworld-update --wait "${UPDATE_WAIT:-300}"

@@ -17,6 +17,10 @@ RUN_INTEGRATION=1 ./tests/run.sh
     `s6-svc` and the cgroup file).
   - `test_render_config.sh` — env → `settings.env`/`notify.env` rendering,
     verified by sourcing the output (spaces and shell metacharacters must survive).
+  - `test_update_check.sh` — `palworld-update` buildid comparison + exit codes,
+    with a fake SteamCMD and manifest (check paths only; no update applied).
+  - `test_public_info.sh` — `palworld-public-info-watch` reads config / resolves
+    IP / writes the join-info state file, with fake `curl`/`sudo`.
 - `integration/test_docker.sh` — builds the image and exercises real container
   scenarios: mode-based service selection, the systemctl shim, env-driven config
   application (`RESTAPIEnabled=True`), external-mode telemetry against a REST

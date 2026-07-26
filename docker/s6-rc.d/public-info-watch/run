@@ -1,0 +1,10 @@
+#!/command/with-contenv bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Brian Grant
+#
+# Public join-info watcher (embedded only). Replaces palworld-public-info-watch.timer.
+# Publishes hostname/IP/port/password to Discord when they change. Runs as the
+# unprivileged steam user; needs PUBLIC_HOSTNAME set and (usefully) DISCORD_WEBHOOK.
+exec s6-setuidgid steam palwarden-run-periodic \
+  "${PUBLIC_INFO_INTERVAL:-600}" public-info-watch \
+  palworld-public-info-watch

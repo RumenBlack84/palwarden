@@ -4,11 +4,13 @@
 set -euo pipefail
 source /usr/local/lib/palworld-notify || true
 
-STATE_FILE=/var/lib/palworld/public-info.env
-CONFIG_FILE=/opt/palworld/server/Pal/Saved/Config/LinuxServer/PalWorldSettings.ini
-HOSTNAME_VALUE="server.example.com"
+STATE_FILE="${PALWORLD_PUBLIC_INFO_FILE:-/var/lib/palworld/public-info.env}"
+CONFIG_FILE="${PALWORLD_CONFIG_FILE:-/opt/palworld/server/Pal/Saved/Config/LinuxServer/PalWorldSettings.ini}"
+# Advertised hostname. Set PUBLIC_HOSTNAME to your DNS name; falls back to the
+# detected public IP if unset. (Was hardcoded on the original VM.)
+HOSTNAME_VALUE="${PUBLIC_HOSTNAME:-}"
 
-install -d -o root -g root -m 0755 /var/lib/palworld
+mkdir -p "$(dirname "$STATE_FILE")"
 
 if [[ ! -r "$CONFIG_FILE" ]]; then
   echo "Cannot read $CONFIG_FILE" >&2
@@ -59,6 +61,9 @@ if [[ -z "$PUBLIC_IP" ]]; then
   echo "Could not determine public IP from ifconfig.me" >&2
   exit 1
 fi
+if [[ -z "$HOSTNAME_VALUE" ]]; then
+  HOSTNAME_VALUE="$PUBLIC_IP"
+fi
 
 tmp="$(mktemp)"
 chmod 0600 "$tmp"
@@ -79,7 +84,7 @@ old_summary="none"
 if [[ -f "$STATE_FILE" ]]; then
   old_summary="previous state existed"
 fi
-install -o root -g root -m 0600 "$tmp" "$STATE_FILE"
+install -m 0600 "$tmp" "$STATE_FILE"
 rm -f "$tmp"
 
 password_display="blank"

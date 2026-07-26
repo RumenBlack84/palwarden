@@ -63,6 +63,12 @@ ENV SteamAppId=2394010 \
     MEMORY_CHECK_INTERVAL=300 \
     MEMORY_WAIT=300 \
     DAILY_REPORT_AT=09:00 \
+    UPDATE_CHECK=false \
+    UPDATE_CHECK_INTERVAL=1800 \
+    UPDATE_WAIT=300 \
+    PUBLIC_INFO_INTERVAL=600 \
+    PALWORLD_STEAMCMD=/home/steam/steamcmd/steamcmd.sh \
+    PALWORLD_DROP_PRIV="s6-setuidgid steam" \
     S6_CMD_WAIT_FOR_SERVICES_MAXTIME=0 \
     S6_BEHAVIOUR_IF_STAGE2_FAILS=2 \
     S6_KILL_GRACETIME=3000
@@ -98,6 +104,8 @@ RUN chmod +x \
         /etc/s6-overlay/s6-rc.d/fps-sample/run \
         /etc/s6-overlay/s6-rc.d/memory-watch/run \
         /etc/s6-overlay/s6-rc.d/daily-report/run \
+        /etc/s6-overlay/s6-rc.d/update-check/run \
+        /etc/s6-overlay/s6-rc.d/public-info-watch/run \
     && (chmod +x /usr/local/sbin/palworld-* /usr/local/bin/palworld-config-parser 2>/dev/null || true) \
     && install -d -o steam -g steam \
         /opt/palworld/server/Pal/Saved/Config/LinuxServer \
