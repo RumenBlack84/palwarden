@@ -48,6 +48,13 @@ RUN tar -C / -Jxpf /tmp/s6-overlay-noarch.tar.xz \
     && tar -C / -Jxpf /tmp/s6-overlay-x86_64.tar.xz \
     && rm -f /tmp/s6-overlay-*.tar.xz
 
+# Pre-update SteamCMD during the build (as steam, with the right HOME) so it does
+# NOT self-update and restart on first container run. That restart is what makes
+# +force_install_dir install to the default Steam library instead of the target
+# volume. Warming it here makes the runtime install honor force_install_dir.
+RUN HOME=/home/steam /command/s6-setuidgid steam \
+      /home/steam/steamcmd/steamcmd.sh +quit 2>/dev/null || true
+
 # Put s6-overlay's /command on PATH for all contexts (docker exec, scripts, and
 # the systemctl shim), not just inside s6 run scripts.
 ENV PATH="/command:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -68,7 +75,7 @@ ENV SteamAppId=2394010 \
     UPDATE_WAIT=300 \
     PUBLIC_INFO_INTERVAL=600 \
     PALWORLD_STEAMCMD=/home/steam/steamcmd/steamcmd.sh \
-    PALWORLD_DROP_PRIV="s6-setuidgid steam" \
+    PALWORLD_DROP_PRIV="env HOME=/home/steam s6-setuidgid steam" \
     S6_CMD_WAIT_FOR_SERVICES_MAXTIME=0 \
     S6_BEHAVIOUR_IF_STAGE2_FAILS=2 \
     S6_KILL_GRACETIME=3000

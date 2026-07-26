@@ -21,7 +21,10 @@ set -euo pipefail
 MODE="${PALWARDEN_MODE:-embedded}"
 INSTALL_DIR="${PALWORLD_INSTALL_DIR:-/opt/palworld/server}"
 APP_ID="${PALWORLD_APP_ID:-2394010}"
-AS_STEAM="/command/s6-setuidgid steam"
+# Drop to steam with a correct HOME — s6-setuidgid changes uid/gid but not HOME,
+# and SteamCMD writes its state under $HOME (fails with "Missing file
+# permissions" if it inherits root's /root).
+AS_STEAM="env HOME=/home/steam /command/s6-setuidgid steam"
 S6_USER_CONTENTS="/etc/s6-overlay/s6-rc.d/user/contents.d"
 
 log() { printf '[palwarden] %s\n' "$*"; }
@@ -79,10 +82,24 @@ if [[ "$MODE" == "embedded" ]]; then
     if command -v steamcmd >/dev/null 2>&1; then STEAMCMD="$(command -v steamcmd)"; else
       log "steamcmd not found (looked for $STEAMCMD)." >&2; exit 1; fi
   fi
+  # Mounted volumes often come up root-owned; make the mount points writable by
+  # steam (NON-recursive — cheap and safe even with the game installed) so
+  # SteamCMD installs into the volume instead of falling back to steam's home.
+  for d in "$INSTALL_DIR" "$INSTALL_DIR/Pal" "$INSTALL_DIR/Pal/Saved"; do
+    [[ -d "$d" ]] && chown steam:steam "$d" 2>/dev/null || true
+  done
   if [[ "${UPDATE_ON_START:-true}" == "true" ]]; then
     log "Updating Palworld dedicated server (Steam app ${APP_ID})..."
-    $AS_STEAM "$STEAMCMD" +force_install_dir "$INSTALL_DIR" +login anonymous \
-      +app_update "$APP_ID" validate +quit
+    # SteamCMD self-updates and restarts on first run, and that restart can drop
+    # the app context ("Missing configuration"). Retry so the second pass — on an
+    # already-updated SteamCMD — installs the game.
+    for attempt in 1 2 3; do
+      if $AS_STEAM "$STEAMCMD" +force_install_dir "$INSTALL_DIR" +login anonymous \
+           +app_update "$APP_ID" validate +quit; then
+        break
+      fi
+      log "SteamCMD attempt ${attempt} did not complete (often the self-update restart); retrying..."
+    done
   else
     log "UPDATE_ON_START=false — skipping SteamCMD update."
   fi
