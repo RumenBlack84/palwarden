@@ -83,8 +83,15 @@ def load_credentials(path: Path = WEBUI_ENV) -> dict[str, str]:
             f"error: no web UI credentials at {path}. "
             "Run 'palwarden-webui --init-credentials' as root to create them."
         )
+    try:
+        text = path.read_text(errors="replace")
+    except OSError as exc:
+        sys.exit(
+            f"error: cannot read web UI credentials at {path}: {exc}. "
+            "Check file ownership/permissions (expected readable by the service account)."
+        )
     values: dict[str, str] = {}
-    for raw in path.read_text(errors="replace").splitlines():
+    for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -121,6 +128,13 @@ def init_credentials(path: Path = WEBUI_ENV) -> tuple[dict[str, str], bool]:
         # Create the file pre-restricted: never let it exist world/group readable,
         # even for the instant between creation and chmod.
         fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_EXCL, 0o600)
+    except FileExistsError:
+        sys.exit(
+            f"error: stale temp file {tmp} already exists. "
+            "A previous 'palwarden-webui --init-credentials' run may have been "
+            "interrupted; remove it and retry."
+        )
+    try:
         with os.fdopen(fd, "w") as fh:
             fh.write("".join(f'{k}="{_escape(v)}"\n' for k, v in creds.items()))
         tmp.replace(path)
@@ -135,14 +149,14 @@ def check_basic(header: str | None, creds: dict[str, str]) -> bool:
     if not header or not header.startswith("Basic "):
         return False
     try:
-        decoded = base64.b64decode(header[6:], validate=True).decode("utf-8", "replace")
+        decoded = base64.b64decode(header[6:], validate=True).decode("utf-8", "strict")
     except Exception:
         return False
     user, sep, password = decoded.partition(":")
     if not sep:
         return False
-    ok_user = hmac.compare_digest(user, creds["WEBUI_USER"])
-    ok_pass = hmac.compare_digest(password, creds["WEBUI_PASSWORD"])
+    ok_user = hmac.compare_digest(user.encode("utf-8"), creds["WEBUI_USER"].encode("utf-8"))
+    ok_pass = hmac.compare_digest(password.encode("utf-8"), creds["WEBUI_PASSWORD"].encode("utf-8"))
     return ok_user and ok_pass
 
 
@@ -200,9 +214,17 @@ def run_tool_json(argv: list[str], timeout: int = 30) -> dict:
     if not result["ok"]:
         return result
     try:
-        return {"ok": True, "data": json.loads(result["stdout"] or "{}")}
+        data = json.loads(result["stdout"] or "{}")
     except json.JSONDecodeError as exc:
+        if result["returncode"] != 0:
+            detail = result["stderr"].strip() or result["stdout"].strip()
+            return {"ok": False,
+                    "error": f"{argv[0]} exited {result['returncode']}: {detail}"}
         return {"ok": False, "error": f"{argv[0]} returned invalid JSON: {exc}"}
+    if result["returncode"] != 0 and not (result["stdout"] or "").strip():
+        detail = result["stderr"].strip() or f"exit {result['returncode']}"
+        return {"ok": False, "error": f"{argv[0]} exited {result['returncode']}: {detail}"}
+    return {"ok": True, "data": data}
 
 
 def pick_window(query: dict[str, list[str]], default: str = "24h",
@@ -238,13 +260,13 @@ def ep_fps(query: dict) -> dict:
 
 
 def ep_events(query: dict) -> dict:
-    window = pick_window(query, "24h")
+    window = pick_window(query, "24h", FPS_REPORT_WINDOWS)
     return run_tool_json([str(SBIN / "palworld-fps"), "events",
                           "--window", window, "--json"])
 
 
 def ep_service_events(query: dict) -> dict:
-    window = pick_window(query, "24h")
+    window = pick_window(query, "24h", FPS_REPORT_WINDOWS)
     return run_tool_json([str(SBIN / "palworld-service-events"), "summary",
                           "--since", window, "--json"])
 
