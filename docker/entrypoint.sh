@@ -72,7 +72,8 @@ rm -f "$S6_USER_CONTENTS"/palworld-server \
       "$S6_USER_CONTENTS"/memory-watch \
       "$S6_USER_CONTENTS"/daily-report \
       "$S6_USER_CONTENTS"/update-check \
-      "$S6_USER_CONTENTS"/public-info-watch
+      "$S6_USER_CONTENTS"/public-info-watch \
+      "$S6_USER_CONTENTS"/service-events
 enable_service() { : > "$S6_USER_CONTENTS/$1"; log "service enabled: $1"; }
 
 if [[ "$MODE" == "embedded" ]]; then
@@ -143,6 +144,8 @@ if [[ "$MODE" == "embedded" ]]; then
   # Public join-info watcher (opt-in via PUBLIC_HOSTNAME); publishes IP/port/
   # password changes to Discord.
   [[ -n "${PUBLIC_HOSTNAME:-}" ]] && enable_service public-info-watch
+  # Crash/restart watchdog: records unexpected restarts for the health report.
+  enable_service service-events
   # Memory watchdog runs as root (needs s6 service control) and restarts the
   # server's s6 service when memory is high.
   enable_service memory-watch

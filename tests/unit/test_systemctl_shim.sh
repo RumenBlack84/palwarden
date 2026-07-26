@@ -78,6 +78,44 @@ out="$(run_shim show palworld.service -p SomethingUnsupported)"
 assert_eq "$out" "SomethingUnsupported=" "unknown property returns an empty value"
 assert_rc 0 run_shim show palworld.service -p SomethingUnsupported
 
+# --- unprivileged callers: s6-svstat needs root, so fall back to the process ---
+# The telemetry/watchdog jobs run as `steam`, where s6-svstat fails; without a
+# fallback the shim reported a running server as inactive with no PID.
+cat > "$WORK/bin/s6-svstat-denied" <<'EOF'
+#!/usr/bin/env bash
+echo "s6-svstat: fatal: unable to control: Permission denied" >&2
+exit 1
+EOF
+cat > "$WORK/bin/pgrep" <<EOF
+#!/usr/bin/env bash
+# report the game process only when the fixture says it is running
+[ "\$(cat "$WORK/proc_running" 2>/dev/null || echo 1)" = "1" ] || exit 1
+echo 7777
+EOF
+chmod +x "$WORK/bin/s6-svstat-denied" "$WORK/bin/pgrep"
+
+run_denied() {
+  cp "$WORK/bin/s6-svstat-denied" "$WORK/bin/s6-svstat"
+  PATH="$WORK/bin:$PATH" PALWARDEN_S6_SVC_DIR="$WORK/run/service" \
+  PALWARDEN_CGROUP_MEM="$WORK/cgmem" bash "$SHIM" "$@"
+  local rc=$?
+  cp "$WORK/bin/s6-svstat-orig" "$WORK/bin/s6-svstat"
+  return $rc
+}
+cp "$WORK/bin/s6-svstat" "$WORK/bin/s6-svstat-orig"
+
+echo 1 > "$WORK/proc_running"
+assert_eq "$(run_denied is-active palworld.service)" "active" "unprivileged: active from the process"
+assert_rc 0 run_denied is-active --quiet palworld.service
+out="$(run_denied show palworld.service -p ActiveState -p MainPID)"
+assert_contains "$out" "ActiveState=active" "unprivileged: ActiveState from the process"
+assert_contains "$out" "MainPID=7777"       "unprivileged: MainPID from the process"
+
+# and when the game really is not running, it says so
+echo 0 > "$WORK/proc_running"
+assert_eq "$(run_denied is-active palworld.service)" "inactive" "unprivileged: inactive when no process"
+echo 1 > "$WORK/proc_running"
+
 # is-enabled reflects the s6 user-bundle marker. The shim looks under
 # /etc/s6-overlay/... which we can't fake without root, so just assert the
 # command runs and returns a known token.

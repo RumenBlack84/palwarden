@@ -28,6 +28,13 @@ integration tests as separate jobs on every push / PR.
   - `test_notify_optional.sh` — Discord notifications are optional: asserts the
     repo invariant that every script sourcing `palworld-notify` also defines a
     no-op fallback, and that scripts still run when the helper isn't installed.
+  - `test_memory_watch.sh` — the memory watchdog, including the regression that
+    matters: a container at 97% of its memory limit must restart (judging against
+    the host's RAM made it never fire), plus that the restart it invokes returns
+    promptly when no REST API is configured.
+  - `test_service_events.sh` — the crash/restart watchdog: baseline, no-change,
+    unexpected vs planned restarts, outage/recovery, and the summary (incl. JSON
+    and an empty DB).
   - `test_config_parser.sh` — `palworld-config-parser`: env→INI key resolution
     (including PascalCase quirks and the exceptions table), quoting/escaping,
     enum + boolean + numeric handling, rejection of structure-breaking values,

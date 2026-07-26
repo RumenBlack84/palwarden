@@ -22,6 +22,7 @@ from typing import Any
 
 FPS_SCRIPT = "/usr/local/sbin/palworld-fps"
 ENGINE_CONFIG = "/usr/local/sbin/palworld-engine-config"
+SERVICE_EVENTS = "/usr/local/sbin/palworld-service-events"
 API_HELPER = "/usr/local/sbin/palworld-api"
 NOTIFY_ENV = Path("/etc/palworld/notify.env")
 SNAPSHOT_ROOT = Path("/opt/palworld/config-snapshots")
@@ -65,6 +66,21 @@ def collect_service() -> dict[str, str]:
     data = parse_systemctl_show(proc.stdout)
     data["ok"] = str(proc.returncode == 0)
     return data
+
+
+def collect_service_events(window: str = "24h") -> dict[str, Any]:
+    """Restarts/outages we detected ourselves.
+
+    systemd's NRestarts resets with the unit and s6 has no counter, so this is the
+    only restart count that is meaningful on both platforms.
+    """
+    proc = run([SERVICE_EVENTS, "summary", "--since", window, "--json"], timeout=20)
+    if proc.returncode != 0:
+        return {}
+    try:
+        return extract_json(proc.stdout)
+    except Exception:
+        return {}
 
 
 def extract_json(text: str) -> dict[str, Any]:
@@ -156,6 +172,7 @@ def collect_health(timeout: int = 5) -> dict[str, Any]:
     return {
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "service": collect_service(),
+        "service_events": collect_service_events(),
         "api": collect_api(timeout=timeout),
         "fps_summary": collect_fps(no_live=True),
         "engine": collect_engine(),
@@ -175,6 +192,14 @@ def format_health(data: dict[str, Any]) -> str:
     lines = ["🩺 **Palworld Server Health**", ""]
     lines.append("Service:")
     lines.append(f"- palworld.service: `{service.get('active_state', 'unknown')}/{service.get('sub_state', 'unknown')}` PID `{service.get('main_pid', 'n/a')}` restarts `{service.get('n_restarts', 'n/a')}`")
+    events = data.get("service_events") or {}
+    if events:
+        detected = events.get("restarts", 0)
+        unexpected = events.get("unexpected", 0)
+        outages = events.get("outages", 0)
+        flag = " ⚠️" if unexpected or outages else ""
+        lines.append(f"- Detected in {events.get('since', '24h')}: `{detected}` restart(s), "
+                     f"`{unexpected}` unexpected, `{outages}` outage(s){flag}")
     if service.get("start_timestamp"):
         lines.append(f"- Started: `{service.get('start_timestamp')}`")
     lines.append("")

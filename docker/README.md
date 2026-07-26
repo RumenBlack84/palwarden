@@ -26,6 +26,7 @@ run is decided at start by the entrypoint from `PALWARDEN_MODE` + config:
 | `daily-report` | ✅ | ✅ | steam | `DISCORD_WEBHOOK` |
 | `update-check` (auto-update) | ✅ | — | root | `UPDATE_CHECK=true` |
 | `public-info-watch` | ✅ | — | steam | `PUBLIC_HOSTNAME` |
+| `service-events` (crash watchdog) | ✅ | — | steam | — |
 
 The server binary is supervised directly, with the service's **`down-signal` set
 to SIGINT** — so stop/restart (and container shutdown) tell Palworld to save its

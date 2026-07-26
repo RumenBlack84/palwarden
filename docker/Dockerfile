@@ -76,6 +76,7 @@ ENV SteamAppId=2394010 \
     UPDATE_CHECK_INTERVAL=1800 \
     UPDATE_WAIT=300 \
     PUBLIC_INFO_INTERVAL=600 \
+    SERVICE_EVENTS_INTERVAL=60 \
     PALWORLD_STEAMCMD=/home/steam/steamcmd/steamcmd.sh \
     PALWORLD_DROP_PRIV="env HOME=/home/steam s6-setuidgid steam" \
     S6_CMD_WAIT_FOR_SERVICES_MAXTIME=0 \
@@ -115,6 +116,7 @@ RUN chmod +x \
         /etc/s6-overlay/s6-rc.d/daily-report/run \
         /etc/s6-overlay/s6-rc.d/update-check/run \
         /etc/s6-overlay/s6-rc.d/public-info-watch/run \
+        /etc/s6-overlay/s6-rc.d/service-events/run \
     && (chmod +x /usr/local/sbin/palworld-* /usr/local/bin/palworld-config-parser 2>/dev/null || true) \
     && install -d -o steam -g steam \
         /opt/palworld/server/Pal/Saved/Config/LinuxServer \

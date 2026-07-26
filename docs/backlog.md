@@ -159,15 +159,18 @@ Purpose:
 
 - Improve graph context without making samplers noisy.
 
-## 8. Crash/restart watchdog summary
+## 8. Crash/restart watchdog summary — implemented
 
-Add a small watchdog/report that checks recent `palworld.service` restarts and abnormal exits.
-
-Potential command:
+Implemented in `/usr/local/sbin/palworld-service-events`:
 
 ```bash
-sudo /usr/local/sbin/palworld-service-events --since 24h
+sudo /usr/local/sbin/palworld-service-events sample            # periodic (timer / s6)
+sudo /usr/local/sbin/palworld-service-events summary --since 24h
 ```
+
+It samples the service's state and main PID and records a marker when they change,
+classifying restarts as planned (we asked) or unexpected (crash/OOM/external).
+Counts feed the daily health report, and the markers appear on the FPS graphs.
 
 Purpose:
 
@@ -176,5 +179,5 @@ Purpose:
 
 ## Prioritized next steps
 
-1. Add crash/restart watchdog summary.
+1. ~~Add crash/restart watchdog summary.~~ — done, see item 8.
 2. Consider wiring health report failures into alert-only notifications.

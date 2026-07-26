@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Brian Grant
+"""Detect and summarise Palworld server restarts and outages.
+
+`docs/backlog.md` item 8: correlate crashes/restarts with FPS drops and config
+changes, and feed the daily health report.
+
+Neither platform gives us this for free — systemd's `NRestarts` resets with the
+unit and s6 keeps no counter at all — so we observe it instead: each `sample`
+compares the service's state and main PID against the previous sample and records
+an event marker when they change. Markers land in the same telemetry DB as FPS
+samples, so restarts show up on the FPS graphs alongside config applies and
+updates, which is the point.
+
+    palworld-service-events sample                # run periodically (timer/s6)
+    palworld-service-events summary --since 24h   # human or --json
+
+A restart is classed **planned** when we asked for one (a restart-category marker
+exists shortly before it) and **unexpected** otherwise — an unexpected restart is
+the interesting signal: a crash, an OOM kill, or something outside the tooling.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+SERVICE = "palworld.service"
+FPS_BIN = os.environ.get("PALWORLD_FPS_BIN", "/usr/local/sbin/palworld-fps")
+METRICS_DB = os.environ.get("PALWORLD_METRICS_DB", "/var/lib/palworld/metrics.sqlite3")
+STATE_FILE = Path(os.environ.get("PALWORLD_SERVICE_STATE_FILE",
+                                 "/var/lib/palworld/service-events.json"))
+# A restart we requested is usually observed within a few minutes of the request.
+PLANNED_WINDOW_SECONDS = int(os.environ.get("PALWORLD_PLANNED_WINDOW", "600"))
+
+CATEGORY = "service"
+RESTART_LABEL = "server restart detected"
+DOWN_LABEL = "server not running"
+UP_LABEL = "server came back up"
+
+
+def run(cmd: list[str], timeout: int = 20) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, text=True, capture_output=True, timeout=timeout, check=False)
+
+
+def service_state() -> tuple[str, str]:
+    """Current (ActiveState, MainPID) — works via the container's systemctl shim."""
+    proc = run(["systemctl", "show", SERVICE, "-p", "ActiveState", "-p", "MainPID", "--no-pager"])
+    raw = dict(
+        line.split("=", 1) for line in proc.stdout.splitlines() if "=" in line
+    )
+    return raw.get("ActiveState", "unknown").strip(), raw.get("MainPID", "0").strip() or "0"
+
+
+def mark(label: str, details: str) -> None:
+    """Record an event marker. Decorative: never fail the sample over it."""
+    try:
+        run([FPS_BIN, "--db", METRICS_DB, "mark", label,
+             "--category", CATEGORY, "--details", details])
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def recent_events(window: str) -> list[dict]:
+    """Markers within the window, or [] when telemetry is unavailable."""
+    try:
+        proc = run([FPS_BIN, "--db", METRICS_DB, "events", "--window", window, "--json"])
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if proc.returncode != 0:
+        return []
+    try:
+        data = json.loads(proc.stdout or "[]")
+    except json.JSONDecodeError:
+        return []
+    return data if isinstance(data, list) else []
+
+
+def restart_was_requested() -> bool:
+    """True when the tooling asked for a restart in the recent past."""
+    cutoff_ms = (time.time() - PLANNED_WINDOW_SECONDS) * 1000
+    for event in recent_events("24h"):
+        if event.get("category") != "restart":
+            continue
+        if float(event.get("event_at_ms") or 0) < cutoff_ms:
+            continue
+        if "requested" in str(event.get("label", "")):
+            return True
+    return False
+
+
+def read_state() -> dict:
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def write_state(state: str, pid: str) -> None:
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"active_state": state, "main_pid": pid,
+                               "sampled_at": int(time.time())}))
+    tmp.replace(STATE_FILE)
+
+
+def cmd_sample(_args: argparse.Namespace) -> int:
+    state, pid = service_state()
+    previous = read_state()
+    prev_state, prev_pid = previous.get("active_state"), previous.get("main_pid")
+
+    if not previous:
+        write_state(state, pid)
+        print(f"baseline recorded: {SERVICE} {state} pid {pid}")
+        return 0
+
+    # Down / recovered transitions first: they are the clearest signal.
+    if state != "active" and prev_state == "active":
+        mark(DOWN_LABEL, f"state {prev_state} -> {state}")
+        write_state(state, pid)
+        print(f"{SERVICE} is not running (was {prev_state}); recorded.")
+        return 0
+    if state == "active" and prev_state != "active":
+        mark(UP_LABEL, f"state {prev_state} -> {state}; pid {pid}")
+        write_state(state, pid)
+        print(f"{SERVICE} came back up (pid {pid}); recorded.")
+        return 0
+
+    # Same state, different process: it restarted while we were not looking.
+    if state == "active" and pid not in ("0", "", prev_pid):
+        planned = restart_was_requested()
+        kind = "planned" if planned else "unexpected"
+        mark(f"{RESTART_LABEL} ({kind})", f"pid {prev_pid} -> {pid}")
+        write_state(state, pid)
+        print(f"{SERVICE} restarted ({kind}): pid {prev_pid} -> {pid}; recorded.")
+        return 0
+
+    write_state(state, pid)
+    print(f"no change: {SERVICE} {state} pid {pid}")
+    return 0
+
+
+def cmd_summary(args: argparse.Namespace) -> int:
+    events = [e for e in recent_events(args.since) if e.get("category") == CATEGORY]
+    restarts = [e for e in events if RESTART_LABEL in str(e.get("label", ""))]
+    unexpected = [e for e in restarts if "unexpected" in str(e.get("label", ""))]
+    outages = [e for e in events if DOWN_LABEL in str(e.get("label", ""))]
+
+    if args.json:
+        print(json.dumps({
+            "since": args.since,
+            "restarts": len(restarts),
+            "unexpected": len(unexpected),
+            "outages": len(outages),
+            "events": events,
+        }, indent=2, sort_keys=True))
+        return 0
+
+    print(f"Palworld service events (last {args.since}):")
+    print(f"- restarts detected: {len(restarts)} ({len(unexpected)} unexpected)")
+    print(f"- outages observed: {len(outages)}")
+    if not events:
+        print("- no service events recorded")
+        return 0
+    print("Recent:")
+    for event in events[-10:]:
+        stamp = str(event.get("event_at_utc", "?"))
+        print(f"- {stamp} {event.get('label')} ({event.get('details') or 'no details'})")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("sample", help="record a restart/outage marker when the service changed")
+    p.set_defaults(func=cmd_sample)
+
+    p = sub.add_parser("summary", help="report recent restarts and outages")
+    p.add_argument("--since", default="24h", help="window accepted by palworld-fps events (default 24h)")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_summary)
+
+    args = ap.parse_args()
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

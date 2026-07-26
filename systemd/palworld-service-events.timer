@@ -1,0 +1,12 @@
+[Unit]
+Description=Check for Palworld service restarts every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+RandomizedDelaySec=5s
+Persistent=true
+Unit=palworld-service-events.service
+
+[Install]
+WantedBy=timers.target

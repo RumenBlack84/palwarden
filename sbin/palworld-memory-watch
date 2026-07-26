@@ -1,15 +1,34 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # SPDX-FileCopyrightText: 2026 Brian Grant
+#
+# Restart Palworld gracefully when memory usage gets dangerously high.
+#
+# Which memory matters depends on where we run:
+#
+#   * In a container WITH a memory limit, that limit is the real ceiling — and
+#     /proc/meminfo still reports the host's RAM, so judging against the host
+#     makes the watchdog useless (a server filling a 512 MiB limit is ~1.5% of a
+#     32 GiB host). When a limit is present we compare cgroup usage against it.
+#   * On bare metal (or a container with no limit) the host's memory is the
+#     ceiling, and the service's own cgroup is checked too, so a leaking server is
+#     caught before it drags the whole box down.
 set -euo pipefail
 source /usr/local/lib/palworld-notify 2>/dev/null || true
 # Notifications are optional: no-op when the helper isn't installed, rather than
 # aborting on "command not found".
 declare -F palworld_notify >/dev/null || palworld_notify() { :; }
+
 SERVICE=palworld.service
 THRESHOLD=85
 WAIT_SECONDS=300
 MESSAGE="Server maintenance: memory usage is high; saving and restarting in 5 minutes."
+# Paths/commands default to the real ones; overrides exist for the tests.
+MEMINFO="${PALWORLD_MEMINFO:-/proc/meminfo}"
+CGROUP_MAX="${PALWARDEN_CGROUP_MEM_MAX:-/sys/fs/cgroup/memory.max}"
+CGROUP_CURRENT="${PALWARDEN_CGROUP_MEM_CURRENT:-/sys/fs/cgroup/memory.current}"
+RESTART_BIN="${PALWORLD_RESTART_BIN:-/usr/local/sbin/palworld-graceful-restart}"
+LOCK_FILE="${PALWORLD_MEMORY_LOCK:-/run/palworld-memory-watch.lock}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -29,25 +48,60 @@ if ! systemctl is-active --quiet "$SERVICE"; then
   exit 0
 fi
 
-read -r mem_total_kb mem_avail_kb < <(awk '/MemTotal:/ {t=$2} /MemAvailable:/ {a=$2} END {print t, a}' /proc/meminfo)
-mem_used_kb=$((mem_total_kb - mem_avail_kb))
-system_used_pct=$((mem_used_kb * 100 / mem_total_kb))
-mem_current="$(systemctl show -p MemoryCurrent --value "$SERVICE" 2>/dev/null || echo 0)"
-if [[ ! "$mem_current" =~ ^[0-9]+$ ]]; then mem_current=0; fi
-service_pct=$(awk -v b="$mem_current" -v kb="$mem_total_kb" 'BEGIN{printf "%.0f", (b/1024)/(kb)*100}')
-service_gib=$(awk -v b="$mem_current" 'BEGIN{printf "%.2f", b/1024/1024/1024}')
-avail_gib=$(awk -v kb="$mem_avail_kb" 'BEGIN{printf "%.1f", kb/1024/1024}')
-total_gib=$(awk -v kb="$mem_total_kb" 'BEGIN{printf "%.1f", kb/1024/1024}')
+# human_bytes <bytes> -> "1.50 GiB" / "512.0 MiB"
+human_bytes() {
+  awk -v b="$1" 'BEGIN{
+    if (b >= 1073741824) printf "%.2f GiB", b/1073741824;
+    else printf "%.1f MiB", b/1048576;
+  }'
+}
 
-if (( system_used_pct < THRESHOLD && service_pct < THRESHOLD )); then
-  echo "Memory OK: system ${system_used_pct}% used (${avail_gib} GiB available / ${total_gib} GiB), ${SERVICE} ${service_gib} GiB (${service_pct}%). Threshold ${THRESHOLD}%."
-  exit 0
+# read_number <file> -> the file's contents when they are a plain integer
+read_number() {
+  local raw
+  raw="$(tr -d '[:space:]' < "$1" 2>/dev/null || true)"
+  if [[ "$raw" =~ ^[0-9]+$ ]]; then printf '%s' "$raw"; fi
+}
+
+# cgroup v2 writes "max" when uncapped, so a number here means we are limited.
+limit_bytes="$(read_number "$CGROUP_MAX")"
+
+if [[ -n "$limit_bytes" ]]; then
+  # --- capped: the cgroup limit is the ceiling that matters -----------------
+  usage_bytes="$(read_number "$CGROUP_CURRENT")"
+  usage_bytes="${usage_bytes:-0}"
+  used_pct=$(( usage_bytes * 100 / limit_bytes ))
+  summary="container memory ${used_pct}% of the $(human_bytes "$limit_bytes") limit ($(human_bytes "$usage_bytes") used)"
+  if (( used_pct < THRESHOLD )); then
+    echo "Memory OK: ${summary}. Threshold ${THRESHOLD}%."
+    exit 0
+  fi
+  reason="$summary"
+  detail="$summary"
+else
+  # --- uncapped: host memory, plus the service's own cgroup -----------------
+  read -r mem_total_kb mem_avail_kb < <(awk '/MemTotal:/ {t=$2} /MemAvailable:/ {a=$2} END {print t, a}' "$MEMINFO")
+  mem_used_kb=$((mem_total_kb - mem_avail_kb))
+  system_used_pct=$((mem_used_kb * 100 / mem_total_kb))
+  mem_current="$(systemctl show -p MemoryCurrent --value "$SERVICE" 2>/dev/null || echo 0)"
+  if [[ ! "$mem_current" =~ ^[0-9]+$ ]]; then mem_current=0; fi
+  service_pct=$(awk -v b="$mem_current" -v kb="$mem_total_kb" 'BEGIN{printf "%.0f", (b/1024)/(kb)*100}')
+  service_gib=$(awk -v b="$mem_current" 'BEGIN{printf "%.2f", b/1024/1024/1024}')
+  avail_gib=$(awk -v kb="$mem_avail_kb" 'BEGIN{printf "%.1f", kb/1024/1024}')
+  total_gib=$(awk -v kb="$mem_total_kb" 'BEGIN{printf "%.1f", kb/1024/1024}')
+
+  if (( system_used_pct < THRESHOLD && service_pct < THRESHOLD )); then
+    echo "Memory OK: system ${system_used_pct}% used (${avail_gib} GiB available / ${total_gib} GiB), ${SERVICE} ${service_gib} GiB (${service_pct}%). Threshold ${THRESHOLD}%."
+    exit 0
+  fi
+
+  reason="system memory ${system_used_pct}% used"
+  if (( service_pct >= THRESHOLD )); then
+    reason="${SERVICE} cgroup memory ${service_pct}% of host RAM (${service_gib} GiB)"
+  fi
+  detail="Host memory: ${system_used_pct}% used, ${avail_gib} GiB available / ${total_gib} GiB. ${SERVICE}: ${service_gib} GiB (${service_pct}%)."
 fi
 
-reason="system memory ${system_used_pct}% used"
-if (( service_pct >= THRESHOLD )); then
-  reason="${SERVICE} cgroup memory ${service_pct}% of host RAM (${service_gib} GiB)"
-fi
-
-palworld_notify warning "memory watchdog threshold crossed: ${reason}; initiating graceful restart with ${WAIT_SECONDS}s notice. Host memory: ${system_used_pct}% used, ${avail_gib} GiB available / ${total_gib} GiB. ${SERVICE}: ${service_gib} GiB (${service_pct}%)."
-/usr/bin/flock -n /run/palworld-memory-watch.lock /usr/local/sbin/palworld-graceful-restart --wait "$WAIT_SECONDS" --message "$MESSAGE"
+echo "Memory watchdog threshold crossed: ${reason}. Threshold ${THRESHOLD}%; restarting."
+palworld_notify warning "memory watchdog threshold crossed: ${reason}; initiating graceful restart with ${WAIT_SECONDS}s notice. ${detail}"
+flock -n "$LOCK_FILE" "$RESTART_BIN" --wait "$WAIT_SECONDS" --message "$MESSAGE"

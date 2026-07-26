@@ -29,14 +29,26 @@ done
 if [[ "${PALWARDEN_CONTAINER:-0}" == "1" ]]; then
   PATH="/command:$PATH"   # ensure s6 tools are reachable
   svcdir="${PALWARDEN_S6_SVC_DIR:-/run/service}/palworld-server"
+  api_bin="${PALWORLD_API_BIN:-/usr/local/sbin/palworld-api}"
   palworld_notify start "graceful restart requested (container); restarting the server service (SIGINT save)."
   /usr/local/sbin/palworld-fps mark "graceful restart requested" --category restart --details "container s6 restart" >/dev/null 2>&1 || true
   # Bring the service down (s6 sends the service's down-signal = SIGINT, so the
   # world saves), wait until it's fully down, then bring it back up.
   s6-svc -wD -T $(( startup_timeout * 1000 )) -d "$svcdir" || true
   s6-svc -u "$svcdir"
+  # Only wait for REST readiness when the API is actually configured. palworld-api
+  # exits 2 for "not enabled / no ADMIN_PASSWORD", which waiting cannot fix — and
+  # blocking for the full startup timeout would stall the caller (the memory
+  # watchdog runs on a timer and would overlap its next tick).
+  sudo "$api_bin" info >/dev/null 2>&1 || api_rc=$?
+  if [[ "${api_rc:-0}" -eq 2 ]]; then
+    palworld_notify success "server service restarted (container); REST API not configured, so readiness was not checked."
+    echo "server service restarted; REST API not configured (skipped readiness check)."
+    /usr/local/sbin/palworld-fps mark "graceful restart completed" --category restart --details "container s6 restart; REST not configured" >/dev/null 2>&1 || true
+    exit 0
+  fi
   deadline=$((SECONDS + startup_timeout))
-  until sudo /usr/local/sbin/palworld-api info >/dev/null 2>&1; do
+  until sudo "$api_bin" info >/dev/null 2>&1; do
     if (( SECONDS >= deadline )); then
       palworld_notify warning "server restart issued, but REST API not ready within ${startup_timeout}s."
       echo "REST API not ready within ${startup_timeout}s after restart" >&2
@@ -45,6 +57,7 @@ if [[ "${PALWARDEN_CONTAINER:-0}" == "1" ]]; then
     sleep 3
   done
   palworld_notify success "server service restarted (container); REST API healthy."
+  echo "server service restarted; REST API healthy."
   /usr/local/sbin/palworld-fps mark "graceful restart completed" --category restart --details "container s6 restart" >/dev/null 2>&1 || true
   exit 0
 fi

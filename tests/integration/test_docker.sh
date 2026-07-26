@@ -145,6 +145,15 @@ out="$(docker exec pw-it-g palworld-health-report report 2>&1)"
 assert_contains "$out" "active/running" "H: health report sees the service as active/running"
 assert_not_contains "$out" "unknown/unknown" "H: no unknown service state"
 assert_contains "$out" "restarts \`n/a\`" "H: unknown restart count reads n/a, not blank"
+# the crash/restart watchdog runs and feeds the report a count that IS meaningful
+assert_contains "$(services_of pw-it-g)" "service-events" "H: service-events watchdog enabled"
+assert_contains "$out" "Detected in" "H: report includes detected restarts/outages"
+# a restart the tooling performed is classified as planned, not a crash
+docker exec --user root pw-it-g palworld-graceful-restart --startup-timeout 3 >/dev/null 2>&1
+docker exec pw-it-g sh -c 'sleep 2; palworld-service-events sample' >/dev/null 2>&1
+out="$(docker exec pw-it-g palworld-service-events summary --since 24h 2>&1)"
+assert_contains "$out" "restarts detected" "H: service-events summary reports restarts"
+assert_not_contains "$out" "Traceback" "H: service-events summary does not crash"
 # palworld-status agrees
 out="$(docker exec pw-it-g palworld-status 2>&1)"
 assert_contains "$out" "state: active" "H: status reports active"

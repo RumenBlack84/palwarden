@@ -153,9 +153,18 @@ usage, and recent markers. `discord` attaches the FPS/player graph. Drives the
 ### `palworld-memory-watch`
 `/usr/local/sbin/palworld-memory-watch [--threshold PCT] [--wait S] [--message T]`
 
-Compares host RAM used% and the `palworld.service` cgroup memory against a
-threshold (default 85%). Over the line, it warns to Discord and triggers a
-`graceful-restart` (under a `flock`). No-ops if the service is down. Timer: every
+Restarts the server before memory pressure takes it out. Which memory it judges
+depends on where it runs:
+
+- **Container with a memory limit** — compares cgroup usage against *that limit*.
+  (`/proc/meminfo` reports the host's RAM inside a container, so judging against
+  the host made the watchdog useless: a server filling a 512 MiB limit is ~1.5% of
+  a 32 GiB host and would never trigger.)
+- **Bare metal / no limit** — host RAM used%, plus the unit's own cgroup, so a
+  leaking server is caught before it drags the box down.
+
+Over the threshold (default 85%) it warns to Discord and triggers a
+`graceful-restart` under a `flock`. No-ops if the service is down. Timer: every
 5 min.
 
 ### `palworld-public-info-watch`
@@ -165,6 +174,21 @@ Reads `ServerPassword`/`PublicPort` from the live config and the current public
 IP, and if the join info changed since `/var/lib/palworld/public-info.env`,
 rewrites that file (mode 0600) and posts the new IP/port/password to Discord.
 Timer: every 10 min.
+
+### `palworld-service-events`
+`/usr/local/sbin/palworld-service-events {sample|summary [--since 24h] [--json]}`
+
+Crash/restart watchdog. `sample` compares the service's state and main PID against
+the previous sample and records an event marker when they changed — classified
+**planned** when the tooling requested a restart shortly before, or **unexpected**
+(a crash, an OOM kill, something outside the tooling) otherwise. It also records
+outages and recoveries. `summary` reports the counts and recent events, and feeds
+the daily health report.
+
+Why observe rather than ask: systemd's `NRestarts` resets with the unit and s6
+keeps no counter at all, so this is the only restart count that means the same
+thing on both platforms. Markers land in the telemetry DB, so restarts appear on
+the FPS graphs next to config applies and updates. Timer/service: every 60s.
 
 ### `palworld-launch-watch` *(dated / inert)*
 `/usr/local/sbin/palworld-launch-watch`
@@ -254,6 +278,7 @@ Installed to `/etc/systemd/system`. Enable only what you need.
 | `palworld-update-check.timer` | timer | every 30m | `palworld-update` under a lock. |
 | `palworld-memory-watch.timer` | timer | every 5m | `palworld-memory-watch --threshold 85 --wait 300`. |
 | `palworld-public-info-watch.timer` | timer | every 10m | `palworld-public-info-watch`. |
+| `palworld-service-events.timer` | timer | every 1m | `palworld-service-events sample` — detects restarts/outages. |
 | `palworld-1dot0-watch.timer` | timer | every 1m *(dated)* | `palworld-launch-watch`. Inert; do not enable. |
 
 Each `*.timer` has a matching one-shot `*.service`. After changing any unit:

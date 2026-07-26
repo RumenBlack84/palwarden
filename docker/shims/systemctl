@@ -43,8 +43,33 @@ svc_raw="${positional[0]:-}"
 svc="$(map_svc "$svc_raw")"
 svcdir="$S6_SVC_DIR/$svc"
 
-svc_up() { s6-svstat "$svcdir" 2>/dev/null | grep -q '^up'; }
-svc_pid() { s6-svstat "$svcdir" 2>/dev/null | grep -oE 'pid [0-9]+' | grep -oE '[0-9]+' | head -1; }
+# s6-svstat needs root, but the telemetry/watchdog jobs run as `steam`. When it is
+# unavailable, fall back to looking for the game process, which any user can see in
+# /proc — otherwise an unprivileged caller sees a running server as "inactive".
+# The fallback is server-specific, so it only applies to that service.
+SERVER_PROCESS="${PALWARDEN_SERVER_PROCESS:-PalServer-Linux-Shipping}"
+svstat_works() { s6-svstat "$svcdir" >/dev/null 2>&1; }
+is_server_svc() { [[ "$svc" == "palworld-server" ]]; }
+
+svc_up() {
+  if svstat_works; then
+    s6-svstat "$svcdir" 2>/dev/null | grep -q '^up'
+  elif is_server_svc; then
+    pgrep -f "$SERVER_PROCESS" >/dev/null 2>&1
+  else
+    return 1
+  fi
+}
+
+svc_pid() {
+  local pid=""
+  if svstat_works; then
+    pid="$(s6-svstat "$svcdir" 2>/dev/null | grep -oE 'pid [0-9]+' | grep -oE '[0-9]+' | head -1)"
+  elif is_server_svc; then
+    pid="$(pgrep -f "$SERVER_PROCESS" 2>/dev/null | head -1)"
+  fi
+  printf '%s' "$pid"
+}
 # s6-svstat reports "up (pid N pgid N) S seconds"; S is the service's uptime.
 svc_uptime_seconds() { s6-svstat "$svcdir" 2>/dev/null | grep -oE '[0-9]+ seconds' | grep -oE '^[0-9]+'; }
 

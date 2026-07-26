@@ -1,0 +1,8 @@
+[Unit]
+Description=Record Palworld service restarts and outages
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/palworld-service-events sample
