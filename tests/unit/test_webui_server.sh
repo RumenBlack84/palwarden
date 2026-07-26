@@ -129,4 +129,27 @@ assert_file_not_contains "$REAL_ROOT/palwarden.html" "WEBUI_PASSWORD" "no creden
 # and the vendored editors must remain untouched
 assert_rc 0 git -C "$DIR/../.." diff --quiet -- webui/PalWorldSettingsEditor.html webui/EngineIniPerformanceEditor.html
 
+# --- payloadError() handles the API's {ok: false} convention ---------------
+# The API reports tool failures as HTTP 200 with {ok: false, error: "..."} so
+# one broken tool doesn't blank the whole dashboard. Extract the real
+# payloadError() function from the page and exercise it under node, rather
+# than trusting a source grep.
+if command -v node >/dev/null 2>&1; then
+  PE_JS="$WORK/payloadError.js"
+  awk '/^function payloadError/{f=1} f{print} f && /^}/{exit}' "$REAL_ROOT/palwarden.html" > "$PE_JS"
+  cat >> "$PE_JS" <<'EOF'
+
+let failures = 0;
+function check(desc, cond) { if (!cond) { failures++; console.log("FAIL: " + desc); } }
+check("ok:false carries the error message", (payloadError({ok: false, error: "boom"}) || "").includes("boom"));
+check("null payload is an error", typeof payloadError(null) === "string" && payloadError(null).length > 0);
+check("ok:true is usable", payloadError({ok: true, data: {}}) === null);
+console.log(failures === 0 ? "OK" : "FAIL");
+EOF
+  pe_out="$(node "$PE_JS" 2>&1)"
+  assert_eq "$pe_out" "OK" "payloadError() extracted from the page behaves correctly under node"
+else
+  fail "node not found; cannot exercise payloadError()"
+fi
+
 assert_report

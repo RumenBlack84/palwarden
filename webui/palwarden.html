@@ -80,6 +80,20 @@ async function get(path) {
   return res.json();
 }
 
+// Returns an error string when a payload is not usable, or null when it is.
+// The API reports tool failures as HTTP 200 with {ok: false, error: "..."}
+// so one broken tool doesn't blank the whole dashboard; callers must check
+// this in addition to res.ok.
+function payloadError(json) {
+  if (json === null || typeof json === "undefined" || typeof json !== "object") {
+    return "invalid response";
+  }
+  if (json.ok === false) {
+    return json.error || "request failed";
+  }
+  return null;
+}
+
 // rows: [label, value, state?] where state is "ok" | "warn" | "bad" | "idle".
 // A state renders the value as a pw-pill; the text is always present, so the
 // meaning never depends on color alone.
@@ -108,9 +122,21 @@ function text(id, value, empty) {
   el.classList.toggle("pw-empty", !!empty);
 }
 
+// Renders a pw-stats region (a <dl>) as a single pw-empty placeholder row,
+// used when a read failed (network error, non-2xx, or {ok: false}).
+function putEmpty(id, message) {
+  const dl = document.getElementById(id);
+  dl.innerHTML = "";
+  const dt = document.createElement("dt"); dt.textContent = "error";
+  const dd = document.createElement("dd"); dd.className = "pw-empty"; dd.textContent = message;
+  dl.append(dt, dd);
+}
+
 async function refresh() {
   try {
     const h = await get("/api/health");
+    const err = payloadError(h);
+    if (err) throw new Error(err);
     const d = h.data || {};
     const svc = d.service || {};
     const api = (d.api && d.api.metrics) || {};
@@ -121,40 +147,48 @@ async function refresh() {
       ["players", (api.currentplayernum ?? "?") + "/" + (api.maxplayernum ?? "?")],
       ["buildid", d.buildid || "unknown"],
     ]);
-  } catch (e) { put("server", [["error", String(e), "bad"]]); }
+  } catch (e) { putEmpty("server", String(e && e.message || e)); }
 
   try {
     const f = await get("/api/fps?window=24h");
+    const err = payloadError(f);
+    if (err) throw new Error(err);
     const w = ((f.data || {}).windows || {})["24h"] || {};
     put("fps", [
       ["avg (24h)", w.avg ?? "n/a"],
       ["1% low", w.low_1 ?? w["1%_low"] ?? "n/a"],
       ["samples", w.samples ?? "n/a"],
     ]);
-  } catch (e) { put("fps", [["error", String(e), "bad"]]); }
+  } catch (e) { putEmpty("fps", String(e && e.message || e)); }
 
   try {
     const s = await get("/api/service-events?since=24h");
+    const err = payloadError(s);
+    if (err) throw new Error(err);
     const d = s.data || s;
     put("events", [
       ["restarts (24h)", d.restarts ?? "n/a"],
       ["unexpected", d.unexpected ?? "n/a", (d.unexpected > 0) ? "warn" : "ok"],
       ["outages", d.outages ?? "n/a", (d.outages > 0) ? "warn" : "ok"],
     ]);
-  } catch (e) { put("events", [["error", String(e), "bad"]]); }
+  } catch (e) { putEmpty("events", String(e && e.message || e)); }
 
   try {
     const e = await get("/api/engine");
+    const err = payloadError(e);
+    if (err) throw new Error(err);
     text("engine", (e.drift_ok ? "OK — " : "DRIFT — ") + (e.text || ""));
-  } catch (e) { text("engine", String(e), true); }
+  } catch (e) { text("engine", String(e && e.message || e), true); }
 
   for (const [id, path] of [["backups", "/api/backups"], ["snapshots", "/api/snapshots"]]) {
     try {
       const r = await get(path);
+      const err = payloadError(r);
+      if (err) throw new Error(err);
       const list = r.data || [];
       if (list.length) text(id, list.map(x => x.name).join("\n"));
       else text(id, "(none)", true);
-    } catch (e) { text(id, String(e), true); }
+    } catch (e) { text(id, String(e && e.message || e), true); }
   }
 }
 
