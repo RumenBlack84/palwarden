@@ -49,6 +49,25 @@ Plain `docker stop` (Docker's **10s** default) is only safe if the world saves
 in under ~10s; for anything larger it may cut the save short. Compose is
 configured with a 120s grace, so `docker compose down/stop` is the safe path.
 
+### Config overwrite protection (`chattr +i`)
+
+Palworld rewrites `PalWorldSettings.ini` / `Engine.ini` when the server shuts
+down, which silently reverts managed settings. The tooling therefore leaves those
+files **immutable** after applying config (unlock → write → relock).
+
+That needs `CAP_LINUX_IMMUTABLE`, which Docker does not grant by default, so
+`compose.yaml` adds it:
+
+```yaml
+    cap_add:
+      - LINUX_IMMUTABLE
+```
+
+Verified working on named volumes. Remove it if you would rather not grant the
+capability — the tooling then **warns and runs unprotected** rather than failing.
+Manual control: `palworld-config-protect {status|lock|unlock}` and
+`palworld-engine-config {lock|unlock}`.
+
 ### Host-ism shims
 
 The tooling was written for a systemd host. Two shims (installed only in the

@@ -93,6 +93,13 @@ via env (as the existing scripts do). Fixtures live in `tests/fixtures/`.
 - **Named-volume ownership**: pre-create paths in the image owned by `steam` so
   fresh volumes inherit it; never recursively `chown` a mounted volume at runtime
   (see runbook §11).
+- **Config overwrite protection**: Palworld rewrites its own config on shutdown,
+  so managed files are left `chattr +i`. Any write path must **unlock → write →
+  relock** (see `lib/palworld-fileattr`, `palworld-config-apply-env`,
+  `palworld-engine-config`). It needs e2fsprogs **and** `CAP_LINUX_IMMUTABLE`,
+  which containers lack by default — so immutability must always degrade to a
+  warning, never block the write. `subprocess.run(check=False)` does **not** catch
+  a *missing* binary; you need `except FileNotFoundError/OSError`.
 - A **real embedded boot** (multi-GB SteamCMD download) has not been run E2E;
   increments were verified with dummy servers + a REST stub.
 

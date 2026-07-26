@@ -25,6 +25,11 @@ integration tests as separate jobs on every push / PR.
     with a fake SteamCMD and manifest (check paths only; no update applied).
   - `test_public_info.sh` — `palworld-public-info-watch` reads config / resolves
     IP / writes the join-info state file, with fake `curl`/`sudo`.
+  - `test_immutable.sh` — `chattr +i` overwrite protection: the shared
+    `lib/palworld-fileattr` helpers, `palworld-engine-config`'s immutability
+    functions, the apply-env unlock→write→relock flow, `palworld-config-protect`,
+    and — most importantly — that all of it **degrades gracefully** (still writes
+    the config) where the immutable bit is unavailable. Uses fake `chattr`/`lsattr`.
   - `test_config_parser.sh` — `palworld-config-parser`: env→INI key resolution
     (including PascalCase quirks and the exceptions table), quoting/escaping,
     enum + boolean + numeric handling, rejection of structure-breaking values,

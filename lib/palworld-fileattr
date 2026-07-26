@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Brian Grant
+#
+# Linux immutable-bit (chattr +i) helpers, sourced like palworld-notify.
+#
+# Palworld rewrites its own config files when the server shuts down, which
+# silently reverts managed settings. Locking a file with `chattr +i` after
+# writing it prevents that; the write path must unlock, write, then relock.
+#
+# Everything here DEGRADES GRACEFULLY: where the immutable bit is unavailable —
+# a container without e2fsprogs or without CAP_LINUX_IMMUTABLE, or a filesystem
+# that does not support it — these functions warn once and report "not
+# immutable" rather than failing. Losing the protection is acceptable; failing
+# to write the config is not.
+
+# fileattr_supported -> 0 if both tools are present
+fileattr_supported() {
+  command -v lsattr >/dev/null 2>&1 && command -v chattr >/dev/null 2>&1
+}
+
+_fileattr_warned=0
+_fileattr_warn() {
+  [[ "${_fileattr_warned:-0}" == "1" ]] && return 0
+  _fileattr_warned=1
+  echo "note: immutable-bit protection unavailable here ($1); config is still written but not locked." >&2
+}
+
+# fileattr_is_immutable <path> -> 0 when the immutable bit is set
+fileattr_is_immutable() {
+  local path="$1"
+  [[ -e "$path" ]] || return 1
+  if ! fileattr_supported; then
+    _fileattr_warn "chattr/lsattr not installed"
+    return 1
+  fi
+  local attrs
+  attrs="$(lsattr -d -- "$path" 2>/dev/null | awk '{print $1; exit}')" || return 1
+  [[ "$attrs" == *i* ]]
+}
+
+# fileattr_set_immutable <path> on|off -> always succeeds
+fileattr_set_immutable() {
+  local path="$1" state="${2:-on}" flag
+  [[ -e "$path" ]] || return 0
+  if ! fileattr_supported; then
+    _fileattr_warn "chattr/lsattr not installed"
+    return 0
+  fi
+  [[ "$state" == "on" ]] && flag="+i" || flag="-i"
+  if ! chattr "$flag" -- "$path" 2>/dev/null; then
+    _fileattr_warn "chattr $flag was refused (missing CAP_LINUX_IMMUTABLE?)"
+  fi
+  return 0
+}

@@ -46,6 +46,11 @@ Then run:
 sudo /usr/local/sbin/palworld-config-apply-env
 sudo systemctl restart palworld.service
 
+Note: after a successful apply the tooling leaves PalWorldSettings.ini immutable
+(chattr +i) so the server cannot revert your settings when it shuts down. Use
+`sudo palworld-config-protect unlock` before editing the file by hand, or pass
+`--no-protect` to apply-env to leave it mutable. See docs/tools.md.
+
 The wrapper backs up the current config to:
 
 - /opt/palworld/config-backups/

@@ -130,7 +130,8 @@ if [[ "$MODE" == "embedded" ]]; then
   # can chown to steam; best-effort so a parser hiccup never blocks boot.
   if [[ -n "${ADMIN_PASSWORD:-}" ]] || compgen -e | grep -q '^PALWORLD_CFG_'; then
     log "Applying settings.env to PalWorldSettings.ini..."
-    PALWORLD_USER=steam PALWORLD_GROUP=steam /usr/local/sbin/palworld-config-apply-env \
+    # PALWORLD_USER/GROUP come from the image env (steam).
+    /usr/local/sbin/palworld-config-apply-env \
       || log "config apply reported an issue (continuing)."
   fi
 

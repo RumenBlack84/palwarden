@@ -18,11 +18,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
-ENGINE_INI = Path("/opt/palworld/server/Pal/Saved/Config/LinuxServer/Engine.ini")
-ENGINE_ENV = Path("/etc/palworld/engine.env")
-BACKUP_DIR = Path("/opt/palworld/config-backups")
-PRETTY_INI = Path("/opt/palworld/server/Pal/Saved/Config/LinuxServer/Engine.pretty.ini")
+# Paths default to the bare-metal layout; the env overrides let the container
+# (and the tests) point at a different tree.
+ENGINE_INI = Path(os.environ.get(
+    "PALWORLD_ENGINE_INI",
+    "/opt/palworld/server/Pal/Saved/Config/LinuxServer/Engine.ini"))
+ENGINE_ENV = Path(os.environ.get("PALWORLD_ENGINE_ENV", "/etc/palworld/engine.env"))
+BACKUP_DIR = Path(os.environ.get("PALWORLD_BACKUP_DIR", "/opt/palworld/config-backups"))
+PRETTY_INI = Path(os.environ.get(
+    "PALWORLD_ENGINE_PRETTY_INI",
+    "/opt/palworld/server/Pal/Saved/Config/LinuxServer/Engine.pretty.ini"))
 NOTIFY = "/usr/local/lib/palworld-notify"
+FPS_BIN = os.environ.get("PALWORLD_FPS_BIN", "/usr/local/sbin/palworld-fps")
 
 
 @dataclass(frozen=True)
@@ -276,10 +283,14 @@ def notify(message: str) -> None:
 
 
 def mark_event(label: str, category: str = "config", details: str | None = None) -> None:
-    cmd = ["/usr/local/sbin/palworld-fps", "mark", label, "--category", category]
+    """Record an FPS event marker. Purely decorative: never break a config apply."""
+    cmd = [FPS_BIN, "mark", label, "--category", category]
     if details:
         cmd.extend(["--details", details])
-    subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass  # telemetry helper missing (e.g. not installed yet)
 
 
 def parse_ini_values(text: str) -> dict[str, str]:
@@ -339,19 +350,48 @@ def match_profile(values: dict[str, str]) -> dict[str, object]:
     return best
 
 
-def _run_attr_command(cmd: list[str], runner=subprocess.run) -> subprocess.CompletedProcess:
-    return runner(cmd, check=True, text=True, capture_output=True)
+_ATTR_WARNED = False
+
+
+def _attr_unavailable(reason: str) -> None:
+    """Warn once that the immutable bit cannot be managed here."""
+    global _ATTR_WARNED
+    if not _ATTR_WARNED:
+        _ATTR_WARNED = True
+        print(f"note: immutable-bit protection unavailable here ({reason}); "
+              "Engine.ini is still written but not locked.", file=sys.stderr)
+
+
+def _run_attr_command(cmd: list[str], runner=subprocess.run):
+    """Run lsattr/chattr, returning None when it is unavailable or refused.
+
+    The immutable bit needs e2fsprogs and CAP_LINUX_IMMUTABLE, neither of which a
+    container has by default. Protection is best-effort: never let its absence
+    stop us from writing the config.
+    """
+    try:
+        return runner(cmd, check=True, text=True, capture_output=True)
+    except FileNotFoundError:
+        _attr_unavailable(f"{cmd[0]} not installed")
+    except subprocess.CalledProcessError as exc:
+        detail = (getattr(exc, "stderr", "") or "").strip() or f"{cmd[0]} failed"
+        _attr_unavailable(detail)
+    except OSError as exc:
+        _attr_unavailable(str(exc))
+    return None
 
 
 def file_is_immutable(path: Path, runner=subprocess.run) -> bool:
     """Return True when lsattr shows the immutable bit for path."""
-    result = _run_attr_command(["lsattr", "--", str(path)], runner=runner)
+    result = _run_attr_command(["lsattr", "-d", "--", str(path)], runner=runner)
+    if result is None:
+        return False
     attrs = result.stdout.split(maxsplit=1)[0] if result.stdout.strip() else ""
     return "i" in attrs
 
 
 def set_immutable(path: Path, enabled: bool, runner=subprocess.run) -> None:
-    """Set or clear the Linux immutable bit on path."""
+    """Set or clear the Linux immutable bit on path (best effort)."""
     flag = "+i" if enabled else "-i"
     _run_attr_command(["chattr", flag, "--", str(path)], runner=runner)
 
