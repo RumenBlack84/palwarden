@@ -60,12 +60,17 @@ Layered, because page loads and API calls need different mechanisms.
 1. **HTTP Basic auth on every path**, static pages included. Nothing is viewable
    without credentials; the browser prompts once. Compared with constant-time
    digests (`hmac.compare_digest`) to avoid timing leaks.
-2. **Mutating endpoints additionally require `Authorization: Bearer <token>`.**
+2. **Mutating endpoints additionally require the token in `X-Palwarden-Token`.**
    This is the CSRF defence: with Basic alone the browser would attach
    credentials to a cross-origin POST, but a cross-origin page cannot set a
    custom header without a CORS preflight, which we never grant. The control
    panel supplies the token from `sessionStorage` (same-origin JS can; an
    attacker's page cannot read it).
+
+   The token travels in its own header rather than `Authorization: Bearer`
+   because Basic auth already occupies `Authorization` on every request — the two
+   schemes cannot share one header. A custom header is exactly as CSRF-safe: the
+   preflight requirement, not the scheme name, is what an attacker cannot satisfy.
 3. **Origin / `Sec-Fetch-Site` validation on mutations.** Reject anything whose
    `Origin` is present and not our own; reject `Sec-Fetch-Site: cross-site`.
    Defeats DNS rebinding.
@@ -114,9 +119,9 @@ state, live players, FPS windows, engine drift, buildid, disk, detected
 restarts). Wrapping the text output would duplicate that for no gain.
 
 Mutating: `POST /api/jobs` with `{"action": "...", "params": {...}}` (Basic +
-Bearer + Origin checks) → `202 {"id": "..."}`.
+`X-Palwarden-Token` + Origin checks) → `202 {"id": "..."}`.
 
-Status codes: `401` missing/bad Basic · `403` missing Bearer or bad Origin ·
+Status codes: `401` missing/bad Basic · `403` missing/bad token or bad Origin ·
 `400` validation failure · `404` unknown path/job · `409` a disruptive job is
 already pending · `500` internal. `/api/*` errors are JSON.
 
@@ -290,7 +295,7 @@ server disagreeing with no indication in the UI.
 
 **Unit** (no docker, per repo convention):
 * Auth: no credentials → 401; wrong password → 401; correct Basic on a read →
-  200; mutation without Bearer → 403; with Bearer → 202; cross-site `Origin` →
+  200; mutation without the token header → 403; with it → 202; cross-site `Origin` →
   403.
 * Refusal to start as root; refusal to start without credentials.
 * Param validation: label/message/wait/backup rejection, including shell
