@@ -12,7 +12,6 @@ import re
 import shutil
 import subprocess
 import sys
-from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,6 +29,9 @@ PRETTY_INI = Path(os.environ.get(
     "/opt/palworld/server/Pal/Saved/Config/LinuxServer/Engine.pretty.ini"))
 NOTIFY = "/usr/local/lib/palworld-notify"
 FPS_BIN = os.environ.get("PALWORLD_FPS_BIN", "/usr/local/sbin/palworld-fps")
+# Owner of the managed files; the container overrides these to steam.
+PALWORLD_USER = os.environ.get("PALWORLD_USER", "palworld")
+PALWORLD_GROUP = os.environ.get("PALWORLD_GROUP", "palworld")
 
 
 @dataclass(frozen=True)
@@ -293,8 +295,14 @@ def mark_event(label: str, category: str = "config", details: str | None = None)
         pass  # telemetry helper missing (e.g. not installed yet)
 
 
-def parse_ini_values(text: str) -> dict[str, str]:
-    values: dict[str, str] = {}
+def parse_ini_values_multi(text: str) -> dict[str, list[str]]:
+    """Collect every occurrence of each managed key.
+
+    The game appends its own sections when it rewrites Engine.ini, so a managed
+    key can legitimately appear more than once; keeping all occurrences lets the
+    drift check flag a genuine conflict instead of silently taking the last one.
+    """
+    values: dict[str, list[str]] = {}
     env_by_section_key = {(s.section, s.key): s.env for s in SETTINGS}
     for section, lines in split_sections(text):
         if section is None:
@@ -306,8 +314,13 @@ def parse_ini_values(text: str) -> dict[str, str]:
             key, value = stripped.split("=", 1)
             env = env_by_section_key.get((section, key.strip()))
             if env:
-                values[env] = value.strip()
+                values.setdefault(env, []).append(value.strip())
     return values
+
+
+def parse_ini_values(text: str) -> dict[str, str]:
+    """Managed values from Engine.ini, last occurrence winning."""
+    return {env: raws[-1] for env, raws in parse_ini_values_multi(text).items()}
 
 
 def normalized_profile_values(profile: dict[str, str]) -> dict[str, str]:
@@ -350,79 +363,6 @@ def match_profile(values: dict[str, str]) -> dict[str, object]:
     return best
 
 
-_ATTR_WARNED = False
-
-
-def _attr_unavailable(reason: str) -> None:
-    """Warn once that the immutable bit cannot be managed here."""
-    global _ATTR_WARNED
-    if not _ATTR_WARNED:
-        _ATTR_WARNED = True
-        print(f"note: immutable-bit protection unavailable here ({reason}); "
-              "Engine.ini is still written but not locked.", file=sys.stderr)
-
-
-def _run_attr_command(cmd: list[str], runner=subprocess.run):
-    """Run lsattr/chattr, returning None when it is unavailable or refused.
-
-    The immutable bit needs e2fsprogs and CAP_LINUX_IMMUTABLE, neither of which a
-    container has by default. Protection is best-effort: never let its absence
-    stop us from writing the config.
-    """
-    try:
-        return runner(cmd, check=True, text=True, capture_output=True)
-    except FileNotFoundError:
-        _attr_unavailable(f"{cmd[0]} not installed")
-    except subprocess.CalledProcessError as exc:
-        detail = (getattr(exc, "stderr", "") or "").strip() or f"{cmd[0]} failed"
-        _attr_unavailable(detail)
-    except OSError as exc:
-        _attr_unavailable(str(exc))
-    return None
-
-
-def file_is_immutable(path: Path, runner=subprocess.run) -> bool:
-    """Return True when lsattr shows the immutable bit for path."""
-    result = _run_attr_command(["lsattr", "-d", "--", str(path)], runner=runner)
-    if result is None:
-        return False
-    attrs = result.stdout.split(maxsplit=1)[0] if result.stdout.strip() else ""
-    return "i" in attrs
-
-
-def set_immutable(path: Path, enabled: bool, runner=subprocess.run) -> None:
-    """Set or clear the Linux immutable bit on path (best effort)."""
-    flag = "+i" if enabled else "-i"
-    _run_attr_command(["chattr", flag, "--", str(path)], runner=runner)
-
-
-@contextmanager
-def mutable_engine_file(path: Path, protect: bool = True, runner=subprocess.run):
-    """Temporarily make Engine.ini mutable, then optionally leave it immutable.
-
-    If protect is true, the file is locked at the end even when it was mutable
-    at entry. If protect is false, only a file that was immutable at entry is
-    restored to immutable.
-    """
-    was_immutable = file_is_immutable(path, runner=runner) if path.exists() else False
-    if was_immutable:
-        set_immutable(path, False, runner=runner)
-    try:
-        yield
-    finally:
-        if protect or was_immutable:
-            set_immutable(path, True, runner=runner)
-
-
-def format_immutable_status(path: Path) -> str:
-    if not path.exists():
-        return "unknown (file missing)"
-    try:
-        return "yes" if file_is_immutable(path) else "no"
-    except Exception as exc:
-        return f"unknown ({exc})"
-
-
 def list_backups(backup_dir: Path) -> list[Path]:
     if not backup_dir.exists():
         return []
@@ -438,29 +378,28 @@ def resolve_backup(name: str, backup_dir: Path) -> Path:
     return backup
 
 
-def rollback_engine(name: str, ini_path: Path, backup_dir: Path, pretty_path: Path, save_current: bool = True, protect: bool = True) -> Path:
+def rollback_engine(name: str, ini_path: Path, backup_dir: Path, pretty_path: Path, save_current: bool = True) -> Path:
     backup = resolve_backup(name, backup_dir)
-    with mutable_engine_file(ini_path, protect=protect):
-        if save_current and ini_path.exists():
-            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            pre = backup_dir / f"Engine.ini.pre-rollback.{stamp}"
-            shutil.copy2(ini_path, pre)
-            try:
-                shutil.chown(pre, user="palworld", group="palworld")
-            except Exception:
-                pass
-        shutil.copy2(backup, ini_path)
+    if save_current and ini_path.exists():
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        pre = backup_dir / f"Engine.ini.pre-rollback.{stamp}"
+        shutil.copy2(ini_path, pre)
         try:
-            shutil.chown(ini_path, user="palworld", group="palworld")
+            shutil.chown(pre, user=PALWORLD_USER, group=PALWORLD_GROUP)
         except Exception:
             pass
-        os.chmod(ini_path, 0o644)
-        write_pretty(ini_path, pretty_path)
-        try:
-            shutil.chown(pretty_path, user="palworld", group="palworld")
-        except Exception:
-            pass
-        os.chmod(pretty_path, 0o644)
+    shutil.copy2(backup, ini_path)
+    try:
+        shutil.chown(ini_path, user=PALWORLD_USER, group=PALWORLD_GROUP)
+    except Exception:
+        pass
+    os.chmod(ini_path, 0o644)
+    write_pretty(ini_path, pretty_path)
+    try:
+        shutil.chown(pretty_path, user=PALWORLD_USER, group=PALWORLD_GROUP)
+    except Exception:
+        pass
+    os.chmod(pretty_path, 0o644)
     return backup
 
 
@@ -470,28 +409,80 @@ def expected_values_from_env(env_path: Path) -> dict[str, str]:
     return normalized_profile_values(parse_env(env_path))
 
 
-def check_expected_values(values: dict[str, str], expected: dict[str, str]) -> dict[str, object]:
-    missing = [env for env in expected if env not in values]
-    different = [
-        {"env": env, "expected": want, "actual": values.get(env)}
-        for env, want in expected.items()
-        if env in values and values.get(env) != want
-    ]
-    return {"ok": not missing and not different, "missing": missing, "different": different}
+def check_expected_values(raw_values: dict[str, list[str]], expected: dict[str, str]) -> dict[str, object]:
+    """Compare Engine.ini against the expected (already normalised) values.
+
+    Comparison is **semantic**, not textual: the game rewrites Engine.ini in its
+    own format, so `True` must equal `1` and `60.000000` must equal `60`. Both
+    sides are normalised before comparing, and a value we cannot parse is reported
+    as invalid rather than raising.
+    """
+    missing: list[str] = []
+    different: list[dict[str, object]] = []
+    invalid: list[dict[str, object]] = []
+    duplicates: list[dict[str, object]] = []
+
+    for env, want in expected.items():
+        raws = raw_values.get(env)
+        if not raws:
+            missing.append(env)
+            continue
+        setting = SETTING_BY_ENV[env]
+        normalised: list[str] = []
+        bad = False
+        for raw in raws:
+            try:
+                normalised.append(normalize_value(setting, raw))
+            except ValueError as exc:
+                invalid.append({"env": env, "actual": raw, "reason": str(exc)})
+                bad = True
+        if bad:
+            continue
+        distinct = sorted(set(normalised))
+        if len(distinct) > 1:
+            duplicates.append({"env": env, "values": raws})
+            continue
+        if distinct[0] != want:
+            different.append({"env": env, "expected": want, "actual": raws[-1]})
+
+    ok = not (missing or different or invalid or duplicates)
+    return {
+        "ok": ok,
+        "missing": missing,
+        "different": different,
+        "invalid": invalid,
+        "duplicates": duplicates,
+        "empty": not raw_values,
+    }
 
 
-def format_check(check: dict[str, object]) -> str:
+def format_check(check: dict[str, object], ini_path: Path | None = None) -> str:
     if check.get("ok"):
         return "Engine.ini check OK: managed values match /etc/palworld/engine.env."
+    where = f" in {ini_path}" if ini_path else ""
+    if check.get("empty"):
+        return (f"Engine.ini check FAILED: no managed values{where}. "
+                "The server may have reset the file (it writes only non-default "
+                "values); re-apply with `palworld-engine-config apply`.")
     lines = ["Engine.ini check FAILED: managed values drifted from /etc/palworld/engine.env."]
     missing = check.get("missing") or []
     different = check.get("different") or []
+    invalid = check.get("invalid") or []
+    duplicates = check.get("duplicates") or []
     if missing:
         lines.append("Missing: " + ", ".join(missing))
     if different:
         lines.append("Different:")
         for item in different:
             lines.append(f"- {item['env']}: expected {item['expected']}, actual {item['actual']}")
+    if invalid:
+        lines.append("Unparseable (cannot compare):")
+        for item in invalid:
+            lines.append(f"- {item['env']}: actual {item['actual']!r} ({item['reason']})")
+    if duplicates:
+        lines.append("Defined more than once with conflicting values:")
+        for item in duplicates:
+            lines.append(f"- {item['env']}: " + ", ".join(str(v) for v in item["values"]))
     return "\n".join(lines)
 
 
@@ -514,7 +505,6 @@ def format_status(ini_path: Path, backup_dir: Path) -> str:
             lines.append("  Extra managed values: " + ", ".join(match.get("extra", [])))
     lines.append("")
     lines.append("Protection:")
-    lines.append(f"- Engine.ini immutable: {format_immutable_status(ini_path)}")
     lines.append("")
     lines.append("Managed values:")
     for setting in SETTINGS:
@@ -542,9 +532,9 @@ def command_status(args: argparse.Namespace) -> int:
         if not expected:
             print(f"Engine.ini check FAILED: no managed values found in {args.env}", file=sys.stderr)
             return 2
-        values = parse_ini_values(ini_path.read_text(errors="replace"))
+        values = parse_ini_values_multi(ini_path.read_text(errors="replace"))
         check = check_expected_values(values, expected)
-        print(format_check(check))
+        print(format_check(check, ini_path))
         return 0 if check.get("ok") else 1
     print(format_status(ini_path, backup_dir))
     return 0
@@ -575,10 +565,9 @@ def command_rollback(args: argparse.Namespace) -> int:
         print(f"Would restore {backup} to {ini_path}")
         print("Dry run only; no files changed.")
         return 0
-    restored = rollback_engine(args.backup, ini_path, backup_dir, pretty_path, protect=not args.no_protect)
+    restored = rollback_engine(args.backup, ini_path, backup_dir, pretty_path)
     print(f"Restored {restored} to {ini_path}")
     print(f"Regenerated {pretty_path}")
-    print(f"Engine.ini immutable protection: {'enabled' if not args.no_protect else 'disabled'}")
     print("Restart palworld.service for Engine.ini rollback to take effect.")
     notify(f"Engine.ini rollback restored `{restored.name}`. Restart palworld.service for rollback to take effect.")
     mark_event("Engine.ini rollback applied", details=f"restored={restored.name}")
@@ -610,7 +599,6 @@ def command_apply(args: argparse.Namespace) -> int:
     backup_dir.mkdir(parents=True, exist_ok=True)
     backup = backup_dir / f"Engine.ini.{stamp}"
     if not args.dry_run:
-        with mutable_engine_file(ini_path, protect=not args.no_protect):
             shutil.copy2(ini_path, backup)
             ini_path.write_text(after)
             try:
@@ -632,7 +620,6 @@ def command_apply(args: argparse.Namespace) -> int:
         return 0
     print(f"Updated {ini_path}")
     print(f"Backup: {backup}")
-    print(f"Engine.ini immutable protection: {'enabled' if not args.no_protect else 'disabled'}")
     print("Restart palworld.service for Engine.ini changes to take effect.")
     notify(f"Engine.ini performance config applied; backup: `{backup.name}`. Restart palworld.service for changes to take effect.\n\n{summary}")
     mark_event("Engine.ini performance config applied", details=f"backup={backup.name}; changes={len(changes)}")
@@ -674,26 +661,6 @@ def command_template(_: argparse.Namespace) -> int:
     return 0
 
 
-def command_lock(args: argparse.Namespace) -> int:
-    ini_path = Path(args.ini)
-    if not ini_path.exists():
-        print(f"Cannot read {ini_path}", file=sys.stderr)
-        return 1
-    set_immutable(ini_path, True)
-    print(f"Locked {ini_path} with chattr +i")
-    return 0
-
-
-def command_unlock(args: argparse.Namespace) -> int:
-    ini_path = Path(args.ini)
-    if not ini_path.exists():
-        print(f"Cannot read {ini_path}", file=sys.stderr)
-        return 1
-    set_immutable(ini_path, False)
-    print(f"Unlocked {ini_path} with chattr -i")
-    return 0
-
-
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -703,7 +670,6 @@ def main() -> int:
     p.add_argument("--backup-dir", default=str(BACKUP_DIR))
     p.add_argument("--pretty", default=str(PRETTY_INI))
     p.add_argument("--dry-run", action="store_true")
-    p.add_argument("--no-protect", action="store_true", help="leave Engine.ini mutable after writing instead of applying chattr +i")
     p.set_defaults(func=command_apply)
     p = sub.add_parser("pretty")
     p.add_argument("--ini", default=str(ENGINE_INI))
@@ -728,14 +694,7 @@ def main() -> int:
     p.add_argument("--ini", default=str(ENGINE_INI))
     p.add_argument("--backup-dir", default=str(BACKUP_DIR))
     p.add_argument("--pretty", default=str(PRETTY_INI))
-    p.add_argument("--no-protect", action="store_true", help="leave Engine.ini mutable after rollback instead of applying chattr +i")
     p.set_defaults(func=command_rollback)
-    p = sub.add_parser("lock", help="set chattr +i on Engine.ini")
-    p.add_argument("--ini", default=str(ENGINE_INI))
-    p.set_defaults(func=command_lock)
-    p = sub.add_parser("unlock", help="clear chattr -i on Engine.ini")
-    p.add_argument("--ini", default=str(ENGINE_INI))
-    p.set_defaults(func=command_unlock)
     args = ap.parse_args()
     return int(args.func(args))
 

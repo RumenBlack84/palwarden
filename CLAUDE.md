@@ -104,19 +104,21 @@ via env (as the existing scripts do). Fixtures live in `tests/fixtures/`.
 - **Named-volume ownership**: pre-create paths in the image owned by `steam` so
   fresh volumes inherit it; never recursively `chown` a mounted volume at runtime
   (see runbook §11).
-- **Config overwrite protection**: Palworld rewrites its own config on shutdown,
-  so managed files are left `chattr +i`. Any write path must **unlock → write →
-  relock** (see `lib/palworld-fileattr`, `palworld-config-apply-env`,
-  `palworld-engine-config`). It needs e2fsprogs **and** `CAP_LINUX_IMMUTABLE`,
-  which containers lack by default — so immutability must always degrade to a
-  warning, never block the write. `subprocess.run(check=False)` does **not** catch
-  a *missing* binary; you need `except FileNotFoundError/OSError`.
-- **A `chattr +i` file blocks volume deletion.** `docker compose down -v` fails
-  with "operation not permitted" while config is locked — unlock first (see
-  `docker/README.md`). Tests that create locked files must clear the bit in their
-  cleanup or they leak volumes.
-- A **real embedded boot** (multi-GB SteamCMD download) has not been run E2E;
-  increments were verified with dummy servers + a REST stub.
+- **Palworld rewrites config but preserves values.** Measured on v1.0.1 (empty
+  world, 4 restarts, files mutable): every custom value survived and all 119 keys
+  were retained; the game normalises `PalWorldSettings.ini` and expands
+  `Engine.ini` with its own sections. So we do **not** use `chattr +i` — an
+  earlier version did, and it needed `CAP_LINUX_IMMUTABLE` + e2fsprogs and broke
+  `docker compose down -v`. A config of *only defaults* is truncated to one
+  newline on first start (Unreal writes only non-defaults) — harmless, but it
+  looks like a wipe.
+- **Drift checks must compare semantically**, not textually: the game reformats
+  values, so normalise both sides (`True` == `1`, `60.000000` == `60`) — see
+  `palworld-engine-config`'s check.
+- Most tests use dummy servers + a REST stub. A **real embedded boot** (multi-GB
+  SteamCMD download) has been verified manually against **v1.0.1.100619**: game
+  installs, server boots, REST healthy, env config applied, graceful save-on-stop,
+  and config survives repeated restarts.
 
 ## Commits
 

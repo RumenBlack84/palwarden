@@ -59,12 +59,6 @@ services:
       nofile:
         soft: 100000
         hard: 100000
-    # Lets the tooling set chattr +i on managed config (PalWorldSettings.ini and
-    # Engine.ini) so Palworld cannot revert it when the server shuts down.
-    # Remove this if you would rather not grant the capability — the tooling then
-    # warns and runs unprotected instead of failing.
-    cap_add:
-      - LINUX_IMMUTABLE
     restart: on-failure
 
   # External: the same image, tooling only, targeting an existing server.

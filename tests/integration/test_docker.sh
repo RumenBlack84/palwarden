@@ -109,37 +109,33 @@ assert_contains "$svcF" "public-info-watch" "F: public-info-watch enabled by PUB
 assert_not_contains "$svcA" "update-check" "F: update-check off by default"
 assert_not_contains "$svcA" "public-info-watch" "F: public-info-watch off by default"
 
-# --- Scenario G: config protection (chattr +i) in the container -------------
-# Palworld reverts managed config on shutdown, so apply-env locks the file. This
-# needs CAP_LINUX_IMMUTABLE; without it the tooling must warn and carry on.
-# G1: with the capability -> the settings file ends up immutable.
-run_c pw-it-g1 --cap-add LINUX_IMMUTABLE -e PALWARDEN_MODE=embedded -e UPDATE_ON_START=false \
-  -e ADMIN_PASSWORD=x -v "$FAKE":/opt/palworld/server "$IMG"
-wait_up pw-it-g1 palworld-server || fail "G1: server did not come up"
-attrs="$(docker exec pw-it-g1 lsattr -d /opt/palworld/server/Pal/Saved/Config/LinuxServer/PalWorldSettings.ini 2>/dev/null | awk '{print $1}')"
-assert_contains "$attrs" "i" "G1: PalWorldSettings.ini locked with chattr +i"
-# a locked file must still be re-appliable (unlock -> write -> relock)
-out="$(docker exec --user root pw-it-g1 palworld-config-apply-env 2>&1)"; rc=$?
-assert_eq "$rc" "0" "G1: re-apply succeeds through the lock"
-assert_not_contains "$out" "Operation not permitted" "G1: no permission error on re-apply"
-# manual control works too
-assert_contains "$(docker exec pw-it-g1 palworld-config-protect status)" "yes" "G1: protect status reports locked"
-docker exec --user root pw-it-g1 palworld-config-protect unlock >/dev/null 2>&1
-assert_contains "$(docker exec pw-it-g1 palworld-config-protect status)" "no" "G1: protect unlock works"
-
-# G2: engine-config apply must work (this used to crash on a missing lsattr) and,
-# without the capability, must still write the value while warning.
-run_c pw-it-g2 -e PALWARDEN_MODE=embedded -e UPDATE_ON_START=false \
+# --- Scenario G: managed config is left mutable, and engine-config works ------
+# We deliberately do NOT lock config (chattr +i): a real-server test showed
+# Palworld v1.0.1 rewrites both files but preserves every value, so protection is
+# unnecessary. engine-config apply must work regardless (it used to crash here on
+# a missing lsattr).
+run_c pw-it-g -e PALWARDEN_MODE=embedded -e UPDATE_ON_START=false -e ADMIN_PASSWORD=x \
   -v "$FAKE":/opt/palworld/server "$IMG"
-wait_up pw-it-g2 palworld-server || fail "G2: server did not come up"
-docker exec --user root pw-it-g2 sh -c '
+wait_up pw-it-g palworld-server || fail "G: server did not come up"
+docker exec pw-it-g sh -c 'sleep 1'
+# nothing should be immutable (and the image no longer even ships chattr)
+out="$(docker exec pw-it-g sh -c 'command -v chattr || true' 2>/dev/null)"
+assert_eq "$out" "" "G: chattr not installed (no immutability machinery)"
+out="$(docker exec --user root pw-it-g palworld-config-apply-env 2>&1)"; rc=$?
+assert_eq "$rc" "0" "G: config apply succeeds"
+assert_not_contains "$out" "Operation not permitted" "G: no permission error"
+# engine-config apply writes its value and does not traceback
+docker exec --user root pw-it-g sh -c '
   mkdir -p /etc/palworld
   printf "[/Script/Engine.Engine]\nNetServerMaxTickRate=30\n" > /opt/palworld/server/Pal/Saved/Config/LinuxServer/Engine.ini
   printf "NET_SERVER_MAX_TICK_RATE=60\n" > /etc/palworld/engine.env' >/dev/null 2>&1
-out="$(docker exec --user root pw-it-g2 palworld-engine-config apply 2>&1)"; rc=$?
-assert_eq "$rc" "0" "G2: engine-config apply exits 0 without CAP_LINUX_IMMUTABLE"
-assert_not_contains "$out" "Traceback" "G2: engine-config apply does not traceback"
-assert_rc 0 docker exec pw-it-g2 grep -qF "NetServerMaxTickRate=60" \
+out="$(docker exec --user root pw-it-g palworld-engine-config apply 2>&1)"; rc=$?
+assert_eq "$rc" "0" "G: engine-config apply exits 0"
+assert_not_contains "$out" "Traceback" "G: engine-config apply does not traceback"
+assert_rc 0 docker exec pw-it-g grep -qF "NetServerMaxTickRate=60" \
   /opt/palworld/server/Pal/Saved/Config/LinuxServer/Engine.ini
+# and the drift check agrees the applied values are in place
+out="$(docker exec --user root pw-it-g palworld-engine-config status --check 2>&1)"; rc=$?
+assert_eq "$rc" "0" "G: drift check passes right after apply"
 
 assert_report

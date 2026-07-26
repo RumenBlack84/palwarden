@@ -6,28 +6,12 @@ source /usr/local/lib/palworld-notify 2>/dev/null || true
 # Notifications are optional: without the helper installed, no-op rather than
 # aborting the apply on "command not found".
 declare -F palworld_notify >/dev/null || palworld_notify() { :; }
-# Immutable-bit helpers; fall back to the repo copy when not installed yet.
-# shellcheck source=../lib/palworld-fileattr
-source /usr/local/lib/palworld-fileattr 2>/dev/null \
-  || source "$(dirname "${BASH_SOURCE[0]}")/../lib/palworld-fileattr"
 # Paths default to the bare-metal layout; overrides exist for the container/tests.
 config_env="${PALWORLD_SETTINGS_ENV:-/etc/palworld/settings.env}"
 server_dir="${PALWORLD_SERVER_DIR:-/opt/palworld/server}"
 config_file="${PALWORLD_CONFIG_FILE:-$server_dir/Pal/Saved/Config/LinuxServer/PalWorldSettings.ini}"
 backup_dir="${PALWORLD_BACKUP_DIR:-/opt/palworld/config-backups}"
 parser_bin="${PALWORLD_PARSER_BIN:-/usr/local/bin/palworld-config-parser}"
-# Palworld rewrites its config on shutdown, reverting managed settings, so the
-# file is left immutable (chattr +i) after a successful apply. --no-protect skips
-# that. Where the immutable bit is unavailable (containers) this degrades to a
-# warning; see lib/palworld-fileattr.
-protect=1
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --no-protect) protect=0; shift ;;
-    -h|--help) echo "Usage: $0 [--no-protect]"; exit 0 ;;
-    *) echo "Usage: $0 [--no-protect]" >&2; exit 64 ;;
-  esac
-done
 # Owner of the server files. Defaults to the bare-metal `palworld` service
 # account; the container overrides this to `steam`.
 PALWORLD_USER="${PALWORLD_USER:-palworld}"
@@ -49,20 +33,6 @@ stamp=$(date -u +%Y%m%dT%H%M%SZ)
 backup="$backup_dir/PalWorldSettings.ini.$stamp"
 cp -a "$config_file" "$backup"
 chown "$PALWORLD_USER:$PALWORLD_GROUP" "$backup"
-# Unlock before writing (a previous apply, or the operator, may have locked it)
-# and make sure we relock on the way out even if something below fails.
-was_immutable=0
-if fileattr_is_immutable "$config_file"; then
-  was_immutable=1
-  fileattr_set_immutable "$config_file" off
-fi
-relock() {
-  if [[ "$protect" -eq 1 || "$was_immutable" -eq 1 ]]; then
-    fileattr_set_immutable "$config_file" on
-  fi
-}
-trap relock EXIT
-
 # Apply every setting (including passwords) in one pass. The parser redacts
 # secret values in its own output, so no log scrubbing is needed here.
 "$parser_bin" --config "$config_file" --env-file "$config_env"

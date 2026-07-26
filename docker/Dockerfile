@@ -24,10 +24,6 @@ ARG WITH_GRAPHS=true
 #   python3         - REST client, telemetry, config helpers, web UI server
 #   procps/iproute2 - pkill/ps/ss used by the scripts and stop handling
 #   util-linux      - flock used by the watchdog
-#   e2fsprogs       - chattr/lsattr, used to lock managed config (chattr +i) so
-#                     Palworld cannot revert it on shutdown. Also needs
-#                     CAP_LINUX_IMMUTABLE at runtime (see compose.yaml); without
-#                     it the tooling warns and continues unprotected.
 #   xz-utils        - extract the s6-overlay release tarballs
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -40,7 +36,6 @@ RUN apt-get update \
         procps \
         iproute2 \
         util-linux \
-        e2fsprogs \
     && if [ "$WITH_GRAPHS" = "true" ]; then \
          apt-get install -y --no-install-recommends python3-matplotlib; \
        fi \

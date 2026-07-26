@@ -84,7 +84,7 @@ See [`config-tools.md`](config-tools.md) for the full workflow narrative and
 example variables. Summary of the commands:
 
 ### `palworld-config-apply-env`
-`/usr/local/sbin/palworld-config-apply-env [--no-protect]`
+`/usr/local/sbin/palworld-config-apply-env`
 
 Reads `/etc/palworld/settings.env`, backs up the current `PalWorldSettings.ini`
 to `/opt/palworld/config-backups/`, then applies every setting (passwords
@@ -92,37 +92,17 @@ included) via `palworld-config-parser`. Regenerates the pretty INI, posts a
 redacted diff + settings summary, and records a config event marker.
 **Requires a service restart to take effect.**
 
-**Overwrite protection:** Palworld rewrites its own config when the server shuts
-down, silently reverting managed settings. So the flow is *unlock → write →
-relock*: the file is left **immutable (`chattr +i`)** after a successful apply
-(and relocked even if a later step fails). `--no-protect` leaves it mutable. Use
-[`palworld-config-protect`](#palworld-config-protect) for manual control. Where
-the immutable bit is unavailable — a container without `CAP_LINUX_IMMUTABLE` —
-this degrades to a warning and the config is still written.
-
-### `palworld-config-protect`
-`/usr/local/sbin/palworld-config-protect {status|lock|unlock}`
-
-Manual control of the immutable bit on `PalWorldSettings.ini` — the counterpart
-to `palworld-engine-config lock|unlock` for Engine.ini. `unlock` before editing
-the file by hand; `apply-env` handles locking automatically. Reports and exits 0
-(rather than failing) where the immutable bit is unavailable.
-
 ### `palworld-engine-config`
-`/usr/local/sbin/palworld-engine-config {apply|status|rollback|lock|unlock|pretty|diff|template} [...]`
+`/usr/local/sbin/palworld-engine-config {apply|status|rollback|pretty|diff|template} [...]`
 
 Manages `Engine.ini` performance levers from `/etc/palworld/engine.env`
 (tick rate, client/bandwidth limits, streaming/async options). `apply` backs up
-and writes managed values; `status` shows managed values + nearest profile match,
-the immutable state, and (`--check`) flags drift; `rollback` restores a prior
-backup. Records event markers. Reminds you to `graceful-restart` — it never
-restarts on its own.
+and writes managed values; `status` shows managed values + nearest profile match;
+`status --check` flags drift, comparing values *semantically* so the game's own
+reformatting (`True` vs `1`, `60.000000` vs `60`) is not mistaken for drift;
+`rollback` restores a prior backup. Records event markers. Reminds you to
+`graceful-restart` — it never restarts on its own.
 
-**Overwrite protection:** like the settings file, `Engine.ini` is left
-**immutable (`chattr +i`)** after `apply`/`rollback` so the server cannot revert
-it on shutdown (`--no-protect` opts out). `lock` / `unlock` give manual control.
-Unavailable immutability (container without `CAP_LINUX_IMMUTABLE`) degrades to a
-warning — the config is still written.
 
 ### `palworld-config-pretty`
 `/usr/local/sbin/palworld-config-pretty`
@@ -219,12 +199,6 @@ Installed to `/usr/local/lib`, not run directly.
   `PalWorldSettings.ini` files (`--discord` formats for chat). Redacts secret keys.
 - **`palworld-config-summary`** — Python; prints a summary of the
   operationally-relevant live settings for notifications.
-- **`palworld-fileattr`** — sourced shell helpers for the Linux immutable bit
-  (`fileattr_is_immutable`, `fileattr_set_immutable`, `fileattr_supported`). Used
-  by `palworld-config-apply-env` / `palworld-config-protect`. Degrades gracefully
-  (warn once, report "not immutable") where `chattr`/`lsattr` or
-  `CAP_LINUX_IMMUTABLE` are unavailable, so a missing immutable bit never blocks
-  a config write.
 
 ---
 

@@ -28,11 +28,6 @@ integration tests as separate jobs on every push / PR.
   - `test_notify_optional.sh` — Discord notifications are optional: asserts the
     repo invariant that every script sourcing `palworld-notify` also defines a
     no-op fallback, and that scripts still run when the helper isn't installed.
-  - `test_immutable.sh` — `chattr +i` overwrite protection: the shared
-    `lib/palworld-fileattr` helpers, `palworld-engine-config`'s immutability
-    functions, the apply-env unlock→write→relock flow, `palworld-config-protect`,
-    and — most importantly — that all of it **degrades gracefully** (still writes
-    the config) where the immutable bit is unavailable. Uses fake `chattr`/`lsattr`.
   - `test_config_parser.sh` — `palworld-config-parser`: env→INI key resolution
     (including PascalCase quirks and the exceptions table), quoting/escaping,
     enum + boolean + numeric handling, rejection of structure-breaking values,
@@ -46,8 +41,7 @@ integration tests as separate jobs on every push / PR.
 - `integration/test_persistence.sh` — drives the real `docker/compose.yaml`
   (own project + ports) to prove `compose down` then `up` preserves the world and
   config: the nested `palworld-saved` submount holds the saves, `down` without
-  `-v` keeps the volumes, and a second boot re-applies config through the
-  pre-existing `chattr +i` lock.
+  `-v` keeps the volumes, and a second boot re-applies config cleanly.
 - `integration/test_update_apply.sh` — simulates a new Steam build and drives the
   full `palworld-update` apply flow in-container (graceful stop → fake SteamCMD
   install → restart → event markers), plus the already-current no-op case.

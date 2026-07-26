@@ -49,43 +49,30 @@ Plain `docker stop` (Docker's **10s** default) is only safe if the world saves
 in under ~10s; for anything larger it may cut the save short. Compose is
 configured with a 120s grace, so `docker compose down/stop` is the safe path.
 
-### Config overwrite protection (`chattr +i`)
+### Does Palworld overwrite managed config?
 
-Palworld rewrites `PalWorldSettings.ini` / `Engine.ini` when the server shuts
-down, which silently reverts managed settings. The tooling therefore leaves those
-files **immutable** after applying config (unlock → write → relock).
+Short answer: **it rewrites the files but preserves your values**, so palwarden
+does not lock anything.
 
-That needs `CAP_LINUX_IMMUTABLE`, which Docker does not grant by default, so
-`compose.yaml` adds it:
+Measured against a real server (**v1.0.1.100619**, empty world, 4 restarts) with
+both config files mutable: every custom value survived, all 119
+`PalWorldSettings.ini` keys were retained, and the REST API kept answering — so
+the server genuinely read and honoured the file. The game *does* normalise the
+files once (`PalWorldSettings.ini` reformatted, `Engine.ini` expanded with
+Unreal's own sections around our values), after which the contents are stable.
 
-```yaml
-    cap_add:
-      - LINUX_IMMUTABLE
-```
+Two related quirks worth knowing:
 
-Verified working on named volumes. Remove it if you would rather not grant the
-capability — the tooling then **warns and runs unprotected** rather than failing.
-Manual control: `palworld-config-protect {status|lock|unlock}` and
-`palworld-engine-config {lock|unlock}`.
+* A config containing **only default values** is truncated to a single newline on
+  first start — Unreal writes only non-defaults. Harmless, but it looks like your
+  config was wiped.
+* Because the game rewrites values in its own format, drift checks must compare
+  *semantically* — `palworld-engine-config status --check` normalises both sides
+  (so `True` == `1` and `60.000000` == `60`) instead of comparing raw text.
 
-> **Deleting volumes needs an unlock first.** An immutable file cannot be
-> unlinked, so `docker compose down -v` fails with
-> `operation not permitted ... PalWorldSettings.ini`. Unlock while the container
-> is still up:
->
-> ```bash
-> docker compose exec palwarden palworld-config-protect unlock
-> docker compose exec palwarden palworld-engine-config unlock   # if Engine.ini is managed
-> docker compose down -v
-> ```
->
-> If the container is already gone, clear the bit from a throwaway container:
->
-> ```bash
-> docker run --rm --user root --cap-add LINUX_IMMUTABLE \
->   -v palwarden_palworld-saved:/v palwarden:latest \
->   sh -c 'find /v -type f -exec chattr -i {} +'
-> ```
+An earlier version of palwarden left these files immutable (`chattr +i`). That is
+gone: it was unnecessary, needed `CAP_LINUX_IMMUTABLE` plus e2fsprogs, and an
+immutable file blocks `docker compose down -v`.
 
 ### Host-ism shims
 
