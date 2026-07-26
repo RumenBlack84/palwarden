@@ -25,6 +25,9 @@ integration tests as separate jobs on every push / PR.
     with a fake SteamCMD and manifest (check paths only; no update applied).
   - `test_public_info.sh` — `palworld-public-info-watch` reads config / resolves
     IP / writes the join-info state file, with fake `curl`/`sudo`.
+  - `test_notify_optional.sh` — Discord notifications are optional: asserts the
+    repo invariant that every script sourcing `palworld-notify` also defines a
+    no-op fallback, and that scripts still run when the helper isn't installed.
   - `test_immutable.sh` — `chattr +i` overwrite protection: the shared
     `lib/palworld-fileattr` helpers, `palworld-engine-config`'s immutability
     functions, the apply-env unlock→write→relock flow, `palworld-config-protect`,

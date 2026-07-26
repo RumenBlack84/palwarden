@@ -48,6 +48,17 @@ be honored (see `palworld-update`'s `PALWORLD_DROP_PRIV`).
 `sudo`→passthrough), installed ahead on `PATH` in the image only. Prefer adding
 to the shim over forking a script.
 
+**Notifications are optional.** Every script that uses `palworld_notify` must
+source the helper tolerantly and define a no-op fallback, or it dies with
+"command not found" where the helper isn't installed:
+
+```bash
+source /usr/local/lib/palworld-notify 2>/dev/null || true
+declare -F palworld_notify >/dev/null || palworld_notify() { :; }
+```
+
+`tests/unit/test_notify_optional.sh` enforces this as a repo invariant.
+
 **Secrets** are never baked into the image or committed. `docker/entrypoint.sh`
 renders `/etc/palworld/{settings,notify}.env` at start via
 `palwarden-render-config` from env (`ADMIN_PASSWORD`, `DISCORD_WEBHOOK`,

@@ -213,7 +213,8 @@ Installed to `/usr/local/lib`, not run directly.
 - **`palworld-notify`** — sourced shell function `palworld_notify LEVEL MESSAGE`.
   Reads `/etc/palworld/notify.env`; posts an emoji-prefixed message to the Discord
   webhook. Silently no-ops if the file or webhook is missing, so every caller
-  works with or without Discord.
+  works with or without Discord. Callers also define a no-op fallback so they keep
+  working when the helper itself isn't installed.
 - **`palworld-config-diff`** — Python; prints a non-secret diff between two
   `PalWorldSettings.ini` files (`--discord` formats for chat). Redacts secret keys.
 - **`palworld-config-summary`** — Python; prints a summary of the

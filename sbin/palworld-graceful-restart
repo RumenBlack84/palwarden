@@ -2,7 +2,10 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # SPDX-FileCopyrightText: 2026 Brian Grant
 set -euo pipefail
-source /usr/local/lib/palworld-notify || true
+source /usr/local/lib/palworld-notify 2>/dev/null || true
+# Notifications are optional: no-op when the helper isn't installed, rather than
+# aborting on "command not found".
+declare -F palworld_notify >/dev/null || palworld_notify() { :; }
 waittime=300
 empty_wait=15
 message="Server maintenance: saving and restarting in 5 minutes."
