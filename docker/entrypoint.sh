@@ -53,7 +53,9 @@ fi
 # notify.env from env. No secrets are baked into the image.
 palwarden-render-config /etc/palworld/settings.env /etc/palworld/notify.env
 chown steam:steam /etc/palworld/settings.env 2>/dev/null || true
-[[ -f /etc/palworld/notify.env ]] && chown steam:steam /etc/palworld/notify.env 2>/dev/null || true
+if [[ -f /etc/palworld/notify.env ]]; then
+  chown steam:steam /etc/palworld/notify.env 2>/dev/null || true
+fi
 
 TELEMETRY_READY=0
 if [[ -n "${ADMIN_PASSWORD:-}" ]]; then
@@ -87,7 +89,7 @@ if [[ "$MODE" == "embedded" ]]; then
   # steam (NON-recursive — cheap and safe even with the game installed) so
   # SteamCMD installs into the volume instead of falling back to steam's home.
   for d in "$INSTALL_DIR" "$INSTALL_DIR/Pal" "$INSTALL_DIR/Pal/Saved"; do
-    [[ -d "$d" ]] && chown steam:steam "$d" 2>/dev/null || true
+    if [[ -d "$d" ]]; then chown steam:steam "$d" 2>/dev/null || true; fi
   done
   if [[ "${UPDATE_ON_START:-true}" == "true" ]]; then
     log "Updating Palworld dedicated server (Steam app ${APP_ID})..."

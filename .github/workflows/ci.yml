@@ -12,8 +12,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install shellcheck
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      # No shellcheck install: tests/lint.sh runs a pinned shellcheck image so
+      # CI and local results cannot diverge on version.
       - name: Lint
         run: ./tests/lint.sh
 

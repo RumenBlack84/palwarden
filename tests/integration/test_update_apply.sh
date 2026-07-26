@@ -17,7 +17,16 @@ source "$DIR/../lib/assert.sh"
 IMG="palwarden:test"
 C=pw-update-apply
 WORK="$(mktemp -d)"
-cleanup() { docker rm -f "$C" >/dev/null 2>&1 || true; rm -rf "$WORK"; }
+cleanup() {
+  docker rm -f "$C" >/dev/null 2>&1 || true
+  # The container writes as steam/root, so those files may not be removable by the
+  # user running the tests; delete them from a throwaway root container first.
+  if [ -d "$WORK/server" ]; then
+    docker run --rm --user root -v "$WORK":/w --entrypoint sh "$IMG" \
+      -c 'rm -rf /w/server' >/dev/null 2>&1 || true
+  fi
+  rm -rf "$WORK" 2>/dev/null || true
+}
 trap cleanup EXIT
 
 # Pre-installed dummy server (copy so the test never mutates the committed fixture).
@@ -25,6 +34,10 @@ cp -r "$REPO/tests/fixtures/fake-server-rest" "$WORK/server"
 mkdir -p "$WORK/server/steamapps"
 printf '"AppState"\n{\n\t"buildid"\t\t"100"\n}\n' > "$WORK/server/steamapps/appmanifest_2394010.acf"
 cp "$REPO/tests/fixtures/fake-steamcmd" "$WORK/fake-steamcmd"; chmod +x "$WORK/fake-steamcmd"
+# palworld-update drops to the container's `steam` user (uid 1000) to run SteamCMD,
+# so the bind-mounted tree must be writable by it. Only guaranteed when the host
+# uid happens to be 1000 — make it explicit instead (CI checks out as uid 1001).
+chmod -R a+rwX "$WORK/server"
 
 echo "  building $IMG ..."
 docker build -q -f "$REPO/docker/Dockerfile" -t "$IMG" "$REPO" >/dev/null 2>&1 || { fail "build failed"; assert_report; exit 1; }

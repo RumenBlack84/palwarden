@@ -18,11 +18,15 @@ shell_files() {
     sbin lib install.sh docker needrestart tests 2>/dev/null | grep -vE '\.py$'
 }
 
+# Pinned so a host/CI shellcheck version difference cannot change the result.
+SHELLCHECK_IMAGE="koalaman/shellcheck:v0.10.0"
+
 run_shellcheck() {
-  if command -v shellcheck >/dev/null 2>&1; then
+  if command -v docker >/dev/null 2>&1; then
+    shell_files | xargs docker run --rm -i -v "$REPO":/mnt -w /mnt "$SHELLCHECK_IMAGE"
+  elif command -v shellcheck >/dev/null 2>&1; then
+    echo "  (using host shellcheck $(shellcheck --version | awk "/version:/{print \$2}"); pinned $SHELLCHECK_IMAGE preferred)" >&2
     shell_files | xargs shellcheck
-  elif command -v docker >/dev/null 2>&1; then
-    shell_files | xargs docker run --rm -i -v "$REPO":/mnt -w /mnt koalaman/shellcheck:stable
   else
     echo "SKIP shellcheck: neither shellcheck nor docker available" >&2
     return 0
