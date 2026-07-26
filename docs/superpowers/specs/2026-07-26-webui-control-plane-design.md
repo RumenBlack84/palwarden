@@ -143,6 +143,7 @@ is ever passed to a shell.
 | Action | Command | Params |
 |---|---|---|
 | `config_apply` | `palworld-config-apply-env` | — |
+| `engine_save` | writes `/etc/palworld/engine.env` from validated key/value pairs | `settings: {<ENGINE_ENV_KEY>: <value>}` — each key must be one of `palworld-engine-config`'s 15 known settings; each value is normalised and range-checked by that tool's own rules (`normalize_value`). Unknown keys and out-of-range values are rejected. |
 | `engine_apply` | `palworld-engine-config apply` | `dry_run: bool` |
 | `config_pretty` | `palworld-config-pretty` | — |
 | `snapshot_create` | `palworld-config-snapshot create <label>` | `label: ^[A-Za-z0-9._-]{1,64}$` |
@@ -158,6 +159,7 @@ is ever passed to a shell.
 | `update_check` | `palworld-update --check` | — |
 | `update_apply` | `palworld-update` | `wait: int 0–1800` |
 | `engine_rollback` | `palworld-engine-config rollback <backup>` | `backup`: must match an existing backup filename |
+| `engine_save_apply_restart` | `engine_save`, then `palworld-engine-config apply`, then `palworld-graceful-restart` | same `settings` as `engine_save`, plus `wait: int 0-1800`. Stops at the first failure — a failed save or apply never reaches the restart. |
 | `api_save` | `palworld-api-save` | — |
 
 `message` is validated tightly because it reaches players through the REST API.
@@ -236,6 +238,30 @@ The existing editors gain (increment 3, optional) a single "Apply via palwarden"
 hook that POSTs `config_apply`/`engine_apply`. If that turns out to require
 non-trivial edits to the vendored files, it moves into our page instead rather
 than forking them.
+
+### Editing Engine.ini from the browser
+
+`webui/EngineIniPerformanceEditor.html` is **first-party**, not vendored: it is
+13.5 KB against the upstream settings editor's 136 KB, and it references
+`engine.env`, `NET_SERVER_MAX_TICK_RATE`, `palworld-engine-config` and
+`current/Engine.ini` — none of which exist upstream. Only
+`webui/PalWorldSettingsEditor.html` is the genuine MIT-vendored file and must stay
+byte-identical. The Engine editor may therefore gain controls directly, and gets a
+header noting AGPL plus its partial derivation from the MIT upstream (see
+`CREDITS.md`).
+
+It gains exactly two controls:
+
+* **Save** — enqueues `engine_save`. Writes `engine.env` only; nothing is applied
+  and the server is untouched, so it is safe at any time. This is the "not right
+  now" path the operator needs.
+* **Save and apply** — enqueues `engine_save_apply_restart`. Disruptive, so it
+  requires `confirm: true` and a `pw-confirm` dialog naming the player-warning
+  window before it is sent.
+
+Engine.ini changes only take effect after a restart, which is why applying without
+restarting is not offered as a third button: it would leave the file and the running
+server disagreeing with no indication in the UI.
 
 ## Platform wiring
 
