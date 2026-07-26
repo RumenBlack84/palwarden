@@ -17,6 +17,7 @@ into a string that reaches one.
 
 from __future__ import annotations
 
+import argparse
 import fcntl
 import importlib.machinery
 import importlib.util
@@ -25,6 +26,7 @@ import re
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
 
 # Mirror how palworld-health-report locates palworld-fps: prepend the
@@ -41,12 +43,44 @@ BACKUP_DIR = Path(os.environ.get("PALWORLD_BACKUP_DIR", "/opt/palworld/config-ba
 # (tests point it at stub binaries), but the module we load here for its
 # setting definitions is palwarden-jobd's own neighbour — same directory in
 # both the installed layout (/usr/local/sbin) and a dev checkout (repo sbin/).
+# Consequence for real deployments: if you set PALWARDEN_SBIN_DIR you must set
+# PALWARDEN_ENGINE_CONFIG_BIN to match, or jobd validates settings against one
+# copy of palworld-engine-config's table and applies them with another.
 ENGINE_CONFIG_BIN = Path(os.environ.get(
     "PALWARDEN_ENGINE_CONFIG_BIN", str(Path(__file__).resolve().parent / "palworld-engine-config")))
 JOBD_LOCK = Path(os.environ.get("PALWARDEN_JOBD_LOCK", "/run/palwarden-jobd.lock"))
-JOBD_INTERVAL = float(os.environ.get("PALWARDEN_JOBD_INTERVAL", "2"))
+JOBD_INTERVAL_DEFAULT = 2.0
+
+
+def _interval_from_env(raw: str | None) -> float:
+    """Poll interval from the environment, tolerating a bad value.
+
+    A typo in a unit file or compose env must not turn into a traceback at
+    import time: that would take out *every* action rather than just slowing
+    the loop, so warn and fall back to the default.
+    """
+    if raw is None or raw.strip() == "":
+        return JOBD_INTERVAL_DEFAULT
+    try:
+        value = float(raw)
+    except ValueError:
+        value = -1.0
+    if value <= 0 or value > 3600:
+        print(f"PALWARDEN_JOBD_INTERVAL={raw!r} is not a sane number of seconds; "
+              f"using {JOBD_INTERVAL_DEFAULT}", file=sys.stderr)
+        return JOBD_INTERVAL_DEFAULT
+    return value
+
+
+JOBD_INTERVAL = _interval_from_env(os.environ.get("PALWARDEN_JOBD_INTERVAL"))
 
 LABEL_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+# The exact shape palworld-engine-config writes: `Engine.ini.<UTC stamp>` from
+# `backup_engine`/`command_apply`, plus `Engine.ini.pre-rollback.<stamp>` from
+# `rollback_engine`. Anchoring on that (rather than any name at all) is what
+# stops an attacker-chosen file in the web-writable backup dir from being
+# rolled into place; see validate_backup.
+BACKUP_RE = re.compile(r"Engine\.ini\.(?:pre-rollback\.)?[0-9]{8}T[0-9]{6}Z")
 
 
 def load_engine_config_module():
@@ -88,8 +122,16 @@ def validate_text(params: dict, key: str = "text") -> str:
     return value
 
 
-def validate_wait(params: dict) -> int:
-    value = params.get("wait")
+def validate_wait(params: dict) -> int | None:
+    """Validate the *optional* `wait` seconds.
+
+    Returns None when the caller did not ask for a particular wait, so the argv
+    builders can omit `--wait` entirely and let the invoked tool apply its own
+    default (palworld-update's is 300s) rather than jobd inventing a second one.
+    """
+    if "wait" not in params or params.get("wait") is None:
+        return None
+    value = params["wait"]
     # bool is an int subclass in Python; reject it explicitly so {"wait": true}
     # doesn't silently become wait=1.
     if isinstance(value, bool) or not isinstance(value, int) or not (0 <= value <= 1800):
@@ -105,11 +147,34 @@ def validate_dry_run(params: dict) -> bool:
 
 
 def validate_backup(params: dict) -> str:
+    """Validate a rollback source in the *web-writable* backup directory.
+
+    BACKUP_DIR is owned by the unprivileged web user, so anything in it — names
+    and symlinks alike — is attacker-controlled. A rollback ends in
+    `shutil.copy2(<backup>, Engine.ini)` followed by chown-to-palworld and
+    chmod 0644, so accepting a symlink here would publish any root-readable
+    file (settings.env, /etc/shadow) to the web user. Hence: never stat through
+    the link before the name is validated, reject links outright, and require
+    the exact name shape palworld-engine-config itself writes.
+    """
     value = params.get("backup")
     if not isinstance(value, str) or "/" in value or "\\" in value:
         raise ValueError(f"backup must be a bare file name, got {value!r}")
-    if not (BACKUP_DIR / value).is_file():
+    if not BACKUP_RE.fullmatch(value):
+        raise ValueError(f"backup must match {BACKUP_RE.pattern!r}, got {value!r}")
+    candidate = BACKUP_DIR / value
+    # lstat/is_symlink do NOT follow the link, so this decides on the entry
+    # itself; is_file() below would have followed it.
+    if candidate.is_symlink():
+        raise ValueError(f"backup must not be a symlink: {value!r}")
+    if not candidate.is_file():
         raise ValueError(f"backup not found: {value!r}")
+    # Belt and braces for a symlinked *parent*: after resolving everything, the
+    # target must still sit directly inside the real backup directory.
+    real_dir = os.path.realpath(BACKUP_DIR)
+    real_candidate = os.path.realpath(candidate)
+    if os.path.dirname(real_candidate) != real_dir:
+        raise ValueError(f"backup resolves outside {real_dir}: {value!r}")
     return value
 
 
@@ -129,9 +194,12 @@ def validate_settings(params: dict) -> dict[str, str]:
         setting = SETTING_BY_ENV.get(key)
         if setting is None:
             raise ValueError(f"unknown engine setting: {key!r}")
-        if not isinstance(value, str):
-            raise ValueError(f"{key} value must be a string, got {value!r}")
-        normalised[key] = normalize_value(setting, value)
+        # A JSON UI naturally posts numbers as numbers, so accept int/float and
+        # coerce to the string form normalize_value parses. bool is an int
+        # subclass — reject it explicitly rather than storing True as "1".
+        if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+            raise ValueError(f"{key} value must be a string or number, got {value!r}")
+        normalised[key] = normalize_value(setting, str(value))
     return normalised
 
 
@@ -145,20 +213,34 @@ def require_confirm(params: dict) -> None:
 
 
 def write_engine_env(settings: dict[str, str]) -> None:
-    """Atomically (re)write ENGINE_ENV from already-normalised settings.
+    """Atomically merge already-normalised settings into ENGINE_ENV.
+
+    A *merge*, not a replace: engine.env is the set of values
+    `palworld-engine-config apply` manages and its drift check compares against.
+    Dropping a key the request happened not to include would silently unmanage
+    it — apply would stop enforcing it, the drift check would go blind to it,
+    and Engine.ini would keep the stale value.
 
     Never destroys an existing file on failure: write a temp file in the same
     directory, rename it into place, then re-read and re-parse it to confirm
     the result is sane before declaring success.
     """
-    ENGINE_ENV.parent.mkdir(parents=True, exist_ok=True)
+    # 0755 to match how /etc/palworld is created elsewhere (install.sh's
+    # `install -d -m 0755`); engine.env is tuning, not a secret.
+    ENGINE_ENV.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+    # Same reader palworld-engine-config uses, so "what is currently managed"
+    # means exactly what apply would see (unknown keys are not ours to keep).
+    merged: dict[str, str] = {}
+    if ENGINE_ENV.exists():
+        merged.update(_engine.parse_env(ENGINE_ENV))
+    merged.update(settings)
     lines = [
         "# Generated by palwarden-jobd (engine_save). Do not edit by hand;",
         "# use the Engine.ini performance editor instead.",
         f"# Written: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}",
         "",
     ]
-    for key, value in sorted(settings.items()):
+    for key, value in sorted(merged.items()):
         lines.append(f"{key}={value}")
     text = "\n".join(lines) + "\n"
 
@@ -177,7 +259,7 @@ def write_engine_env(settings: dict[str, str]) -> None:
     # a self-check against a corrupt/truncated write, using the same reader
     # palworld-engine-config uses (one parser, not a second copy).
     reparsed = _engine.parse_env(ENGINE_ENV)
-    for key, value in settings.items():
+    for key, value in merged.items():
         if reparsed.get(key) != value:
             raise ValueError(f"engine.env write did not round-trip for {key}")
 
@@ -207,7 +289,10 @@ def _argv_config_pretty(_params: dict) -> list[list[str]]:
 
 def _argv_snapshot_create(params: dict) -> list[list[str]]:
     label = validate_label(params)
-    return [[str(SBIN / "palworld-config-snapshot"), "create", label]]
+    # `--` before every parameter-derived positional: `-` is a legal label
+    # character and `text` only has to be printable, so a value like "--no-mark"
+    # would otherwise be parsed as an *option* by the target's argparse.
+    return [[str(SBIN / "palworld-config-snapshot"), "create", "--", label]]
 
 
 def _argv_backup(_params: dict) -> list[list[str]]:
@@ -216,13 +301,17 @@ def _argv_backup(_params: dict) -> list[list[str]]:
 
 def _argv_mark(params: dict) -> list[list[str]]:
     text = validate_text(params)
-    return [[str(SBIN / "palworld-fps"), "mark", text, "--category", "manual"]]
+    # --category must precede the `--`: argparse treats *everything* after the
+    # terminator as positional, so `mark -- <text> --category manual` fails.
+    return [[str(SBIN / "palworld-fps"), "mark", "--category", "manual", "--", text]]
 
 
 def _argv_graceful_restart(params: dict) -> list[list[str]]:
     wait = validate_wait(params)
     message = validate_message(params)
-    argv = [str(SBIN / "palworld-graceful-restart"), "--wait", str(wait)]
+    argv = [str(SBIN / "palworld-graceful-restart")]
+    if wait is not None:  # absent wait: let the tool's own default stand
+        argv += ["--wait", str(wait)]
     if message is not None:
         argv += ["--message", message]
     return [argv]
@@ -231,7 +320,9 @@ def _argv_graceful_restart(params: dict) -> list[list[str]]:
 def _argv_graceful_stop(params: dict) -> list[list[str]]:
     wait = validate_wait(params)
     message = validate_message(params)
-    argv = [str(SBIN / "palworld-graceful-stop"), "--wait", str(wait)]
+    argv = [str(SBIN / "palworld-graceful-stop")]
+    if wait is not None:
+        argv += ["--wait", str(wait)]
     if message is not None:
         argv += ["--message", message]
     return [argv]
@@ -243,12 +334,15 @@ def _argv_update_check(_params: dict) -> list[list[str]]:
 
 def _argv_update_apply(params: dict) -> list[list[str]]:
     wait = validate_wait(params)
-    return [[str(SBIN / "palworld-update"), "--wait", str(wait)]]
+    argv = [str(SBIN / "palworld-update")]
+    if wait is not None:  # else palworld-update's own default (300s) applies
+        argv += ["--wait", str(wait)]
+    return [argv]
 
 
 def _argv_engine_rollback(params: dict) -> list[list[str]]:
     backup = validate_backup(params)
-    return [[str(SBIN / "palworld-engine-config"), "rollback", backup]]
+    return [[str(SBIN / "palworld-engine-config"), "rollback", "--", backup]]
 
 
 def _argv_api_save(_params: dict) -> list[list[str]]:
@@ -259,9 +353,12 @@ def _argv_engine_save_apply_restart(params: dict) -> list[list[str]]:
     # engine_save itself writes no command (build_commands handles it before
     # calling here); this only builds the apply + restart steps that follow.
     wait = validate_wait(params)
+    restart = [str(SBIN / "palworld-graceful-restart")]
+    if wait is not None:
+        restart += ["--wait", str(wait)]
     return [
         [str(SBIN / "palworld-engine-config"), "apply"],
-        [str(SBIN / "palworld-graceful-restart"), "--wait", str(wait)],
+        restart,
     ]
 
 
@@ -398,39 +495,85 @@ def reap_orphans() -> int:
 
 def poll_once() -> None:
     # claim_next is an unlocked read-modify-write; that is safe here only
-    # because main()'s flock ensures at most one worker process ever calls it.
+    # because every mode of main() holds the flock, so at most one worker
+    # process ever calls it.
     job = jobs.claim_next()
-    if job is not None:
-        run_job(job)
-
-
-def main() -> int:
-    args = sys.argv[1:]
-    if "--reap" in args:
-        reap_orphans()
-        return 0
-    if "--once" in args:
-        reap_orphans()
-        poll_once()
-        jobs.prune()
-        return 0
-
-    # Default: hold an exclusive, non-blocking lock for the life of the process
-    # so a second worker can never run concurrently with this one — that
-    # exclusivity is what makes claim_next's unlocked read-then-write safe.
-    # Reaping only happens once we hold the lock: reaping before it could mark
-    # a job "failed" that a still-running sibling worker legitimately owns.
-    JOBD_LOCK.parent.mkdir(parents=True, exist_ok=True)
-    lock_fd = os.open(JOBD_LOCK, os.O_CREAT | os.O_RDWR, 0o600)
+    if job is None:
+        return
     try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        run_job(job)
+    except Exception:  # noqa: BLE001 - one bad job must not stop the queue
+        # A job file that vanished between claim and completion makes
+        # append_output/update_job raise KeyError. Letting that escape would
+        # end the worker's loop and silently stop the whole queue draining, so
+        # fail this job (best effort — the file may genuinely be gone) and go
+        # on. KeyboardInterrupt/SystemExit are BaseException and still escape.
+        traceback.print_exc()
+        try:
+            jobs.update_job(job["id"], state="failed", exit_code=1,
+                            finished_at=int(time.time()))
+        except Exception:  # noqa: BLE001 - nothing left to record it on
+            pass
+
+
+def acquire_lock() -> int | None:
+    """Take the exclusive, non-blocking worker lock, or None if already held.
+
+    *Every* mode takes it, not just the daemon loop: reap_orphans cannot tell a
+    live sibling's `running` job from a crashed one, so a stray `--once`/`--reap`
+    would mark a 20-minute update_apply as failed while it kept running, and
+    would race the daemon in claim_next.
+    """
+    JOBD_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(JOBD_LOCK, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="palwarden-jobd",
+        description="Root worker for the palwarden web UI job queue.")
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--once", action="store_true",
+                      help="reap, run at most one queued job, prune, exit")
+    mode.add_argument("--reap", action="store_true",
+                      help="mark jobs left running by a crash as failed, then exit")
+    args = ap.parse_args(argv)
+
+    # The lock is held for the life of the process in all three modes, so a
+    # second worker can never run concurrently — that exclusivity is what makes
+    # claim_next's unlocked read-then-write safe. Reaping only happens once we
+    # hold it: reaping before could mark a job "failed" that a still-running
+    # sibling worker legitimately owns.
+    lock_fd = acquire_lock()
+    if lock_fd is None:
         print(f"another palwarden-jobd holds {JOBD_LOCK}; exiting", file=sys.stderr)
         return 1
-    reap_orphans()
-    while True:
+
+    if args.reap:
+        reap_orphans()
+        return 0
+    if args.once:
+        reap_orphans()
         poll_once()
         jobs.prune()
+        return 0
+
+    reap_orphans()
+    while True:
+        # Belt and braces around poll_once's own guard: a failure in
+        # claim_next/prune (a corrupt directory, a full disk) must also not end
+        # the loop.
+        try:
+            poll_once()
+            jobs.prune()
+        except Exception:  # noqa: BLE001 - keep draining the queue
+            traceback.print_exc()
         time.sleep(JOBD_INTERVAL)
 
 
