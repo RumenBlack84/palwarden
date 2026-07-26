@@ -1,0 +1,4 @@
+# palwarden shellcheck config
+# SC1090/SC1091: sourced files (palworld-notify, settings.env) are resolved at
+# runtime and not available to the linter.
+disable=SC1090,SC1091

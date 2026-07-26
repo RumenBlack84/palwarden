@@ -6,7 +6,11 @@ Dependency-free test suites for palwarden.
 ./tests/run.sh                 # unit tests only (fast, no docker)
 ./tests/run.sh --integration   # unit + docker integration tests
 RUN_INTEGRATION=1 ./tests/run.sh
+./tests/lint.sh                # shellcheck (via docker if not installed) + python
 ```
+
+CI (`.github/workflows/ci.yml`) runs `lint.sh`, the unit tests, and the
+integration tests as separate jobs on every push / PR.
 
 ## Layout
 

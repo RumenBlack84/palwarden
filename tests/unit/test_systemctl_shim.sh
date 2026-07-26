@@ -53,11 +53,9 @@ assert_eq "$(run_shim show -p MemoryCurrent --value palworld.service)" "10485760
 # MainPID parsed from svstat
 assert_eq "$(run_shim show -p MainPID --value palworld.service)" "4242" "MainPID value"
 
-# is-enabled reflects the s6 user-bundle marker
-CONTENTS="$WORK/contents"
-mkdir -p "$WORK/s6/user/contents.d"
-# The shim looks under /etc/s6-overlay/... which we can't fake without root, so
-# just assert the command runs and returns a known token.
+# is-enabled reflects the s6 user-bundle marker. The shim looks under
+# /etc/s6-overlay/... which we can't fake without root, so just assert the
+# command runs and returns a known token.
 out="$(run_shim is-enabled palworld.service)"
 assert_contains "${out}enabled_or_disabled" "abled" "is-enabled returns a state"
 

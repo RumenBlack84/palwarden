@@ -42,7 +42,7 @@ for _ in $(seq 1 40); do
   if docker exec "$C" sh -c 'sudo palworld-api info 2>/dev/null' | grep -q "HTTP 200"; then up=1; break; fi
   sleep 1
 done
-[ "$up" = 1 ] && pass || fail "server/REST did not come up"
+if [ "$up" = 1 ]; then pass; else fail "server/REST did not come up"; fi
 
 buildid() { docker exec "$C" sh -c 'awk -F\" "/\"buildid\"/{print \$4; exit}" /opt/palworld/server/steamapps/appmanifest_2394010.acf'; }
 runpid()  { docker exec "$C" s6-svstat /run/service/palworld-server 2>/dev/null | grep -oE 'pid [0-9]+' | grep -oE '[0-9]+'; }
@@ -61,7 +61,7 @@ up=0
 for _ in $(seq 1 20); do
   docker exec "$C" sh -c 'sudo palworld-api info 2>/dev/null' | grep -q "HTTP 200" && { up=1; break; }; sleep 1
 done
-[ "$up" = 1 ] && pass || fail "server did not come back up after update"
+if [ "$up" = 1 ]; then pass; else fail "server did not come back up after update"; fi
 assert_ne "$pid_before" "$(runpid)" "server service was restarted by the update"
 
 # Event markers recorded in the telemetry DB.

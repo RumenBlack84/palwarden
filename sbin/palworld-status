@@ -3,7 +3,6 @@
 # SPDX-FileCopyrightText: 2026 Brian Grant
 set -euo pipefail
 SERVICE=palworld.service
-CONFIG=/opt/palworld/server/Pal/Saved/Config/LinuxServer/PalWorldSettings.ini
 MANIFEST=/opt/palworld/server/steamapps/appmanifest_2394010.acf
 STATE_FILE=/var/lib/palworld/public-info.env
 

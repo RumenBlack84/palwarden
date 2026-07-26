@@ -89,6 +89,7 @@ summary_text=$(/usr/local/lib/palworld-config-summary || true)
 if [[ -z "$summary_text" ]]; then
   summary_text="Relevant server settings summary unavailable."
 fi
+# shellcheck disable=SC2016  # backticks are literal Discord markdown, not expansions
 printf -v notify_msg 'config parser applied environment changes; backup: `%s`. Restart palworld.service for config changes to take effect.\n\n%s\n\n%s' "$(basename "$backup")" "$diff_text" "$summary_text"
 palworld_notify success "$notify_msg"
 /usr/local/sbin/palworld-fps mark "PalWorldSettings.ini config applied" --category config --details "backup=$(basename "$backup")" >/dev/null 2>&1 || true

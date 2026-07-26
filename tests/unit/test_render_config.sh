@@ -46,8 +46,11 @@ assert_eq "$(val "$s" SERVER_NAME)" "Yggdrasil Palworld" "server name with space
 assert_eq "$(val "$s" MAX_PLAYERS)" "32"                 "max players passthrough"
 
 # --- password with shell metacharacters round-trips safely ------------------
+# The literal metacharacters ARE the test input, hence the single quotes.
 s="$WORK/s6"; n="$WORK/n6"
+# shellcheck disable=SC2016
 render "$s" "$n" PALWARDEN_MODE=embedded ADMIN_PASSWORD='p$a b`c"d' >/dev/null
+# shellcheck disable=SC2016
 assert_eq "$(val "$s" ADMIN_PASSWORD)" 'p$a b`c"d' "special-char password round-trips"
 
 # --- Discord webhook -> notify.env ------------------------------------------

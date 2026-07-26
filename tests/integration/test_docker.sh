@@ -77,7 +77,7 @@ assert_contains "$svcC" "fps-sample" "C: telemetry enabled"
 assert_not_contains "$svcC" "palworld-server" "C: no server in external mode"
 docker exec pw-it-c sh -c 'sleep 6'
 okrows="$(docker exec pw-it-c python3 -c "import sqlite3;print(sqlite3.connect('/var/lib/palworld/metrics.sqlite3').execute('select count(*) from fps_samples where ok=1').fetchone()[0])" 2>/dev/null)"
-[ "${okrows:-0}" -gt 0 ] && pass || fail "C: expected ok telemetry rows from stub, got '${okrows:-0}'"
+if [ "${okrows:-0}" -gt 0 ]; then pass; else fail "C: expected ok telemetry rows from stub, got '${okrows:-0}'"; fi
 
 # --- Scenario D: container graceful restart cycles the server ---------------
 rp1="$(docker exec pw-it-b s6-svstat /run/service/palworld-server | grep -oE 'pid [0-9]+' | grep -oE '[0-9]+')"

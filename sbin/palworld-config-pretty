@@ -3,7 +3,6 @@
 # SPDX-FileCopyrightText: 2026 Brian Grant
 set -euo pipefail
 PALWORLD_USER="${PALWORLD_USER:-palworld}"; PALWORLD_GROUP="${PALWORLD_GROUP:-palworld}"
-src=/opt/palworld/server/Pal/Saved/Config/LinuxServer/PalWorldSettings.ini
 dst=/opt/palworld/server/Pal/Saved/Config/LinuxServer/PalWorldSettings.pretty.ini
 python3 - <<"PY"
 from pathlib import Path

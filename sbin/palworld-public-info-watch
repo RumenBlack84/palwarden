@@ -92,6 +92,7 @@ if [[ -n "$SERVER_PASSWORD" ]]; then
   password_display="$SERVER_PASSWORD"
 fi
 
+# shellcheck disable=SC2016  # backticks are literal Discord markdown, not expansions
 printf -v discord_msg '🎮 **Server Information Updated!**\n\n🌐 **Hostname:** `%s`\n📡 **Public IP:** `%s`\n🔌 **Port:** `%s`\n🔑 **Password:** `%s`' "$HOSTNAME_VALUE" "$PUBLIC_IP" "$SERVER_PORT" "$password_display"
 palworld_notify success "$discord_msg"
 echo "Updated $STATE_FILE (${old_summary})."
