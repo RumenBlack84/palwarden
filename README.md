@@ -1,5 +1,8 @@
 # palwarden
 
+[![CI](https://github.com/RumenBlack84/palwarden/actions/workflows/ci.yml/badge.svg)](https://github.com/RumenBlack84/palwarden/actions/workflows/ci.yml)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
+
 Operational tooling for a self-hosted **Palworld dedicated server** on Linux.
 
 `palwarden` is the collection of scripts, systemd units, config helpers, and a

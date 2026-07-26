@@ -20,3 +20,6 @@ docker/.env
 
 # Runtime state written into the test fixture by container runs
 tests/fixtures/fake-server/Pal/Saved/
+
+# Claude Code local state (permission allowlists, temp files)
+.claude/
