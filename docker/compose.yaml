@@ -16,28 +16,32 @@
 name: palwarden
 
 services:
-  # The Palworld dedicated server, running the all-in-one image in embedded mode.
-  # Only started when the "embedded" profile is active.
-  palworld-server:
+  # The all-in-one image in embedded mode: s6 supervises the Palworld server and
+  # the config web UI in one container. Only started when the "embedded" profile
+  # is active.
+  palwarden:
     build:
       context: ..
       dockerfile: docker/Dockerfile
     image: palwarden:latest
-    container_name: palwarden-server
+    container_name: palwarden
     profiles: ["embedded"]
     environment:
       PALWARDEN_MODE: embedded
       UPDATE_ON_START: ${UPDATE_ON_START:-true}
     ports:
       - "${PALWORLD_GAME_PORT:-8211}:8211/udp"
+      # Config web UI, published to host loopback only.
+      - "127.0.0.1:${WEBUI_PORT:-8088}:8088"
       # REST API (8212) is deliberately NOT published to the host. Tooling reaches
-      # it over the internal compose network. Do not expose it publicly.
+      # it over localhost inside the container. Do not expose it publicly.
     volumes:
       # Whole game install: persists SteamCMD downloads across restarts.
       - palworld-server:/opt/palworld/server
       # Saves + config broken out for easy backup (nested submount of the above).
       - palworld-saved:/opt/palworld/server/Pal/Saved
-    stop_signal: SIGINT
+    # s6-overlay shuts down on SIGTERM (the default) and forwards SIGINT to the
+    # game so it saves; give it up to 120s before the daemon kills the container.
     stop_grace_period: 120s
     ulimits:
       nofile:

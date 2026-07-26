@@ -1,0 +1,16 @@
+#!/command/with-contenv bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Brian Grant
+#
+# Static Palworld config editor web UI (client-side HTML), supervised by s6 and
+# served by Python's http.server as the unprivileged `steam` user.
+#
+# Bound to 0.0.0.0 inside the container; compose maps it only to host loopback.
+set -u
+WEBUI_DIR=/opt/palworld/tools/config-webui
+cd "$WEBUI_DIR" || exit 1
+
+# Expose the live config read-only at /current/ so the editors can load it.
+ln -sfn /opt/palworld/server/Pal/Saved/Config/LinuxServer current 2>/dev/null || true
+
+exec s6-setuidgid steam python3 -m http.server 8088 --bind 0.0.0.0

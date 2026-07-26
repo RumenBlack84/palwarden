@@ -77,8 +77,12 @@ external-only users.
    [`../docker/`](../docker/). Server runs as PID 1 via `exec` (no supervisor
    yet). Verified: image builds, mode dispatch works, tooling baked in; a full
    embedded game-download boot was not run end-to-end.
-2. **Add a supervisor** (s6-overlay) so the server + web UI + timers can coexist;
-   convert the server from a bare `exec` to an s6 service.
+2. **Add a supervisor** — ✅ **done**. s6-overlay is PID 1; the server and the
+   config web UI run as supervised s6 services (`docker/s6-rc.d/`), each dropped
+   to the unprivileged `steam` user. Stop forwards SIGINT for a clean save.
+   Verified: image builds, both services start, web UI serves (HTTP 200),
+   non-root workloads, graceful stop completes without SIGKILL. Full embedded
+   game boot still not run E2E.
 3. **Port the timers** to cron/s6 one at a time, starting with `fps-sample` and
    `update-check`. This is where **external** mode becomes functional.
 4. **Abstract host-isms** (`systemctl`/cgroup) behind a small status helper with
