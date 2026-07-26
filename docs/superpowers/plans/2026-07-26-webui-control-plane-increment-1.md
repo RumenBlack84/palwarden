@@ -818,6 +818,12 @@ exists. Refuses to run as root."
   `/api/config`, `/api/backups`, `/api/snapshots` (Task 2).
 - Produces: a page served at `/` containing the marker string
   `id="palwarden-dashboard"`, which the test asserts.
+- **Uses the component vocabulary** defined in the design spec's `## UI` section
+  (`### Component vocabulary`): `--pw-*` custom properties for all colors and
+  spacing, and the `pw-card` / `pw-stats` / `pw-pill` / `pw-log` / `pw-empty`
+  classes. Increment 1 needs only that subset; do not invent new class names, and
+  do not use raw hex colors outside the `:root` block. Later pages (historical
+  graphs, event history) reuse the same tokens, which is why they exist now.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -830,6 +836,10 @@ assert_rc 0 test -f "$REAL_ROOT/palwarden.html"
 assert_file_contains "$REAL_ROOT/palwarden.html" 'id="palwarden-dashboard"' "has the dashboard root element"
 assert_file_contains "$REAL_ROOT/palwarden.html" "/api/health" "fetches health"
 assert_file_contains "$REAL_ROOT/palwarden.html" "sessionStorage" "keeps the token in sessionStorage"
+# the shared component vocabulary from the design spec, so later pages can reuse it
+assert_file_contains "$REAL_ROOT/palwarden.html" "--pw-bg" "declares the design tokens"
+assert_file_contains "$REAL_ROOT/palwarden.html" "pw-card" "uses the card component"
+assert_file_contains "$REAL_ROOT/palwarden.html" "pw-pill--ok" "uses state pills"
 # it must not ship a hardcoded credential
 assert_file_not_contains "$REAL_ROOT/palwarden.html" "WEBUI_PASSWORD" "no credential baked into the page"
 # and the vendored editors must remain untouched
@@ -857,33 +867,60 @@ Create `webui/palwarden.html`:
 <meta charset="utf-8">
 <title>palwarden</title>
 <style>
-  :root { color-scheme: dark; }
-  body { font: 14px/1.5 ui-monospace, monospace; margin: 0; padding: 1.5rem;
-         background: #14161a; color: #e6e6e6; }
-  h1 { font-size: 1.1rem; margin: 0 0 1rem; letter-spacing: .08em; }
-  a { color: #8ab4f8; }
-  .grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(19rem, 1fr)); }
-  .card { background: #1c1f25; border: 1px solid #2b2f37; border-radius: 6px; padding: .9rem 1rem; }
-  .card h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .1em;
-             color: #9aa4b2; margin: 0 0 .6rem; }
-  dl { display: grid; grid-template-columns: auto 1fr; gap: .2rem .8rem; margin: 0; }
-  dt { color: #9aa4b2; } dd { margin: 0; }
-  .ok { color: #7ddc86; } .warn { color: #f0c674; } .bad { color: #f28b82; }
-  pre { margin: 0; white-space: pre-wrap; word-break: break-word; max-height: 14rem;
-        overflow: auto; color: #c8ccd4; }
-  footer { margin-top: 1.2rem; color: #6c7480; font-size: .8rem; }
+  /* Design tokens — the only place raw colors appear. Shared with future pages;
+     see the design spec, "Component vocabulary". */
+  :root {
+    color-scheme: dark;
+    --pw-bg: #14161a; --pw-surface: #1c1f25; --pw-border: #2b2f37;
+    --pw-fg: #e6e6e6; --pw-fg-muted: #9aa4b2;
+    --pw-ok: #7ddc86; --pw-warn: #f0c674; --pw-bad: #f28b82; --pw-idle: #8b93a1;
+    --pw-accent: #8ab4f8;
+    --pw-space-1: 4px; --pw-space-2: 8px; --pw-space-3: 16px; --pw-space-4: 24px;
+    --pw-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 0; padding: var(--pw-space-4);
+         background: var(--pw-bg); color: var(--pw-fg); }
+  h1 { font-size: 1.1rem; margin: 0 0 var(--pw-space-3); letter-spacing: .08em;
+       font-family: var(--pw-mono); }
+  a { color: var(--pw-accent); }
+  :focus-visible { outline: 2px solid var(--pw-accent); outline-offset: 2px; }
+
+  .pw-grid { display: grid; gap: var(--pw-space-3);
+             grid-template-columns: repeat(auto-fit, minmax(19rem, 1fr)); }
+  .pw-card { background: var(--pw-surface); border: 1px solid var(--pw-border);
+             border-radius: 6px; padding: var(--pw-space-3); }
+  .pw-card > h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .1em;
+                  color: var(--pw-fg-muted); margin: 0 0 var(--pw-space-2); }
+
+  /* pw-stats: label/value grid. Labels are prose, values are monospace. */
+  .pw-stats { display: grid; grid-template-columns: auto 1fr;
+              gap: var(--pw-space-1) var(--pw-space-2); margin: 0; }
+  .pw-stats dt { color: var(--pw-fg-muted); }
+  .pw-stats dd { margin: 0; font-family: var(--pw-mono); }
+
+  /* pw-pill: state badge. Always carries a text label — never color alone. */
+  .pw-pill { display: inline-block; padding: 0 var(--pw-space-2); border-radius: 999px;
+             font-family: var(--pw-mono); font-size: .82rem;
+             border: 1px solid currentColor; }
+  .pw-pill--ok { color: var(--pw-ok); } .pw-pill--warn { color: var(--pw-warn); }
+  .pw-pill--bad { color: var(--pw-bad); } .pw-pill--idle { color: var(--pw-idle); }
+
+  .pw-log { margin: 0; white-space: pre-wrap; word-break: break-word; max-height: 14rem;
+            overflow: auto; font-family: var(--pw-mono); color: var(--pw-fg); }
+  .pw-empty { color: var(--pw-fg-muted); font-style: italic; }
+  footer { margin-top: var(--pw-space-4); color: var(--pw-fg-muted); font-size: .8rem; }
 </style>
 </head>
 <body>
 <div id="palwarden-dashboard">
   <h1>palwarden</h1>
-  <div class="grid">
-    <section class="card"><h2>Server</h2><dl id="server"></dl></section>
-    <section class="card"><h2>Performance</h2><dl id="fps"></dl></section>
-    <section class="card"><h2>Restarts &amp; outages</h2><dl id="events"></dl></section>
-    <section class="card"><h2>Engine.ini</h2><pre id="engine">…</pre></section>
-    <section class="card"><h2>Backups</h2><pre id="backups">…</pre></section>
-    <section class="card"><h2>Snapshots</h2><pre id="snapshots">…</pre></section>
+  <div class="pw-grid">
+    <section class="pw-card"><h2>Server</h2><dl class="pw-stats" id="server"></dl></section>
+    <section class="pw-card"><h2>Performance</h2><dl class="pw-stats" id="fps"></dl></section>
+    <section class="pw-card"><h2>Restarts &amp; outages</h2><dl class="pw-stats" id="events"></dl></section>
+    <section class="pw-card"><h2>Engine.ini</h2><pre class="pw-log" id="engine">…</pre></section>
+    <section class="pw-card"><h2>Backups</h2><pre class="pw-log" id="backups">…</pre></section>
+    <section class="pw-card"><h2>Snapshots</h2><pre class="pw-log" id="snapshots">…</pre></section>
   </div>
   <footer>
     Config editors:
@@ -904,18 +941,33 @@ async function get(path) {
   return res.json();
 }
 
+// rows: [label, value, state?] where state is "ok" | "warn" | "bad" | "idle".
+// A state renders the value as a pw-pill; the text is always present, so the
+// meaning never depends on color alone.
 function put(id, rows) {
   const dl = document.getElementById(id);
   dl.innerHTML = "";
-  for (const [label, value, cls] of rows) {
+  for (const [label, value, state] of rows) {
     const dt = document.createElement("dt"); dt.textContent = label;
-    const dd = document.createElement("dd"); dd.textContent = value;
-    if (cls) dd.className = cls;
+    const dd = document.createElement("dd");
+    if (state) {
+      const pill = document.createElement("span");
+      pill.className = "pw-pill pw-pill--" + state;
+      pill.textContent = value;
+      dd.append(pill);
+    } else {
+      dd.textContent = value;
+    }
     dl.append(dt, dd);
   }
 }
 
-function text(id, value) { document.getElementById(id).textContent = value; }
+// empty=true marks the value as a pw-empty placeholder rather than real data.
+function text(id, value, empty) {
+  const el = document.getElementById(id);
+  el.textContent = value;
+  el.classList.toggle("pw-empty", !!empty);
+}
 
 async function refresh() {
   try {
@@ -955,14 +1007,15 @@ async function refresh() {
   try {
     const e = await get("/api/engine");
     text("engine", (e.drift_ok ? "OK — " : "DRIFT — ") + (e.text || ""));
-  } catch (e) { text("engine", String(e)); }
+  } catch (e) { text("engine", String(e), true); }
 
   for (const [id, path] of [["backups", "/api/backups"], ["snapshots", "/api/snapshots"]]) {
     try {
       const r = await get(path);
       const list = r.data || [];
-      text(id, list.length ? list.map(x => x.name).join("\n") : "(none)");
-    } catch (e) { text(id, String(e)); }
+      if (list.length) text(id, list.map(x => x.name).join("\n"));
+      else text(id, "(none)", true);
+    } catch (e) { text(id, String(e), true); }
   }
 }
 

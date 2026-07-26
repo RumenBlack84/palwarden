@@ -175,6 +175,63 @@ with the vendored editors being single files):
 * **Job log:** live view of the current/last job, polled while `running`.
 * Token entered once, kept in `sessionStorage`.
 
+### Component vocabulary
+
+The page ships no framework, so the "design system" is a fixed set of documented
+class names plus CSS custom properties. This exists so that anyone editing the
+page later — human or agent — has a closed vocabulary to reach for instead of
+inventing a new markup shape per widget. Treat additions to this table as spec
+changes, not incidental edits.
+
+Tokens (declared once on `:root`, both themes):
+
+| Token | Use |
+|-------|-----|
+| `--pw-bg`, `--pw-surface`, `--pw-border` | page, card, hairline |
+| `--pw-fg`, `--pw-fg-muted` | body text, secondary text |
+| `--pw-ok`, `--pw-warn`, `--pw-bad`, `--pw-idle` | the only four state colors |
+| `--pw-accent` | interactive affordance (links, focus ring) |
+| `--pw-space-1..4` | 4/8/16/24 px spacing scale |
+| `--pw-mono` | monospace stack for values, logs, argv |
+
+Components:
+
+| Class | What it is | Rules |
+|-------|------------|-------|
+| `pw-card` | Titled section box | Every top-level region is one. Title is an `<h2>`. |
+| `pw-stats` | Label/value grid (`<dl>` of `dt`/`dd`) | Labels prose, values `--pw-mono`. |
+| `pw-pill` | State badge | Exactly one of `pw-pill--ok/warn/bad/idle`. Text label always present — never color alone. |
+| `pw-btn` | Action button | `pw-btn--danger` marks disruptive actions; those require `pw-confirm`. Disabled while a job is `running`. |
+| `pw-confirm` | Modal confirmation | Names the action and the player-warning window. Focus-trapped, Esc cancels. |
+| `pw-log` | Monospace scroll region | `aria-live="polite"`, autoscrolls only when already at the bottom. |
+| `pw-toast` | Transient result | One at a time; errors persist until dismissed, successes auto-clear. |
+| `pw-empty` | No-data placeholder | Used instead of a blank region when a read returns `ok: false`. |
+
+Rules that apply everywhere:
+
+* **State is conveyed by text plus color, never color alone** (accessibility, and
+  it survives the terminal-ish themes people run).
+* **Values are monospace, labels are not.** Keeps drift/FPS/buildid scannable.
+* No inline styles and no per-widget one-off classes; extend a token or add a row
+  above.
+
+### Growing past one page
+
+Later pages (historical performance graphs, event history, per-restart drilldown)
+are planned. They stay separate static files under `webui/` — `palwarden.html`
+remains the control plane — and reuse the tokens and components above via one
+shared `webui/palwarden.css`, extracted at the point the second page lands. A
+shared `webui/palwarden.js` for auth-header handling and fetch/error plumbing
+follows the same rule: extracted when there is a second consumer, not before.
+
+Charts are the one place this vocabulary is likely to be insufficient. When
+historical graphs arrive, revisit the no-dependency constraint deliberately
+rather than by default: a small vendored chart library (or hand-rolled SVG, which
+is viable for time-series of this size) is preferable to a build step, but a
+React design system such as Meta's Astryx becomes a reasonable trade *if* the
+dashboard has by then grown enough pages to amortise adding a Node build stage to
+the image. That decision belongs in its own spec.
+
 The existing editors gain (increment 3, optional) a single "Apply via palwarden"
 hook that POSTs `config_apply`/`engine_apply`. If that turns out to require
 non-trivial edits to the vendored files, it moves into our page instead rather
