@@ -136,7 +136,6 @@ external-only users.
   (simpler to author). Leaning s6-overlay.
 - Whether to also publish a **slim tools-only image** for external-only users
   who don't want the SteamCMD base layer.
-- How to handle the `palworld-config-parser` binary — keep vendored, or replace
-  with an in-repo Python parser so the image has no opaque binary. Purely a
-  maintainability call now; licensing is settled (the project and the binary are
-  both AGPL-3.0 — see [`../CREDITS.md`](../CREDITS.md)).
+- ~~How to handle the `palworld-config-parser` binary~~ — **resolved**: replaced
+  by a first-party Python implementation, so the image contains no opaque
+  third-party executable (see [`../CREDITS.md`](../CREDITS.md)).

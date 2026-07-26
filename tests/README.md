@@ -25,6 +25,12 @@ integration tests as separate jobs on every push / PR.
     with a fake SteamCMD and manifest (check paths only; no update applied).
   - `test_public_info.sh` — `palworld-public-info-watch` reads config / resolves
     IP / writes the join-info state file, with fake `curl`/`sudo`.
+  - `test_config_parser.sh` — `palworld-config-parser`: env→INI key resolution
+    (including PascalCase quirks and the exceptions table), quoting/escaping,
+    enum + boolean + numeric handling, rejection of structure-breaking values,
+    secret redaction, idempotency, and a **systematic** check that every env var
+    documented in `config/settings.env.example` resolves against the full 90-key
+    fixture.
 - `integration/test_docker.sh` — builds the image and exercises real container
   scenarios: mode-based service selection, the systemctl shim, env-driven config
   application (`RESTAPIEnabled=True`), external-mode telemetry against a REST
@@ -35,15 +41,19 @@ integration tests as separate jobs on every push / PR.
 - `fixtures/` — a fake server (`fake-server/`, whose "binary" saves on SIGINT), a
   REST-serving fake server for the update flow (`fake-server-rest/`), a fake
   SteamCMD (`fake-steamcmd`, reports `STUB_REMOTE_BUILDID` and "installs" by
-  bumping the manifest), and a Palworld REST API stub (`rest-stub.py`).
+  bumping the manifest), a Palworld REST API stub (`rest-stub.py`), and
+  `PalWorldSettings.full.ini` — a realistic config with all 90 canonical keys
+  (quoted strings, bools, numbers, bare enums, and a paren tuple).
 
 ## What is and isn't covered
 
-Unit tests cover the container-only glue (shims, config rendering) with no
-dependencies. Integration tests cover container behavior end-to-end using a
-dummy server — they do **not** download or run the real Palworld server, so the
-real SteamCMD install/boot path and the third-party config parser's edits are
-exercised only against fixtures. A real embedded boot remains a manual check.
+Unit tests cover the first-party logic with no dependencies: the container glue
+(shims, config rendering) and the config parser (against a full 90-key fixture).
+Integration tests cover container behavior end-to-end using a dummy server — they
+do **not** download or run the real Palworld server, so the real SteamCMD
+install/boot path is exercised only by a manual embedded boot (last verified
+against Palworld v1.0.1: game installs, server boots, REST API healthy, config
+applied, graceful save-on-stop).
 
 ## Adding tests
 

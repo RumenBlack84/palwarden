@@ -7,17 +7,19 @@ is passed off as ours.
 
 ## Starting points / bundled components
 
-### Palworld Config Parser Tool
-- **Upstream:** pelican-eggs/Palworld-Config-Parser-Tool (v1.0.23)
-- **License:** **AGPL-3.0**
-- **How we use it:** `bin/palworld-config-parser` is the upstream prebuilt binary,
-  wrapped by `sbin/palworld-config-apply-env`. It's a starting point for our
-  config-apply flow.
-- **License note:** Because `palwarden` is itself AGPL-3.0, bundling and building
-  on this is consistent. If we ever adapt its **source** (not just call the
-  binary), that derived code is AGPL too — which is fine here. We may still
-  reimplement it in Python over time to reduce the opaque-binary dependency, not
-  for licensing reasons but for maintainability.
+### Palworld Config Parser Tool — inspiration (no longer bundled)
+- **Upstream:** pelican-eggs/Palworld-Config-Parser-Tool (v1.0.23), **AGPL-3.0**
+- **History:** we originally shipped the upstream *prebuilt binary* at
+  `bin/palworld-config-parser`, wrapped by `sbin/palworld-config-apply-env`. It
+  established the interface this project still uses: settings come from the
+  environment, the live `PalWorldSettings.ini` is edited in place.
+- **Now:** that binary has been **removed and replaced by our own Python
+  implementation** at the same path, so the repo and image contain no opaque
+  third-party executable. The reimplementation was written from the observable
+  interface (env-var names, Palworld's own INI format) — not from upstream source —
+  and resolves env names against the keys present in the live config rather than
+  copying any mapping table. Credit to the upstream project for the idea and the
+  interface; it is no longer a dependency.
 
 ### Palworld Dedicated Server Config Creator (web UI)
 - **Upstream:** BlinkZer0/Palworld-Dedicated-Server-Config-Creator

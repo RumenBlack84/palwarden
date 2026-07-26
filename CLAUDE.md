@@ -22,7 +22,7 @@ Start with `README.md`, `docs/architecture.md`, `docs/tools.md`, and
 |-----|------|
 | `sbin/` | Operational commands (bash + python3). The real logic. |
 | `lib/` | Sourced helpers (`palworld-notify`, config diff/summary). |
-| `bin/` | `palworld-config-parser` — third-party AGPL binary (see `CREDITS.md`). |
+| `bin/` | `palworld-config-parser` — first-party Python tool that applies env vars to `PalWorldSettings.ini` (replaced a third-party binary). |
 | `systemd/`, `needrestart/`, `config/` | Bare-metal units, hooks, config templates. |
 | `webui/` | Third-party MIT config editors (keep `LICENSE.upstream-mit`). |
 | `docker/` | Dockerfile, `compose.yaml`, entrypoint, `s6-rc.d/` services, shims. |

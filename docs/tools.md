@@ -201,16 +201,40 @@ Installed to `/usr/local/lib`, not run directly.
 
 ## `palworld-config-parser`
 
-`/usr/local/bin/palworld-config-parser` — a **prebuilt static ELF binary** from
-[pelican-eggs/Palworld-Config-Parser-Tool](https://github.com/pelican-eggs)
-(v1.0.23), licensed **AGPL-3.0**. It edits
-`Pal/Saved/Config/LinuxServer/PalWorldSettings.ini` in the current working
-directory from environment variables; `palworld-config-apply-env` wraps it.
+`/usr/local/bin/palworld-config-parser` — first-party **Python** tool that applies
+environment variables to `PalWorldSettings.ini`. Wrapped by
+`palworld-config-apply-env`; also usable directly:
 
-> **Licensing:** `palwarden` is itself AGPL-3.0, so bundling and building on this
-> is consistent — see [`CREDITS.md`](../CREDITS.md). Longer term we may
-> reimplement it in Python to drop the opaque-binary dependency (a
-> maintainability goal, not a licensing requirement).
+```bash
+palworld-config-parser                                  # ./Pal/Saved/.../PalWorldSettings.ini from env
+palworld-config-parser --config FILE --env-file FILE    # explicit paths
+palworld-config-parser --dry-run                        # report without writing
+```
+
+**How env names map to INI keys:** instead of a hardcoded table of ~90 mappings,
+keys are resolved against the keys *present in the live config* — compared with
+underscores removed, case-insensitively, and allowing Unreal's `b` boolean prefix.
+So `PAL_AUTO_HP_REGENE_RATE` finds `PalAutoHPRegeneRate`, `IS_PVP` finds `bIsPvP`,
+and keys added by future game updates work with no code change. Only genuinely
+irregular names (`MAX_PLAYERS` → `ServerPlayerMaxNum`, `SERVER_PORT` →
+`PublicPort`, `ENABLE_ENEMY` → `bEnableInvaderEnemy`, …) need the small
+`EXCEPTIONS` table.
+
+**Safety:** only keys whose env var is set are touched (every other byte is
+preserved); each value keeps its existing shape, with the live file acting as the
+schema — quoted strings stay quoted and escaped, booleans stay `True`/`False`,
+numbers stay numeric, and Palworld's bare enums (`Difficulty=None`) stay bare
+tokens. A value that would corrupt the config is **rejected with a warning**
+rather than written. Secret values (`AdminPassword`, `ServerPassword`) are applied
+but never printed.
+
+**Known limitation:** tuple-valued settings (`CrossplayPlatforms=(Steam,Xbox,…)`)
+are parsed and preserved intact but cannot be *changed* by this tool; edit them by
+hand or via the web UI.
+
+> This replaced a prebuilt AGPL binary from
+> [pelican-eggs/Palworld-Config-Parser-Tool](https://github.com/pelican-eggs),
+> which established the interface. See [`CREDITS.md`](../CREDITS.md).
 
 ---
 

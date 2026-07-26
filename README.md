@@ -20,7 +20,7 @@ publishing.
 | Path | Contents |
 |------|----------|
 | `sbin/` | Operational admin commands (installed to `/usr/local/sbin`). The main entry points operators run. |
-| `bin/` | `palworld-config-parser` — prebuilt helper binary that edits `PalWorldSettings.ini` from env vars (installed to `/usr/local/bin`). See [attribution](#third-party-components). |
+| `bin/` | `palworld-config-parser` — applies env vars to `PalWorldSettings.ini` (installed to `/usr/local/bin`). |
 | `lib/` | Shared helpers sourced/called by the scripts: Discord notify, config diff/summary (installed to `/usr/local/lib`). |
 | `systemd/` | `*.service` / `*.timer` units for the server and its background jobs (installed to `/etc/systemd/system`). |
 | `needrestart/` | Hooks so unattended `apt` upgrades don't hard-restart the server outside the graceful flow. |
@@ -162,8 +162,10 @@ helpers cannot authenticate.
 `palwarden` builds on two upstream projects; full attribution and license
 mapping is in [`CREDITS.md`](CREDITS.md):
 
-- **pelican-eggs/Palworld-Config-Parser-Tool** (AGPL-3.0) — the starting point
-  for our config-apply flow (`bin/palworld-config-parser`).
+- **pelican-eggs/Palworld-Config-Parser-Tool** (AGPL-3.0) — established the
+  interface for our config-apply flow. Its prebuilt binary has since been
+  replaced by our own Python implementation, so no third-party executable ships
+  here.
 - **BlinkZer0/Palworld-Dedicated-Server-Config-Creator** (MIT) — the basis for
   our in-browser config editors (`webui/`); its MIT notice is retained at
   `webui/LICENSE.upstream-mit`.
