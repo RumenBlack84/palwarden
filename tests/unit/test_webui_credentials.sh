@@ -56,8 +56,11 @@ PALWARDEN_WEBUI_ENV="$ENVF3" WEBUI_USER=ygg WEBUI_PASSWORD="$special_pw" \
 # on disk the value must appear escaped (backslash, quote and dollar all backslash-escaped)
 # shellcheck disable=SC2016
 assert_file_contains "$ENVF3" 'WEBUI_PASSWORD="p\"w\\a\$s"' "special chars are escaped on disk"
-# --serve must load the escaped file without hitting the "missing credentials" failure path
-out3="$(PALWARDEN_WEBUI_ENV="$ENVF3" python3 "$WEBUI" --serve 2>&1)"
+# --serve must load the escaped file without hitting the "missing credentials" failure path.
+# It now actually binds and serves forever, so bound it with `timeout` — we only care
+# about what it prints before/while starting up, not that it runs indefinitely.
+out3="$(PALWARDEN_WEBUI_ENV="$ENVF3" PALWARDEN_WEBUI_PORT=18098 \
+  timeout 2 python3 "$WEBUI" --serve 2>&1)"
 assert_not_contains "$out3" "missing" "escaped credentials load cleanly (round-trip via loader)"
 assert_not_contains "$out3" "Traceback" "no traceback loading escaped credentials"
 

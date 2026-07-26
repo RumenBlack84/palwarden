@@ -15,12 +15,41 @@ access goes through an SSH tunnel, which supplies the encryption.
 from __future__ import annotations
 
 import argparse
+import base64
+import hmac
+import http.server
+import importlib.machinery
+import importlib.util
+import json
 import os
+import re
 import secrets
+import socketserver
+import subprocess
 import sys
+import urllib.parse
 from pathlib import Path
 
 WEBUI_ENV = Path(os.environ.get("PALWARDEN_WEBUI_ENV", "/etc/palworld/webui.env"))
+
+WEB_ROOT = Path(os.environ.get("PALWARDEN_WEBUI_ROOT", "/opt/palworld/tools/config-webui"))
+BIND = os.environ.get("PALWARDEN_WEBUI_BIND", "127.0.0.1")
+PORT = int(os.environ.get("PALWARDEN_WEBUI_PORT", "8088"))
+SBIN = Path(os.environ.get("PALWARDEN_SBIN_DIR", "/usr/local/sbin"))
+PARSER_BIN = Path(os.environ.get("PALWARDEN_PARSER_BIN", "/usr/local/bin/palworld-config-parser"))
+CONFIG_FILE = Path(os.environ.get(
+    "PALWORLD_CONFIG_FILE",
+    "/opt/palworld/server/Pal/Saved/Config/LinuxServer/PalWorldSettings.ini"))
+# NOTE: PALWORLD_BACKUP_DIR already means *config* backups elsewhere in this repo,
+# so world-save backups get their own variable.
+SAVE_BACKUP_DIR = Path(os.environ.get("PALWARDEN_SAVE_BACKUP_DIR", "/opt/palworld/backups"))
+SNAPSHOT_DIR = Path(os.environ.get("PALWARDEN_SNAPSHOT_DIR", "/opt/palworld/config-snapshots"))
+
+SECRET_KEYS = {"adminpassword", "serverpassword"}
+# Windows palworld-fps accepts for `report --window`.
+FPS_REPORT_WINDOWS = {"5m", "60m", "24h", "7d"}
+WINDOW_RE = re.compile(r"^\d{1,4}[mhd]$")
+REALM = "palwarden"
 
 REQUIRED_KEYS = ("WEBUI_USER", "WEBUI_PASSWORD", "WEBUI_TOKEN")
 
@@ -101,6 +130,285 @@ def init_credentials(path: Path = WEBUI_ENV) -> tuple[dict[str, str], bool]:
     return creds, True
 
 
+def check_basic(header: str | None, creds: dict[str, str]) -> bool:
+    """Validate an HTTP Basic header in constant time."""
+    if not header or not header.startswith("Basic "):
+        return False
+    try:
+        decoded = base64.b64decode(header[6:], validate=True).decode("utf-8", "replace")
+    except Exception:
+        return False
+    user, sep, password = decoded.partition(":")
+    if not sep:
+        return False
+    ok_user = hmac.compare_digest(user, creds["WEBUI_USER"])
+    ok_pass = hmac.compare_digest(password, creds["WEBUI_PASSWORD"])
+    return ok_user and ok_pass
+
+
+def allowed_roots() -> list[Path]:
+    """Directories the static server may serve from.
+
+    The web root contains a deliberate `current` symlink into the live config
+    directory, so that directory is allowed too — but nothing else is.
+    """
+    roots = []
+    for candidate in (WEB_ROOT, CONFIG_FILE.parent):
+        try:
+            roots.append(candidate.resolve())
+        except OSError:
+            continue
+    return roots
+
+
+def resolve_static(url_path: str) -> Path | None:
+    """Map a URL path to a file inside the allowed roots, or None."""
+    clean = urllib.parse.unquote(urllib.parse.urlparse(url_path).path)
+    if clean in ("", "/"):
+        clean = "/palwarden.html"
+    candidate = (WEB_ROOT / clean.lstrip("/"))
+    try:
+        resolved = candidate.resolve()
+    except OSError:
+        return None
+    if not any(resolved == root or root in resolved.parents for root in allowed_roots()):
+        return None
+    return resolved if resolved.is_file() else None
+
+
+def run_tool(argv: list[str], timeout: int = 30) -> dict:
+    """Run a read-only tool. A failure is data, not an exception."""
+    try:
+        proc = subprocess.run(argv, text=True, capture_output=True,
+                              timeout=timeout, check=False)
+    except FileNotFoundError:
+        return {"ok": False, "error": f"{argv[0]} is not installed"}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": f"{argv[0]} timed out after {timeout}s"}
+    except OSError as exc:
+        return {"ok": False, "error": f"{argv[0]} failed: {exc}"}
+    return {
+        "ok": True,
+        "returncode": proc.returncode,
+        "stdout": proc.stdout,
+        "stderr": proc.stderr[:500],
+    }
+
+
+def run_tool_json(argv: list[str], timeout: int = 30) -> dict:
+    result = run_tool(argv, timeout)
+    if not result["ok"]:
+        return result
+    try:
+        return {"ok": True, "data": json.loads(result["stdout"] or "{}")}
+    except json.JSONDecodeError as exc:
+        return {"ok": False, "error": f"{argv[0]} returned invalid JSON: {exc}"}
+
+
+def pick_window(query: dict[str, list[str]], default: str = "24h",
+                allowed: set[str] | None = None) -> str:
+    """Validate a window parameter; never pass an unvetted string to a tool."""
+    value = (query.get("window") or query.get("since") or [default])[0]
+    if allowed is not None:
+        return value if value in allowed else default
+    return value if WINDOW_RE.match(value) else default
+
+
+def load_parser_module():
+    """Reuse the config parser's OptionSettings splitter instead of duplicating it.
+
+    palworld-health-report already loads palworld-fps this way.
+    """
+    loader = importlib.machinery.SourceFileLoader("palwarden_cfg_parser", str(PARSER_BIN))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = module
+    loader.exec_module(module)
+    return module
+
+
+def ep_health(_query: dict) -> dict:
+    return run_tool_json([str(SBIN / "palworld-health-report"), "report", "--json"], 60)
+
+
+def ep_fps(query: dict) -> dict:
+    window = pick_window(query, "24h", FPS_REPORT_WINDOWS)
+    return run_tool_json([str(SBIN / "palworld-fps"), "report", "--json",
+                          "--no-live", "--window", window])
+
+
+def ep_events(query: dict) -> dict:
+    window = pick_window(query, "24h")
+    return run_tool_json([str(SBIN / "palworld-fps"), "events",
+                          "--window", window, "--json"])
+
+
+def ep_service_events(query: dict) -> dict:
+    window = pick_window(query, "24h")
+    return run_tool_json([str(SBIN / "palworld-service-events"), "summary",
+                          "--since", window, "--json"])
+
+
+def ep_engine(_query: dict) -> dict:
+    result = run_tool([str(SBIN / "palworld-engine-config"), "status", "--check"])
+    if not result["ok"]:
+        return result
+    return {"ok": True, "drift_ok": result["returncode"] == 0,
+            "text": result["stdout"].strip() or result["stderr"].strip()}
+
+
+def ep_config(_query: dict) -> dict:
+    try:
+        text = CONFIG_FILE.read_text(errors="replace")
+    except OSError as exc:
+        return {"ok": False, "error": f"cannot read {CONFIG_FILE}: {exc}"}
+    match = re.search(r"^OptionSettings=\((.*)\)[ \t]*$", text, re.MULTILINE)
+    if not match:
+        return {"ok": False, "error": f"no OptionSettings=(...) line in {CONFIG_FILE}"}
+    try:
+        split = load_parser_module().split_settings
+    except Exception as exc:
+        return {"ok": False, "error": f"cannot load the config parser: {exc}"}
+    settings: dict[str, str] = {}
+    for part in split(match.group(1)):
+        key, sep, value = part.partition("=")
+        if not sep:
+            continue
+        key = key.strip()
+        value = value.strip()
+        if key.lower() in SECRET_KEYS:
+            settings[key] = "<redacted>"
+        else:
+            settings[key] = value[1:-1] if len(value) >= 2 and value[0] == value[-1] == '"' else value
+    return {"ok": True, "data": settings}
+
+
+def _list_dir(path: Path, limit: int = 50) -> dict:
+    if not path.is_dir():
+        return {"ok": True, "data": []}
+    entries = []
+    for item in sorted(path.iterdir(), key=lambda p: p.name, reverse=True)[:limit]:
+        try:
+            stat = item.stat()
+        except OSError:
+            continue
+        entries.append({"name": item.name, "bytes": stat.st_size,
+                        "modified": int(stat.st_mtime)})
+    return {"ok": True, "data": entries}
+
+
+def ep_backups(_query: dict) -> dict:
+    return _list_dir(SAVE_BACKUP_DIR)
+
+
+def ep_snapshots(_query: dict) -> dict:
+    return _list_dir(SNAPSHOT_DIR)
+
+
+READ_ENDPOINTS = {
+    "/api/health": ep_health,
+    "/api/fps": ep_fps,
+    "/api/events": ep_events,
+    "/api/service-events": ep_service_events,
+    "/api/engine": ep_engine,
+    "/api/config": ep_config,
+    "/api/backups": ep_backups,
+    "/api/snapshots": ep_snapshots,
+}
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "palwarden-webui"
+    credentials: dict[str, str] = {}
+
+    # --- helpers ----------------------------------------------------------
+    def _send_json(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload, indent=2, sort_keys=True).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _challenge(self) -> None:
+        body = b"authentication required\n"
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", f'Basic realm="{REALM}"')
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _authenticated(self) -> bool:
+        if check_basic(self.headers.get("Authorization"), self.credentials):
+            return True
+        self._challenge()
+        return False
+
+    # --- routes -----------------------------------------------------------
+    def do_GET(self) -> None:  # noqa: N802 - stdlib naming
+        if not self._authenticated():
+            return
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path.startswith("/api/"):
+            handler = READ_ENDPOINTS.get(parsed.path)
+            if handler is None:
+                self._send_json(404, {"ok": False, "error": "unknown endpoint"})
+                return
+            query = urllib.parse.parse_qs(parsed.query)
+            try:
+                self._send_json(200, handler(query))
+            except Exception as exc:  # never leak a traceback to the browser
+                self._send_json(500, {"ok": False, "error": f"internal error: {exc}"})
+            return
+
+        target = resolve_static(self.path)
+        if target is None:
+            self.send_error(404, "not found")
+            return
+        try:
+            data = target.read_bytes()
+        except OSError:
+            self.send_error(404, "not found")
+            return
+        ctype = {
+            ".html": "text/html; charset=utf-8",
+            ".ini": "text/plain; charset=utf-8",
+            ".css": "text/css",
+            ".js": "application/javascript",
+            ".svg": "image/svg+xml",
+            ".json": "application/json",
+        }.get(target.suffix, "application/octet-stream")
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_POST(self) -> None:  # noqa: N802
+        if not self._authenticated():
+            return
+        # Mutating endpoints arrive in increment 2, together with the root worker.
+        self._send_json(501, {"ok": False,
+                              "error": "mutating endpoints are not implemented yet"})
+
+    # --- logging: request lines only, never headers -----------------------
+    def log_message(self, fmt: str, *args) -> None:
+        sys.stderr.write("%s %s\n" % (self.address_string(), fmt % args))
+
+
+class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def make_server(creds: dict[str, str]) -> ThreadingHTTPServer:
+    Handler.credentials = creds
+    return ThreadingHTTPServer((BIND, PORT), Handler)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="palwarden web UI server")
     ap.add_argument("--init-credentials", action="store_true",
@@ -120,8 +428,16 @@ def main() -> int:
         return 0
 
     if args.serve:
-        load_credentials(WEBUI_ENV)   # fail closed before binding anything
-        print("serve not implemented yet", file=sys.stderr)
+        creds = load_credentials(WEBUI_ENV)   # fail closed before binding
+        if os.geteuid() == 0:
+            sys.exit("error: refusing to run as root; run as the palworld/steam user.")
+        httpd = make_server(creds)
+        print(f"palwarden-webui listening on {BIND}:{PORT} (root {WEB_ROOT})",
+              file=sys.stderr)
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            pass
         return 0
 
     ap.print_help()
