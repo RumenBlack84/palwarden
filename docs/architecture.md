@@ -28,6 +28,8 @@ How the `palwarden` pieces fit together on a running host.
    │   (every 5m)                                  ▲                          │
    │  public-info-watch ────► palworld-public-info-watch                     │
    │   (every 10m)              writes public-info.env                       │
+   │  service-events.timer ─► palworld-service-events sample                 │
+   │   (every 1m)               records restarts/outages as markers          │
    │  fps-daily-report ─────► palworld-health-report discord ──┐            │
    │   (09:00 ET)                                               │            │
    └───────────────────────────────────────────────────────────┼───────────┘
@@ -78,8 +80,14 @@ script calls. It reads the Discord webhook from `/etc/palworld/notify.env` and
 no-ops silently if that file is absent, so the tooling runs fine without Discord.
 
 **7. Watchers** — one-shot timer jobs: `memory-watch` (graceful restart over a
-RAM threshold), `public-info-watch` (republish join info on change), and
+memory threshold — the container's cgroup limit when there is one, else host RAM),
+`service-events` (notice restarts/outages and record them as markers, classified
+planned vs unexpected), `public-info-watch` (republish join info on change), and
 `launch-watch` (a dated one-off for the Palworld 1.0 launch — see below).
+
+Restart detection is observational on purpose: systemd's `NRestarts` resets with
+the unit and s6 keeps no counter, so sampling state + main PID is the only measure
+that means the same thing on bare metal and in the container.
 
 ## Data / state directories
 
@@ -91,7 +99,7 @@ RAM threshold), `public-info-watch` (republish join info on change), and
 | `/opt/palworld/config-backups` | `palworld` | Timestamped `PalWorldSettings.ini` / `Engine.ini` backups. |
 | `/opt/palworld/config-snapshots` | `palworld` | Labeled config+state snapshots. |
 | `/etc/palworld` | mixed | `settings.env`, `notify.env`, `engine.env`, templates. |
-| `/var/lib/palworld` | root/palworld | `metrics.sqlite3`, `public-info.env`. |
+| `/var/lib/palworld` | root/palworld | `metrics.sqlite3`, `public-info.env`, `service-events.json` (last observed service state). |
 | `/var/log/palworld` | palworld | `server.log`. |
 | `/run/palworld-*.lock` | — | `flock` files preventing overlapping timer runs. |
 

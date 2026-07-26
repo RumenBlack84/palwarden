@@ -98,6 +98,10 @@ via env (as the existing scripts do). Fixtures live in `tests/fixtures/`.
 - **Bash `trap` on TERM does not fire reliably under s6.** Don't rely on it for
   service shutdown — use the service's `down-signal`, or let default termination
   handle it (see `palwarden-run-periodic`).
+- **`s6-svstat` needs root.** Jobs that run as `steam` cannot query s6 service
+  state, so the `systemctl` shim falls back to finding the game process for
+  `palworld-server`. Watch for this when adding an unprivileged job: testing it
+  via `docker exec` (which runs as root) hides the problem entirely.
 - **`pkill -f <pattern>`** matches the invoking shell if its command line
   contains the pattern — avoid in tests; `pkill` skips its own pid but not a
   parent `sh -c '...pattern...'`.
