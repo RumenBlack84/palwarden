@@ -23,3 +23,6 @@ tests/fixtures/fake-server/Pal/Saved/
 
 # Claude Code local state (permission allowlists, temp files)
 .claude/
+
+# Subagent-driven-development scratch state
+.superpowers/
