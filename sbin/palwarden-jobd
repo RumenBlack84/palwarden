@@ -1,0 +1,438 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Brian Grant
+"""Root worker for the web UI control plane's job queue.
+
+Runs as root. Its only input is a job file dropped in `PALWARDEN_JOBS_DIR` by
+`palwarden-webui`, which runs unprivileged and is treated as untrusted: a bug
+in that HTTP handler, or a hand-edited job file, must not be able to run
+anything this worker did not itself validate. So every action name and every
+parameter is re-checked here, from scratch, against a fixed allowlist — the
+job file's contents are a *request*, never a command.
+
+Every action maps to a fixed argv list built from typed, validated slots.
+Nothing is ever passed through a shell, and no parameter is ever interpolated
+into a string that reaches one.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import importlib.machinery
+import importlib.util
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# Mirror how palworld-health-report locates palworld-fps: prepend the
+# bare-metal lib dir and the repo's lib/ so `palwarden_jobs` resolves in both
+# installed and dev-checkout layouts (tests set PYTHONPATH instead).
+sys.path.insert(0, "/usr/local/lib")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import palwarden_jobs as jobs  # noqa: E402
+
+SBIN = Path(os.environ.get("PALWARDEN_SBIN_DIR", "/usr/local/sbin"))
+ENGINE_ENV = Path(os.environ.get("PALWORLD_ENGINE_ENV", "/etc/palworld/engine.env"))
+BACKUP_DIR = Path(os.environ.get("PALWORLD_BACKUP_DIR", "/opt/palworld/config-backups"))
+# Deliberately NOT derived from SBIN: SBIN is where *invoked commands* live
+# (tests point it at stub binaries), but the module we load here for its
+# setting definitions is palwarden-jobd's own neighbour — same directory in
+# both the installed layout (/usr/local/sbin) and a dev checkout (repo sbin/).
+ENGINE_CONFIG_BIN = Path(os.environ.get(
+    "PALWARDEN_ENGINE_CONFIG_BIN", str(Path(__file__).resolve().parent / "palworld-engine-config")))
+JOBD_LOCK = Path(os.environ.get("PALWARDEN_JOBD_LOCK", "/run/palwarden-jobd.lock"))
+JOBD_INTERVAL = float(os.environ.get("PALWARDEN_JOBD_INTERVAL", "2"))
+
+LABEL_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+
+
+def load_engine_config_module():
+    """Load palworld-engine-config as a module rather than duplicating its
+    settings table: the 15 known engine settings, their types and their
+    min/max ranges must live in exactly one place.
+
+    Same pattern as palworld-health-report's load_fps_module / palwarden-webui's
+    load_parser_module (hyphenated script names cannot be imported normally).
+    """
+    loader = importlib.machinery.SourceFileLoader("palwarden_engine_config_for_jobd", str(ENGINE_CONFIG_BIN))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = module
+    loader.exec_module(module)
+    return module
+
+
+_engine = load_engine_config_module()
+SETTING_BY_ENV = _engine.SETTING_BY_ENV
+normalize_value = _engine.normalize_value
+
+
+# --- parameter validators ---------------------------------------------------
+# Each raises ValueError with a message safe to surface in job output.
+
+
+def validate_label(params: dict, key: str = "label") -> str:
+    value = params.get(key)
+    if not isinstance(value, str) or not LABEL_RE.fullmatch(value):
+        raise ValueError(f"{key} must match {LABEL_RE.pattern!r}, got {value!r}")
+    return value
+
+
+def validate_text(params: dict, key: str = "text") -> str:
+    value = params.get(key)
+    if not isinstance(value, str) or len(value) > 200 or not value.isprintable():
+        raise ValueError(f"{key} must be <=200 printable characters")
+    return value
+
+
+def validate_wait(params: dict) -> int:
+    value = params.get("wait")
+    # bool is an int subclass in Python; reject it explicitly so {"wait": true}
+    # doesn't silently become wait=1.
+    if isinstance(value, bool) or not isinstance(value, int) or not (0 <= value <= 1800):
+        raise ValueError(f"wait must be an integer 0-1800, got {value!r}")
+    return value
+
+
+def validate_dry_run(params: dict) -> bool:
+    value = params.get("dry_run", False)
+    if not isinstance(value, bool):
+        raise ValueError(f"dry_run must be a boolean, got {value!r}")
+    return value
+
+
+def validate_backup(params: dict) -> str:
+    value = params.get("backup")
+    if not isinstance(value, str) or "/" in value or "\\" in value:
+        raise ValueError(f"backup must be a bare file name, got {value!r}")
+    if not (BACKUP_DIR / value).is_file():
+        raise ValueError(f"backup not found: {value!r}")
+    return value
+
+
+def validate_message(params: dict) -> str | None:
+    # message is optional; validate only when present.
+    if "message" not in params or params.get("message") is None:
+        return None
+    return validate_text(params, "message")
+
+
+def validate_settings(params: dict) -> dict[str, str]:
+    raw = params.get("settings")
+    if not isinstance(raw, dict) or not raw:
+        raise ValueError("settings must be a non-empty object")
+    normalised: dict[str, str] = {}
+    for key, value in raw.items():
+        setting = SETTING_BY_ENV.get(key)
+        if setting is None:
+            raise ValueError(f"unknown engine setting: {key!r}")
+        if not isinstance(value, str):
+            raise ValueError(f"{key} value must be a string, got {value!r}")
+        normalised[key] = normalize_value(setting, value)
+    return normalised
+
+
+def require_confirm(params: dict) -> None:
+    if params.get("confirm") is not True:
+        raise ValueError("disruptive action requires confirm: true")
+
+
+# --- engine_save: the one action that writes a file instead of running a
+# command ---------------------------------------------------------------
+
+
+def write_engine_env(settings: dict[str, str]) -> None:
+    """Atomically (re)write ENGINE_ENV from already-normalised settings.
+
+    Never destroys an existing file on failure: write a temp file in the same
+    directory, rename it into place, then re-read and re-parse it to confirm
+    the result is sane before declaring success.
+    """
+    ENGINE_ENV.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "# Generated by palwarden-jobd (engine_save). Do not edit by hand;",
+        "# use the Engine.ini performance editor instead.",
+        f"# Written: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}",
+        "",
+    ]
+    for key, value in sorted(settings.items()):
+        lines.append(f"{key}={value}")
+    text = "\n".join(lines) + "\n"
+
+    tmp = ENGINE_ENV.with_name(ENGINE_ENV.name + ".tmp")
+    fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+        os.chmod(tmp, 0o644)  # belt-and-braces: independent of umask
+        tmp.replace(ENGINE_ENV)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+    # Confirm the file we just wrote actually parses back to what we wrote —
+    # a self-check against a corrupt/truncated write, using the same reader
+    # palworld-engine-config uses (one parser, not a second copy).
+    reparsed = _engine.parse_env(ENGINE_ENV)
+    for key, value in settings.items():
+        if reparsed.get(key) != value:
+            raise ValueError(f"engine.env write did not round-trip for {key}")
+
+
+# --- action table ------------------------------------------------------------
+# Each entry maps to argv(params) -> list of argv lists, run in order, plus
+# whether the action is disruptive (requires confirm). engine_save has no
+# command at all — it only writes a file — so it is handled separately in
+# build_commands/run_job.
+
+
+def _argv_config_apply(_params: dict) -> list[list[str]]:
+    return [[str(SBIN / "palworld-config-apply-env")]]
+
+
+def _argv_engine_apply(params: dict) -> list[list[str]]:
+    dry_run = validate_dry_run(params)
+    argv = [str(SBIN / "palworld-engine-config"), "apply"]
+    if dry_run:
+        argv.append("--dry-run")
+    return [argv]
+
+
+def _argv_config_pretty(_params: dict) -> list[list[str]]:
+    return [[str(SBIN / "palworld-config-pretty")]]
+
+
+def _argv_snapshot_create(params: dict) -> list[list[str]]:
+    label = validate_label(params)
+    return [[str(SBIN / "palworld-config-snapshot"), "create", label]]
+
+
+def _argv_backup(_params: dict) -> list[list[str]]:
+    return [[str(SBIN / "palworld-backup")]]
+
+
+def _argv_mark(params: dict) -> list[list[str]]:
+    text = validate_text(params)
+    return [[str(SBIN / "palworld-fps"), "mark", text, "--category", "manual"]]
+
+
+def _argv_graceful_restart(params: dict) -> list[list[str]]:
+    wait = validate_wait(params)
+    message = validate_message(params)
+    argv = [str(SBIN / "palworld-graceful-restart"), "--wait", str(wait)]
+    if message is not None:
+        argv += ["--message", message]
+    return [argv]
+
+
+def _argv_graceful_stop(params: dict) -> list[list[str]]:
+    wait = validate_wait(params)
+    message = validate_message(params)
+    argv = [str(SBIN / "palworld-graceful-stop"), "--wait", str(wait)]
+    if message is not None:
+        argv += ["--message", message]
+    return [argv]
+
+
+def _argv_update_check(_params: dict) -> list[list[str]]:
+    return [[str(SBIN / "palworld-update"), "--check"]]
+
+
+def _argv_update_apply(params: dict) -> list[list[str]]:
+    wait = validate_wait(params)
+    return [[str(SBIN / "palworld-update"), "--wait", str(wait)]]
+
+
+def _argv_engine_rollback(params: dict) -> list[list[str]]:
+    backup = validate_backup(params)
+    return [[str(SBIN / "palworld-engine-config"), "rollback", backup]]
+
+
+def _argv_api_save(_params: dict) -> list[list[str]]:
+    return [[str(SBIN / "palworld-api-save")]]
+
+
+def _argv_engine_save_apply_restart(params: dict) -> list[list[str]]:
+    # engine_save itself writes no command (build_commands handles it before
+    # calling here); this only builds the apply + restart steps that follow.
+    wait = validate_wait(params)
+    return [
+        [str(SBIN / "palworld-engine-config"), "apply"],
+        [str(SBIN / "palworld-graceful-restart"), "--wait", str(wait)],
+    ]
+
+
+ACTIONS: dict[str, dict] = {
+    "config_apply": {"argv": _argv_config_apply, "disruptive": False},
+    "engine_apply": {"argv": _argv_engine_apply, "disruptive": False},
+    "config_pretty": {"argv": _argv_config_pretty, "disruptive": False},
+    "snapshot_create": {"argv": _argv_snapshot_create, "disruptive": False},
+    "backup": {"argv": _argv_backup, "disruptive": False},
+    "mark": {"argv": _argv_mark, "disruptive": False},
+    "engine_save": {"argv": None, "disruptive": False},
+    "graceful_restart": {"argv": _argv_graceful_restart, "disruptive": True},
+    "graceful_stop": {"argv": _argv_graceful_stop, "disruptive": True},
+    "update_check": {"argv": _argv_update_check, "disruptive": True},
+    "update_apply": {"argv": _argv_update_apply, "disruptive": True},
+    "engine_rollback": {"argv": _argv_engine_rollback, "disruptive": True},
+    "api_save": {"argv": _argv_api_save, "disruptive": True},
+    "engine_save_apply_restart": {"argv": _argv_engine_save_apply_restart, "disruptive": True},
+}
+
+
+def validate_params(action: str, params: dict) -> tuple[dict | None, str | None]:
+    """Re-validate action + params from scratch. Returns (normalised_params, error).
+
+    Exactly one of the two return slots is populated. Never trust that params
+    already passed validation elsewhere (the API, or an earlier version of this
+    same job file) — the job file is untrusted input.
+    """
+    spec = ACTIONS.get(action)
+    if spec is None:
+        return None, f"{action!r} is not an allowed action"
+    if not isinstance(params, dict):
+        return None, "params must be an object"
+    if spec["disruptive"]:
+        try:
+            require_confirm(params)
+        except ValueError as exc:
+            return None, str(exc)
+    try:
+        normalised = dict(params)
+        if action in ("engine_save", "engine_save_apply_restart"):
+            normalised["settings"] = validate_settings(params)
+        if action in ("graceful_restart", "graceful_stop", "update_apply", "engine_save_apply_restart"):
+            normalised["wait"] = validate_wait(params)
+        if action in ("graceful_restart", "graceful_stop"):
+            normalised["message"] = validate_message(params)
+        if action == "engine_apply":
+            normalised["dry_run"] = validate_dry_run(params)
+        if action == "snapshot_create":
+            normalised["label"] = validate_label(params)
+        if action == "mark":
+            normalised["text"] = validate_text(params)
+        if action == "engine_rollback":
+            normalised["backup"] = validate_backup(params)
+    except ValueError as exc:
+        return None, str(exc)
+    return normalised, None
+
+
+def build_commands(action: str, params: dict) -> list[list[str]]:
+    """Build the fixed argv list(s) for an already-validated action+params.
+
+    Callers must run validate_params first; this does not re-validate (it can
+    raise if given bad input, but run_job always calls validate_params first).
+    """
+    spec = ACTIONS[action]
+    if spec["argv"] is None:
+        return []  # engine_save: file-only, no command
+    return spec["argv"](params)
+
+
+def run_job(job: dict) -> int:
+    """Validate, then execute a job's steps in order, recording output/state.
+
+    Stops at the first failing step (composite actions like
+    engine_save_apply_restart never reach a restart after a failed apply).
+    Returns the exit code recorded on the job (0 on success).
+    """
+    job_id = job["id"]
+    action = job.get("action")
+    params, error = validate_params(action, job.get("params") or {})
+    if error is not None:
+        jobs.append_output(job_id, f"refused: {error}\n")
+        jobs.update_job(job_id, state="failed", exit_code=1, finished_at=int(time.time()))
+        return 1
+
+    # engine_save (and the save half of the composite action) writes a file
+    # rather than running a command; do that first so a bad write fails the
+    # whole job before any command runs.
+    if action in ("engine_save", "engine_save_apply_restart"):
+        try:
+            write_engine_env(params["settings"])
+        except (OSError, ValueError) as exc:
+            jobs.append_output(job_id, f"engine_save failed: {exc}\n")
+            jobs.update_job(job_id, state="failed", exit_code=1, finished_at=int(time.time()))
+            return 1
+        jobs.append_output(job_id, "wrote engine.env\n")
+
+    exit_code = 0
+    for argv in build_commands(action, params):
+        try:
+            result = subprocess.run(argv, capture_output=True, text=True, timeout=1800, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            jobs.append_output(job_id, f"failed to run {argv!r}: {exc}\n")
+            exit_code = 1
+            break
+        jobs.append_output(job_id, result.stdout)
+        if result.stderr:
+            jobs.append_output(job_id, result.stderr)
+        exit_code = result.returncode
+        if exit_code != 0:
+            break
+
+    state = "succeeded" if exit_code == 0 else "failed"
+    jobs.update_job(job_id, state=state, exit_code=exit_code, finished_at=int(time.time()))
+    return exit_code
+
+
+def reap_orphans() -> int:
+    """Mark any job left `running` (from a crash/restart) as failed.
+
+    A job can only be `running` here because a previous worker claimed it and
+    then died before finishing — this process only ever sees `running` jobs
+    of its own making, moved there by claim_next just before run_job.
+    """
+    reaped = 0
+    for job in jobs.list_jobs(limit=1000):
+        if job.get("state") == "running":
+            jobs.append_output(job["id"], "worker restarted; this job did not finish\n")
+            jobs.update_job(job["id"], state="failed", exit_code=1, finished_at=int(time.time()))
+            reaped += 1
+    return reaped
+
+
+def poll_once() -> None:
+    # claim_next is an unlocked read-modify-write; that is safe here only
+    # because main()'s flock ensures at most one worker process ever calls it.
+    job = jobs.claim_next()
+    if job is not None:
+        run_job(job)
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if "--reap" in args:
+        reap_orphans()
+        return 0
+    if "--once" in args:
+        reap_orphans()
+        poll_once()
+        jobs.prune()
+        return 0
+
+    # Default: hold an exclusive, non-blocking lock for the life of the process
+    # so a second worker can never run concurrently with this one — that
+    # exclusivity is what makes claim_next's unlocked read-then-write safe.
+    # Reaping only happens once we hold the lock: reaping before it could mark
+    # a job "failed" that a still-running sibling worker legitimately owns.
+    JOBD_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    lock_fd = os.open(JOBD_LOCK, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print(f"another palwarden-jobd holds {JOBD_LOCK}; exiting", file=sys.stderr)
+        return 1
+    reap_orphans()
+    while True:
+        poll_once()
+        jobs.prune()
+        time.sleep(JOBD_INTERVAL)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
