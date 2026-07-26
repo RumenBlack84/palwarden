@@ -25,6 +25,28 @@ WEBUI_ENV = Path(os.environ.get("PALWARDEN_WEBUI_ENV", "/etc/palworld/webui.env"
 REQUIRED_KEYS = ("WEBUI_USER", "WEBUI_PASSWORD", "WEBUI_TOKEN")
 
 
+def _escape(val: str) -> str:
+    """Escape a value for double-quoted KEY="value" lines (shell-source-safe)."""
+    val = val.replace("\\", "\\\\").replace('"', '\\"')
+    val = val.replace("$", "\\$").replace("`", "\\`")
+    return val
+
+
+def _unescape(val: str) -> str:
+    """Reverse `_escape`: turn \\X escapes back into literal characters."""
+    out = []
+    i = 0
+    while i < len(val):
+        ch = val[i]
+        if ch == "\\" and i + 1 < len(val):
+            out.append(val[i + 1])
+            i += 2
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
 def load_credentials(path: Path = WEBUI_ENV) -> dict[str, str]:
     """Read KEY="value" lines. Exits with a clear message if unusable."""
     if not path.is_file():
@@ -39,7 +61,9 @@ def load_credentials(path: Path = WEBUI_ENV) -> dict[str, str]:
             continue
         key, _, val = line.partition("=")
         val = val.strip()
-        if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+        if len(val) >= 2 and val[0] == val[-1] and val[0] == '"':
+            val = _unescape(val[1:-1])
+        elif len(val) >= 2 and val[0] == val[-1] and val[0] == "'":
             val = val[1:-1]
         values[key.strip()] = val
     missing = [k for k in REQUIRED_KEYS if not values.get(k)]
@@ -57,11 +81,23 @@ def init_credentials(path: Path = WEBUI_ENV) -> tuple[dict[str, str], bool]:
         "WEBUI_PASSWORD": os.environ.get("WEBUI_PASSWORD") or secrets.token_urlsafe(24),
         "WEBUI_TOKEN": os.environ.get("WEBUI_TOKEN") or secrets.token_urlsafe(32),
     }
-    path.parent.mkdir(parents=True, exist_ok=True)
+    for key, val in creds.items():
+        if "\n" in val:
+            sys.exit(f"error: {key} contains a newline, which cannot be stored safely; "
+                      "choose a value without one")
+
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text("".join(f'{k}="{v}"\n' for k, v in creds.items()))
-    tmp.chmod(0o600)
-    tmp.replace(path)
+    try:
+        # Create the file pre-restricted: never let it exist world/group readable,
+        # even for the instant between creation and chmod.
+        fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write("".join(f'{k}="{_escape(v)}"\n' for k, v in creds.items()))
+        tmp.replace(path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     return creds, True
 
 

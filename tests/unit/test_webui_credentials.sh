@@ -47,6 +47,29 @@ PALWARDEN_WEBUI_ENV="$ENVF2" WEBUI_USER=ygg WEBUI_PASSWORD=chosen-password \
 assert_file_contains "$ENVF2" 'WEBUI_USER="ygg"' "honours WEBUI_USER"
 assert_file_contains "$ENVF2" 'WEBUI_PASSWORD="chosen-password"' "honours WEBUI_PASSWORD"
 
+# --- special characters round-trip through escaping ------------------------
+ENVF3="$WORK/special.env"
+# shellcheck disable=SC2016
+special_pw='p"w\a$s'
+PALWARDEN_WEBUI_ENV="$ENVF3" WEBUI_USER=ygg WEBUI_PASSWORD="$special_pw" \
+  WEBUI_TOKEN=chosen-token python3 "$WEBUI" --init-credentials >/dev/null 2>&1
+# on disk the value must appear escaped (backslash, quote and dollar all backslash-escaped)
+# shellcheck disable=SC2016
+assert_file_contains "$ENVF3" 'WEBUI_PASSWORD="p\"w\\a\$s"' "special chars are escaped on disk"
+# --serve must load the escaped file without hitting the "missing credentials" failure path
+out3="$(PALWARDEN_WEBUI_ENV="$ENVF3" python3 "$WEBUI" --serve 2>&1)"
+assert_not_contains "$out3" "missing" "escaped credentials load cleanly (round-trip via loader)"
+assert_not_contains "$out3" "Traceback" "no traceback loading escaped credentials"
+
+# --- a newline in a value is rejected, not silently corrupted ---------------
+ENVF4="$WORK/newline.env"
+out4="$(PALWARDEN_WEBUI_ENV="$ENVF4" WEBUI_USER=ygg WEBUI_PASSWORD="$(printf 'a\nb')" \
+  WEBUI_TOKEN=chosen-token python3 "$WEBUI" --init-credentials 2>&1)"; rc4=$?
+assert_ne "$rc4" "0" "newline in a credential value is rejected"
+assert_contains "$out4" "newline" "explains the newline rejection"
+assert_not_contains "$out4" "Traceback" "no traceback on newline rejection"
+assert_rc 1 test -f "$ENVF4"
+
 # --- fail closed on a missing or incomplete file --------------------------
 out="$(PALWARDEN_WEBUI_ENV="$WORK/nope.env" python3 "$WEBUI" --serve 2>&1)"; rc=$?
 assert_ne "$rc" "0" "serving without credentials exits nonzero"
