@@ -42,11 +42,20 @@ def job_path(job_id: str) -> Path:
 
 
 def _write(job: dict) -> dict:
-    JOBS_DIR.mkdir(parents=True, exist_ok=True)
+    # Job files can carry config values and paths, so keep the directory and
+    # every file owner-only from the instant they exist — no umask-dependent
+    # world/group-readable window.
+    JOBS_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     path = job_path(job["id"])
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(job, indent=2, sort_keys=True))
-    tmp.replace(path)
+    fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(json.dumps(job, indent=2, sort_keys=True))
+        tmp.replace(path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     return job
 
 
@@ -72,7 +81,10 @@ def read_job(job_id: str) -> dict | None:
     """Return the job, or None when it is missing or unreadable.
 
     A corrupt file is treated as absent: a half-written or hand-edited job must
-    not take down the reader.
+    not take down the reader. That covers decode failures too — invalid UTF-8
+    bytes raise UnicodeDecodeError, which (like json.JSONDecodeError) is a
+    ValueError subclass, so (OSError, ValueError) catches both without a bare
+    except.
     """
     try:
         path = job_path(job_id)
@@ -80,7 +92,7 @@ def read_job(job_id: str) -> dict | None:
         return None
     try:
         data = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
         return None
     return data if isinstance(data, dict) else None
 

@@ -105,16 +105,29 @@ assert j.read_job(keep["id"]) is not None
 print("ok")')"
 assert_eq "$out" "ok" "prune drops old finished jobs only"
 
-# --- a corrupt job file does not crash readers ---------------------------
+# --- a corrupt job file does not crash readers ----------------------------
+# Two distinct corruption modes: invalid JSON (valid UTF-8) and invalid UTF-8
+# bytes (json.loads never even gets to parse it). Both must read as absent.
 reset
 out="$(py '
 import palwarden_jobs as j
-from pathlib import Path
 job = j.create_job("backup", {})
 j.job_path(job["id"]).write_text("{not json")
 assert j.read_job(job["id"]) is None
-assert j.list_jobs() == [] or all(isinstance(x, dict) for x in j.list_jobs())
+assert job["id"] not in [x["id"] for x in j.list_jobs()]
+assert j.has_pending() is False
 print("ok")')"
-assert_eq "$out" "ok" "corrupt job file is ignored, not fatal"
+assert_eq "$out" "ok" "invalid-JSON job file is ignored, not fatal"
+
+reset
+out="$(py '
+import palwarden_jobs as j
+job = j.create_job("backup", {})
+j.job_path(job["id"]).write_bytes(b"\xff\xfe\x00bad")
+assert j.read_job(job["id"]) is None
+assert job["id"] not in [x["id"] for x in j.list_jobs()]
+assert j.has_pending() is False
+print("ok")')"
+assert_eq "$out" "ok" "invalid-UTF-8 job file is ignored, not fatal"
 
 assert_report
