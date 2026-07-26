@@ -658,6 +658,35 @@ def read_backup_nofollow(backup: Path) -> tuple[bytes, os.stat_result]:
     return read_nofollow(backup, "backup")
 
 
+def read_ini_text_or_absent(ini_path: Path) -> str | None:
+    """Engine.ini's text for `status`/`--check`, or None if it is genuinely absent.
+
+    Both callers previously used `ini_path.read_text(...)`, unprotected, on a
+    path that lives in the directory the unprivileged web user owns — the same
+    hole every write and the other reads were already closed against. Routed
+    through read_nofollow, so a symlink is refused and a FIFO cannot wedge the
+    `--check` request `palwarden-webui`'s /api/engine issues on every dashboard
+    load.
+
+    A genuinely missing Engine.ini is a normal state (see PrettyWriteError's
+    neighbours above: the game truncates a defaults-only config to one
+    newline, and a fresh install has none yet) and must keep yielding an empty
+    result rather than an error, exactly as `ini_path.exists()` used to gate
+    it. read_nofollow reports every open failure that is not a symlink as
+    FileNotFoundError, so ENOENT is picked out of the chained cause rather than
+    re-checking existence by name (which would just reopen the check-then-use
+    gap this function exists to close).
+    """
+    try:
+        data, _ = read_nofollow(ini_path, ini_path.name)
+    except FileNotFoundError as exc:
+        cause = exc.__cause__
+        if isinstance(cause, OSError) and cause.errno == errno.ENOENT:
+            return None
+        raise
+    return data.decode(errors="replace")
+
+
 def resolve_backup(name: str, backup_dir: Path) -> Path:
     if "/" in name or "\\" in name:
         raise ValueError("backup name must be a file name, not a path")
@@ -821,7 +850,8 @@ def format_check(check: dict[str, object], ini_path: Path | None = None) -> str:
 
 
 def format_status(ini_path: Path, backup_dir: Path) -> str:
-    values = parse_ini_values(ini_path.read_text(errors="replace")) if ini_path.exists() else {}
+    text = read_ini_text_or_absent(ini_path)
+    values = parse_ini_values(text) if text is not None else {}
     match = match_profile(values)
     lines = ["Engine.ini managed status", ""]
     lines.append("Current profile:")
@@ -866,11 +896,28 @@ def command_status(args: argparse.Namespace) -> int:
         if not expected:
             print(f"Engine.ini check FAILED: no managed values found in {args.env}", file=sys.stderr)
             return 2
-        values = parse_ini_values_multi(ini_path.read_text(errors="replace"))
+        # A symlink or FIFO planted at ini_path (the game/web user owns this
+        # directory) must fail this request cleanly, not hang it or read
+        # through the link — this is the drift check /api/engine calls on
+        # every dashboard load. The exists() check above already handles a
+        # genuinely absent file; text is None here only on a TOCTOU race.
+        try:
+            text = read_ini_text_or_absent(ini_path)
+        except ValueError as exc:
+            print(f"Engine.ini check FAILED: {exc}", file=sys.stderr)
+            return 2
+        if text is None:
+            print(f"Engine.ini check FAILED: cannot read {ini_path}", file=sys.stderr)
+            return 2
+        values = parse_ini_values_multi(text)
         check = check_expected_values(values, expected)
         print(format_check(check, ini_path))
         return 0 if check.get("ok") else 1
-    print(format_status(ini_path, backup_dir))
+    try:
+        print(format_status(ini_path, backup_dir))
+    except ValueError as exc:
+        print(f"Engine.ini status FAILED: {exc}", file=sys.stderr)
+        return 1
     return 0
 
 

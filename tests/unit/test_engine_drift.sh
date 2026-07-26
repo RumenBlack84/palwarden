@@ -478,4 +478,83 @@ assert_contains "$out" "Engine.pretty.ini" "rollback's message names the file it
 assert_contains "$(markers)" "rollback partially applied" "a marker records the partial rollback"
 rm -f "$PRETTY"
 
+# --- status/--check reads of Engine.ini must be hardened too ----------------
+# The two remaining `ini_path.read_text(...)` call sites (format_status, and
+# the --check path in command_status) were the last unhardened reads of a
+# path the unprivileged web user owns — and --check is what /api/engine calls
+# on every dashboard load, so a FIFO there is a denial-of-service and a
+# symlink there is an arbitrary-file-read.
+status() {
+  PALWORLD_ENGINE_INI="$INI" PALWORLD_ENGINE_ENV="$ENV_FILE" \
+  PALWORLD_BACKUP_DIR="$WORK/backups" PALWORLD_ENGINE_PRETTY_INI="$PRETTY" \
+  PALWORLD_FPS_BIN=/bin/true \
+    python3 "$ENGINE" status 2>&1
+}
+
+# a normal regular file: both subcommands must behave exactly as before
+cat > "$INI" <<'EOF'
+[/Script/OnlineSubsystemUtils.IpNetDriver]
+NetServerMaxTickRate=60
+ConnectionTimeout=60
+[/Script/Engine.StreamingSettings]
+s.AsyncLoadingThreadEnabled=1
+EOF
+out="$(status)"; rc=$?
+assert_eq "$rc" "0" "status on a regular Engine.ini still succeeds"
+assert_contains "$out" "Engine.ini managed status" "status still prints its header"
+assert_contains "$out" "NetServerMaxTickRate=60" "status still shows the managed value"
+out="$(check)"; rc=$?
+assert_eq "$rc" "0" "--check on a regular Engine.ini still succeeds"
+assert_contains "$out" "OK" "--check still reports OK"
+
+# an absent Engine.ini: must behave exactly as before (empty status, no crash;
+# --check's own "cannot read" message, since it already guarded on exists())
+rm -f "$INI"
+out="$(status)"; rc=$?
+assert_eq "$rc" "0" "status on a missing Engine.ini still succeeds"
+assert_contains "$out" "<unset>" "status still reports unset values for a missing file"
+assert_not_contains "$out" "Traceback" "missing Engine.ini does not crash status"
+out="$(check)"; rc=$?
+assert_ne "$rc" "0" "--check on a missing Engine.ini still fails"
+assert_contains "$out" "cannot read" "--check still names the missing file"
+assert_not_contains "$out" "Traceback" "missing Engine.ini does not crash --check"
+
+# a symlink to a 0600 secret outside the config directory: refused, not read
+printf 'ADMIN_PASSWORD=hunter2\n' > "$WORK/secret.env"
+chmod 0600 "$WORK/secret.env"
+ln -sf "$WORK/secret.env" "$INI"
+out="$(status)"; rc=$?
+assert_ne "$rc" "0" "status refuses a symlinked Engine.ini"
+assert_contains "$out" "symlink" "status names the symlink refusal"
+assert_not_contains "$out" "ADMIN_PASSWORD" "status never reads through the symlink"
+assert_not_contains "$out" "Traceback" "the symlink refusal is a message, not a crash"
+out="$(check)"; rc=$?
+assert_ne "$rc" "0" "--check refuses a symlinked Engine.ini"
+assert_contains "$out" "symlink" "--check names the symlink refusal"
+assert_not_contains "$out" "ADMIN_PASSWORD" "--check never reads through the symlink"
+assert_not_contains "$out" "Traceback" "the symlink refusal is a message, not a crash"
+rm -f "$INI"
+
+# a FIFO at Engine.ini: must refuse promptly, not hang the request. `timeout`
+# wraps both calls so a regression here fails the suite in seconds instead of
+# wedging it for the full subprocess timeout (this is what /api/engine hits).
+mkfifo "$INI"
+out="$(timeout 5 env \
+  PALWORLD_ENGINE_INI="$INI" PALWORLD_ENGINE_ENV="$ENV_FILE" \
+  PALWORLD_BACKUP_DIR="$WORK/backups" PALWORLD_ENGINE_PRETTY_INI="$PRETTY" \
+  PALWORLD_FPS_BIN=/bin/true python3 "$ENGINE" status 2>&1)"; rc=$?
+assert_ne "$rc" "0" "status refuses a FIFO at Engine.ini"
+assert_ne "$rc" "124" "status's FIFO refusal happens well before the timeout fires"
+assert_contains "$out" "regular file" "status's FIFO refusal says it is not a regular file"
+assert_not_contains "$out" "Traceback" "the FIFO refusal is a message, not a crash"
+out="$(timeout 5 env \
+  PALWORLD_ENGINE_INI="$INI" PALWORLD_ENGINE_ENV="$ENV_FILE" \
+  PALWORLD_BACKUP_DIR="$WORK/backups" PALWORLD_ENGINE_PRETTY_INI="$PRETTY" \
+  PALWORLD_FPS_BIN=/bin/true python3 "$ENGINE" status --check 2>&1)"; rc=$?
+assert_ne "$rc" "0" "--check refuses a FIFO at Engine.ini"
+assert_ne "$rc" "124" "--check's FIFO refusal happens well before the timeout fires"
+assert_contains "$out" "regular file" "--check's FIFO refusal says it is not a regular file"
+assert_not_contains "$out" "Traceback" "the FIFO refusal is a message, not a crash"
+rm -f "$INI"
+
 assert_report
