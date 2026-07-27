@@ -14,13 +14,23 @@ LIB="$DIR/../../lib"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
-mkdir -p "$WORK/jobs" "$WORK/bin" "$WORK/etc" "$WORK/backups"
+# backups/ is the *config* backup dir (engine_rollback's source); uploads/ and
+# savebackups/ are the staging and world-save-archive dirs the backup actions use.
+mkdir -p "$WORK/jobs" "$WORK/bin" "$WORK/etc" "$WORK/backups" \
+         "$WORK/uploads" "$WORK/savebackups"
+ARCHIVE="palworld-save-20260726T031500Z.tar.gz"
+ARCHIVE2="palworld-save-20260726T041500Z.tar.gz"
+# The worker only ever stats these (the tools it spawns are what read the bytes),
+# so a placeholder file is enough to stand in for a real archive here.
+printf 'placeholder\n' > "$WORK/uploads/$ARCHIVE"
+printf 'placeholder\n' > "$WORK/savebackups/$ARCHIVE"
 
 # stub tools that record their argv so we can prove nothing was mangled
 stub_tools() {
   for tool in palworld-backup palworld-config-pretty palworld-config-apply-env \
               palworld-config-snapshot palworld-engine-config palworld-graceful-restart \
-              palworld-graceful-stop palworld-update palworld-api-save palworld-fps; do
+              palworld-graceful-stop palworld-update palworld-api-save palworld-fps \
+              palworld-restore palworld-backups; do
     cat > "$WORK/bin/$tool" <<EOF
 #!/usr/bin/env bash
 echo "\$(basename "\$0") \$*" >> "$WORK/argv.log"
@@ -37,6 +47,8 @@ jobd() {
   PALWARDEN_JOBS_DIR="$WORK/jobs" PYTHONPATH="$LIB" \
   PALWARDEN_SBIN_DIR="$WORK/bin" PALWORLD_ENGINE_ENV="${ENGINE_ENV_OVERRIDE:-$WORK/etc/engine.env}" \
   PALWORLD_BACKUP_DIR="$WORK/backups" PALWARDEN_JOBD_LOCK="$WORK/jobd.lock" \
+  PALWARDEN_UPLOAD_DIR="$WORK/uploads" PALWARDEN_SAVE_BACKUP_DIR="$WORK/savebackups" \
+  PALWORLD_BACKUP_SCHEDULE="${SCHEDULE_OVERRIDE:-$WORK/etc/backup.env}" \
     python3 "$JOBD" "$@"
 }
 enqueue() {  # enqueue <action> <json-params>
@@ -503,7 +515,9 @@ roundtrip="$(
   PALWARDEN_JOBS_DIR="$WORK/jobs" PYTHONPATH="$LIB" PALWARDEN_SBIN_DIR="$WORK/bin" \
   PALWORLD_ENGINE_ENV="$WORK/etc/engine.env" PALWORLD_BACKUP_DIR="$WORK/backups" \
   PALWARDEN_JOBD_LOCK="$WORK/jobd.lock" \
-  python3 - "$JOBD" <<'EOF'
+  PALWARDEN_UPLOAD_DIR="$WORK/uploads" PALWARDEN_SAVE_BACKUP_DIR="$WORK/savebackups" \
+  PALWORLD_BACKUP_SCHEDULE="$WORK/etc/backup.env" \
+  python3 - "$JOBD" "$ARCHIVE" <<'EOF'
 import importlib.machinery, importlib.util, sys
 
 loader = importlib.machinery.SourceFileLoader("jobd_under_test", sys.argv[1])
@@ -512,6 +526,7 @@ mod = importlib.util.module_from_spec(spec)
 sys.modules[loader.name] = mod
 loader.exec_module(mod)
 
+archive_name = sys.argv[2]
 SAMPLES = {
     "confirm": True,
     "wait": 30,
@@ -521,14 +536,28 @@ SAMPLES = {
     "dry_run": True,
     "settings": {"NET_SERVER_MAX_TICK_RATE": "60"},
     "backup": "Engine.ini.20260710T182037Z",
+    "staged": archive_name,
+}
+# `settings` and `backup` mean different things to different actions (an engine
+# table vs the backup schedule; a config backup vs a world-save archive), so those
+# actions bring their own sample rather than the shared one being widened to
+# something every validator would accept — which would defeat the check.
+OVERRIDES = {
+    "backup_schedule_save": {"settings": {"BACKUP_ENABLED": True,
+                                          "BACKUP_INTERVAL_HOURS": 24,
+                                          "BACKUP_RETENTION_DAYS": 14,
+                                          "BACKUP_KEEP_MIN": 3}},
+    "backup_restore": {"backup": archive_name},
+    "backup_delete": {"backup": archive_name},
 }
 for action in mod.ACTIONS:
     keys = mod.recognised_params(action)
-    missing = sorted(k for k in keys if k not in SAMPLES)
+    samples = dict(SAMPLES, **OVERRIDES.get(action, {}))
+    missing = sorted(k for k in keys if k not in samples)
     if missing:
         print(f"FAIL {action}: no sample value for {missing}")
         continue
-    params = {k: SAMPLES[k] for k in keys}
+    params = {k: samples[k] for k in keys}
     got, err = mod.validate_params(action, params)
     if err is not None:
         print(f"FAIL {action}: {err}")
@@ -538,5 +567,335 @@ print("done")
 EOF
 )"
 assert_eq "$roundtrip" "done" "every recognised param key round-trips for every action"
+
+# --- backup_import: promote one staged upload, exact argv -------------------
+# The name is the *value* of --import, so no `--` may separate them: argparse would
+# fail with "expected one argument". valid_archive_name is what makes that safe.
+: > "$WORK/argv.log"
+id="$(enqueue backup_import "{\"staged\": \"$ARCHIVE\"}")"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "succeeded" "backup_import succeeds"
+assert_eq "$(cat "$WORK/argv.log")" "palworld-restore --import $ARCHIVE" "backup_import argv exact"
+
+# ...and it looks in the UPLOAD dir, not the backups dir: an archive that exists
+# only as a promoted backup is not something there is anything left to import.
+printf 'placeholder\n' > "$WORK/savebackups/$ARCHIVE2"
+: > "$WORK/argv.log"
+id="$(enqueue backup_import "{\"staged\": \"$ARCHIVE2\"}")"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "failed" "an archive present only in the backups dir is not importable"
+assert_contains "$(output_of "$id")" "staged not found in the upload directory" "says which directory it looked in"
+assert_eq "$(wc -c < "$WORK/argv.log" | tr -d ' ')" "0" "the missing upload never reached a command"
+
+# a symlink in the staging dir under a legitimate name is refused, not followed:
+# the web account owns that directory, so it chooses what root would have read.
+ln -sf "$WORK/etc/settings.env" "$WORK/uploads/$ARCHIVE2"
+: > "$WORK/argv.log"
+id="$(enqueue backup_import "{\"staged\": \"$ARCHIVE2\"}")"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "failed" "a symlinked staged upload is refused"
+assert_contains "$(output_of "$id")" "staged must not be a symlink" "says why the staged symlink was refused"
+assert_eq "$(wc -c < "$WORK/argv.log" | tr -d ' ')" "0" "the symlinked upload never reached a command"
+rm -f "$WORK/uploads/$ARCHIVE2"
+
+# --- hostile staged/backup names never reach argv --------------------------
+# A REGULAR file with an off-pattern name, so the pattern check is what refuses it:
+# with a symlink the symlink guard would refuse it anyway and deleting the pattern
+# check would leave the suite green.
+printf 'placeholder\n' > "$WORK/uploads/notanarchive"
+printf 'placeholder\n' > "$WORK/savebackups/notanarchive"
+: > "$WORK/argv.log"
+id="$(enqueue backup_import '{"staged": "notanarchive"}')"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "failed" "off-pattern staged name refused on its name alone"
+assert_contains "$(output_of "$id")" "staged must match" "names the pattern the staged name failed"
+assert_eq "$(wc -c < "$WORK/argv.log" | tr -d ' ')" "0" "off-pattern staged name never reached a command"
+
+: > "$WORK/argv.log"
+id="$(enqueue backup_delete '{"backup": "notanarchive", "confirm": true}')"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "failed" "off-pattern save-archive name refused on its name alone"
+assert_contains "$(output_of "$id")" "backup must match" "names the pattern the archive name failed"
+assert_eq "$(wc -c < "$WORK/argv.log" | tr -d ' ')" "0" "off-pattern archive name never reached a command"
+
+# separators, traversal and a shell metacharacter, on both parameters. Built with
+# json.dumps so the shell never has to quote these values correctly for them to be
+# the values under test.
+hostile_params() {  # hostile_params <key> <value> [extra-json-key]
+  python3 -c "
+import json, sys
+params = {sys.argv[1]: sys.argv[2]}
+if len(sys.argv) > 3:
+    params[sys.argv[3]] = True
+print(json.dumps(params))" "$@"
+}
+for hostile in '../../etc/palworld/settings.env' 'sub/palworld-save-20260726T031500Z.tar.gz' \
+               'palworld-save-20260726T031500Z.tar.gz; rm -rf /' \
+               "palworld-save-20260726T031500Z.tar.gz\$(id)" \
+               "palworld-save-20260726T031500Z.tar.gz\\" '..' ''; do
+  : > "$WORK/argv.log"
+  id="$(enqueue backup_import "$(hostile_params staged "$hostile")")"
+  jobd --once >/dev/null 2>&1
+  assert_eq "$(state_of "$id")" "failed" "hostile staged value refused: '$hostile'"
+  assert_eq "$(wc -c < "$WORK/argv.log" | tr -d ' ')" "0" "hostile staged value never reached a command: '$hostile'"
+  : > "$WORK/argv.log"
+  id="$(enqueue backup_restore "$(hostile_params backup "$hostile" confirm)")"
+  jobd --once >/dev/null 2>&1
+  assert_eq "$(state_of "$id")" "failed" "hostile backup value refused: '$hostile'"
+  assert_eq "$(wc -c < "$WORK/argv.log" | tr -d ' ')" "0" "hostile backup value never reached a command: '$hostile'"
+done
+
+# a separator is refused as a *separator*, by its own message, before any pattern or
+# filesystem reasoning happens
+id="$(enqueue backup_import '{"staged": "../../etc/passwd"}')"
+jobd --once >/dev/null 2>&1
+assert_contains "$(output_of "$id")" "staged must be a bare file name" "the separator refusal says what is wrong"
+
+# --- backup_restore: confirm-gated, exact argv, --wait only when asked -----
+: > "$WORK/argv.log"
+id="$(enqueue backup_restore "{\"backup\": \"$ARCHIVE\"}")"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "failed" "backup_restore without confirm is refused"
+assert_contains "$(output_of "$id")" "requires confirm" "explains the restore refusal"
+assert_eq "$(wc -c < "$WORK/argv.log" | tr -d ' ')" "0" "unconfirmed restore never reached a command"
+
+: > "$WORK/argv.log"
+id="$(enqueue backup_restore "{\"backup\": \"$ARCHIVE\", \"confirm\": true}")"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "succeeded" "backup_restore succeeds"
+assert_eq "$(cat "$WORK/argv.log")" "palworld-restore --restore $ARCHIVE" "backup_restore argv exact, with no --wait"
+
+: > "$WORK/argv.log"
+id="$(enqueue backup_restore "{\"backup\": \"$ARCHIVE\", \"wait\": 45, \"confirm\": true}")"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "succeeded" "backup_restore with a wait succeeds"
+assert_eq "$(cat "$WORK/argv.log")" "palworld-restore --restore $ARCHIVE --wait 45" "backup_restore forwards --wait exactly"
+
+# restoring something that has only been uploaded (never promoted) is refused: the
+# staging directory is web-writable and the backups directory is not.
+printf 'placeholder\n' > "$WORK/uploads/$ARCHIVE2"
+rm -f "$WORK/savebackups/$ARCHIVE2"
+: > "$WORK/argv.log"
+id="$(enqueue backup_restore "{\"backup\": \"$ARCHIVE2\", \"confirm\": true}")"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "failed" "an un-imported upload is not restorable"
+assert_contains "$(output_of "$id")" "backup not found in the backups directory" "says which directory it looked in"
+assert_eq "$(wc -c < "$WORK/argv.log" | tr -d ' ')" "0" "the un-imported upload never reached a command"
+
+# --- backup_delete: confirm-gated, exact argv -----------------------------
+: > "$WORK/argv.log"
+id="$(enqueue backup_delete "{\"backup\": \"$ARCHIVE\"}")"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "failed" "backup_delete without confirm is refused"
+assert_contains "$(output_of "$id")" "requires confirm" "explains the delete refusal"
+assert_eq "$(wc -c < "$WORK/argv.log" | tr -d ' ')" "0" "unconfirmed delete never reached a command"
+
+: > "$WORK/argv.log"
+id="$(enqueue backup_delete "{\"backup\": \"$ARCHIVE\", \"confirm\": true}")"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "succeeded" "backup_delete succeeds"
+assert_eq "$(cat "$WORK/argv.log")" "palworld-backups --delete $ARCHIVE" "backup_delete argv exact"
+
+# a symlink in the backups dir is refused too: palworld-backup chowns each archive
+# to the service account, so an entry there is not beyond an attacker's reach.
+ln -sf "$WORK/etc/settings.env" "$WORK/savebackups/$ARCHIVE2"
+: > "$WORK/argv.log"
+id="$(enqueue backup_delete "{\"backup\": \"$ARCHIVE2\", \"confirm\": true}")"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "failed" "a symlinked save archive is refused"
+assert_contains "$(output_of "$id")" "backup must not be a symlink" "says why the archive symlink was refused"
+assert_eq "$(wc -c < "$WORK/argv.log" | tr -d ' ')" "0" "the symlinked archive never reached a command"
+rm -f "$WORK/savebackups/$ARCHIVE2"
+
+# --- the two `backup` validators must not have merged --------------------
+# validate_backup is engine_rollback's *config*-backup check. Widening it to cover
+# save archives (or pointing engine_rollback at the new one) would silently change
+# what a rollback accepts, so both directions are pinned. Both files exist, in the
+# directory each action reads, so only the name checks can be doing the refusing.
+echo "[/script/onlineSubsystemUtils.ipnetdriver]" > "$WORK/backups/Engine.ini.20260726T031500Z"
+printf 'placeholder\n' > "$WORK/backups/$ARCHIVE"
+: > "$WORK/argv.log"
+id="$(enqueue engine_rollback '{"backup": "Engine.ini.20260726T031500Z", "confirm": true}')"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "succeeded" "engine_rollback still accepts an Engine.ini.<stamp> name"
+assert_eq "$(cat "$WORK/argv.log")" "palworld-engine-config rollback -- Engine.ini.20260726T031500Z" "and its argv is unchanged"
+: > "$WORK/argv.log"
+id="$(enqueue engine_rollback "{\"backup\": \"$ARCHIVE\", \"confirm\": true}")"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "failed" "engine_rollback still refuses a save-archive name"
+assert_contains "$(output_of "$id")" 'Engine\\.ini' "and refuses it against the Engine.ini pattern"
+assert_eq "$(wc -c < "$WORK/argv.log" | tr -d ' ')" "0" "a save-archive name never reached a rollback"
+# the reverse: an Engine.ini backup is not a world save, even though one exists in
+# the config-backup dir under that exact name
+printf 'placeholder\n' > "$WORK/savebackups/Engine.ini.20260726T031500Z"
+: > "$WORK/argv.log"
+id="$(enqueue backup_delete '{"backup": "Engine.ini.20260726T031500Z", "confirm": true}')"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "failed" "backup_delete refuses a config-backup name"
+assert_contains "$(output_of "$id")" "palworld-save-" "and refuses it against the save-archive pattern"
+assert_eq "$(wc -c < "$WORK/argv.log" | tr -d ' ')" "0" "a config-backup name never reached palworld-backups"
+rm -f "$WORK/savebackups/Engine.ini.20260726T031500Z"
+
+# --- backup_schedule_save: writes the four keys, and only those ------------
+SCHED_OK='{"settings": {"BACKUP_ENABLED": true, "BACKUP_INTERVAL_HOURS": 6, "BACKUP_RETENTION_DAYS": 30, "BACKUP_KEEP_MIN": 5}}'
+: > "$WORK/argv.log"
+id="$(enqueue backup_schedule_save "$SCHED_OK")"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "succeeded" "backup_schedule_save succeeds"
+assert_contains "$(output_of "$id")" "wrote the backup schedule" "says the schedule was written"
+assert_file_contains "$WORK/etc/backup.env" "BACKUP_ENABLED=true" "wrote the enabled flag"
+assert_file_contains "$WORK/etc/backup.env" "BACKUP_INTERVAL_HOURS=6" "wrote the interval"
+assert_file_contains "$WORK/etc/backup.env" "BACKUP_RETENTION_DAYS=30" "wrote the retention"
+assert_file_contains "$WORK/etc/backup.env" "BACKUP_KEEP_MIN=5" "wrote the keep-min floor"
+assert_file_contains "$WORK/etc/backup.env" "# Generated by palwarden-jobd (backup_schedule_save)" "marks the file as generated"
+assert_eq "$(wc -c < "$WORK/argv.log" | tr -d ' ')" "0" "the schedule action runs no command at all"
+assert_eq "$(stat -c '%a' "$WORK/etc/backup.env")" "644" "the schedule file is 0644"
+# no temp file left behind, and none at a guessable fixed name
+if ls "$WORK/etc"/backup.env.tmp* >/dev/null 2>&1; then fail "a temp schedule file was left behind"; else pass; fi
+
+# false is a value, not an absence: the disabled state has to survive a save
+id="$(enqueue backup_schedule_save '{"settings": {"BACKUP_ENABLED": false, "BACKUP_INTERVAL_HOURS": 6, "BACKUP_RETENTION_DAYS": 30, "BACKUP_KEEP_MIN": 5}}')"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "succeeded" "disabling scheduled backups succeeds"
+assert_file_contains "$WORK/etc/backup.env" "BACKUP_ENABLED=false" "wrote the disabled flag"
+
+# ...and the file we wrote is one palworld-backups actually reads back, with no
+# warnings: the two sides parse the same file, so a format only one of them accepts
+# would be a schedule silently replaced by defaults on the next tick.
+id="$(enqueue backup_schedule_save "$SCHED_OK")"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "succeeded" "re-saving the schedule succeeds"
+sched_json="$(PALWORLD_BACKUP_SCHEDULE="$WORK/etc/backup.env" PYTHONPATH="$LIB" \
+  python3 "$DIR/../../sbin/palworld-backups" --show-schedule 2>"$WORK/sched.err")"
+assert_contains "$sched_json" '"BACKUP_INTERVAL_HOURS": 6' "palworld-backups reads back the interval we wrote"
+assert_contains "$sched_json" '"BACKUP_RETENTION_DAYS": 30' "palworld-backups reads back the retention we wrote"
+assert_contains "$sched_json" '"BACKUP_KEEP_MIN": 5' "palworld-backups reads back the keep-min we wrote"
+assert_contains "$sched_json" '"BACKUP_ENABLED": true' "palworld-backups reads back the enabled flag we wrote"
+assert_eq "$(wc -c < "$WORK/sched.err" | tr -d ' ')" "0" "and parses it without a single warning"
+
+# an unknown key is refused BY NAME, not dropped
+id="$(enqueue backup_schedule_save '{"settings": {"BACKUP_ENABLED": true, "BACKUP_INTERVAL_HOURS": 6, "BACKUP_RETENTION_DAYS": 30, "BACKUP_KEEP_MIN": 5, "BACKUP_INTERVAL_HOUR": 9}}')"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "failed" "an unknown schedule key is refused"
+assert_contains "$(output_of "$id")" "unknown backup schedule setting: 'BACKUP_INTERVAL_HOUR'" "the refusal names the unknown key"
+assert_file_not_contains "$WORK/etc/backup.env" "BACKUP_INTERVAL_HOURS=9" "and nothing was written"
+
+# an *engine* key is not a schedule key: the schedule form must not be a second
+# door to engine.env's table
+id="$(enqueue backup_schedule_save '{"settings": {"NET_SERVER_MAX_TICK_RATE": "60"}}')"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "failed" "an engine setting is refused by the schedule action"
+assert_contains "$(output_of "$id")" "unknown backup schedule setting: 'NET_SERVER_MAX_TICK_RATE'" "names the engine key as unknown here"
+
+# a partial save is refused: the writer replaces the file, so a missing key would
+# silently revert to palworld-backups' default
+id="$(enqueue backup_schedule_save '{"settings": {"BACKUP_INTERVAL_HOURS": 6}}')"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "failed" "a partial schedule save is refused"
+assert_contains "$(output_of "$id")" "must be saved whole" "explains that the schedule is saved whole"
+assert_contains "$(output_of "$id")" "'BACKUP_KEEP_MIN'" "and names a key that was missing"
+
+# BACKUP_ENABLED takes a real boolean only, exactly like confirm
+for bad in '"true"' '1' 'null'; do
+  id="$(enqueue backup_schedule_save "{\"settings\": {\"BACKUP_ENABLED\": $bad, \"BACKUP_INTERVAL_HOURS\": 6, \"BACKUP_RETENTION_DAYS\": 30, \"BACKUP_KEEP_MIN\": 5}}")"
+  jobd --once >/dev/null 2>&1
+  assert_eq "$(state_of "$id")" "failed" "BACKUP_ENABLED: $bad is refused"
+  assert_contains "$(output_of "$id")" "BACKUP_ENABLED must be a boolean" "explains the BACKUP_ENABLED refusal for $bad"
+done
+
+# every range bound: accepted at both ends, refused one step outside either
+sched_with() {  # sched_with <key> <value>
+  python3 -c "
+import json, sys
+s = {'BACKUP_ENABLED': True, 'BACKUP_INTERVAL_HOURS': 6,
+     'BACKUP_RETENTION_DAYS': 30, 'BACKUP_KEEP_MIN': 5}
+s[sys.argv[1]] = json.loads(sys.argv[2])
+print(json.dumps({'settings': s}))" "$1" "$2"
+}
+while read -r key low high; do
+  for good in "$low" "$high"; do
+    id="$(enqueue backup_schedule_save "$(sched_with "$key" "$good")")"
+    jobd --once >/dev/null 2>&1
+    assert_eq "$(state_of "$id")" "succeeded" "$key=$good (a bound) is accepted"
+    assert_file_contains "$WORK/etc/backup.env" "$key=$good" "$key=$good was written"
+  done
+  for bad in "$((low - 1))" "$((high + 1))"; do
+    id="$(enqueue backup_schedule_save "$(sched_with "$key" "$bad")")"
+    jobd --once >/dev/null 2>&1
+    assert_eq "$(state_of "$id")" "failed" "$key=$bad (outside the range) is refused"
+    assert_contains "$(output_of "$id")" "$key must be an integer $low-$high" "names $key's range"
+    assert_file_not_contains "$WORK/etc/backup.env" "$key=$bad" "$key=$bad was never written"
+  done
+  # a non-integer is refused too, and it is the *value* that is named
+  id="$(enqueue backup_schedule_save "$(sched_with "$key" '"lots"')")"
+  jobd --once >/dev/null 2>&1
+  assert_eq "$(state_of "$id")" "failed" "$key='lots' is refused"
+  assert_contains "$(output_of "$id")" "$key must be an integer" "explains the $key type refusal"
+done <<'EOF'
+BACKUP_INTERVAL_HOURS 1 720
+BACKUP_RETENTION_DAYS 1 3650
+BACKUP_KEEP_MIN 1 100
+EOF
+
+# the ranges jobd enforces are the ranges palworld-backups repairs against. If they
+# diverged, the panel would accept a value the next tick silently replaced with a
+# default — invisible until someone needed a backup that was never taken.
+tables="$(PYTHONPATH="$LIB" python3 - "$JOBD" "$DIR/../../sbin/palworld-backups" <<'EOF'
+import importlib.machinery, importlib.util, sys
+
+def load(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, path)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    loader.exec_module(mod)
+    return mod
+
+jobd = load("jobd_under_test", sys.argv[1])
+backups = load("backups_under_test", sys.argv[2])
+if jobd.SCHEDULE_RANGES != backups.RANGES:
+    print(f"FAIL ranges: {jobd.SCHEDULE_RANGES} != {backups.RANGES}")
+elif set(jobd.SCHEDULE_KEYS) != set(backups.DEFAULTS):
+    print(f"FAIL keys: {sorted(jobd.SCHEDULE_KEYS)} != {sorted(backups.DEFAULTS)}")
+else:
+    print("agree")
+EOF
+)"
+assert_eq "$tables" "agree" "jobd's schedule table matches palworld-backups' own"
+
+# --- a failed schedule write leaves the previous schedule intact ----------
+# Root ignores mode 0500, so this needs a non-root uid; same divergence as the
+# engine.env case above.
+if [ "$(id -u)" -eq 0 ]; then
+  echo "  SKIP: unwritable-schedule check needs a non-root uid (root ignores mode 0500)"
+else
+  mkdir -p "$WORK/roschedule"
+  id="$(enqueue backup_schedule_save "$SCHED_OK")"
+  SCHEDULE_OVERRIDE="$WORK/roschedule/backup.env" jobd --once >/dev/null 2>&1
+  assert_eq "$(state_of "$id")" "succeeded" "the schedule saves into a writable directory"
+  assert_file_contains "$WORK/roschedule/backup.env" "BACKUP_INTERVAL_HOURS=6" "the first schedule landed"
+  chmod 0500 "$WORK/roschedule"
+  id="$(enqueue backup_schedule_save '{"settings": {"BACKUP_ENABLED": false, "BACKUP_INTERVAL_HOURS": 12, "BACKUP_RETENTION_DAYS": 7, "BACKUP_KEEP_MIN": 2}}')"
+  SCHEDULE_OVERRIDE="$WORK/roschedule/backup.env" jobd --once >/dev/null 2>&1
+  chmod 0700 "$WORK/roschedule"
+  assert_eq "$(state_of "$id")" "failed" "an unwritable schedule directory fails the job"
+  assert_contains "$(output_of "$id")" "backup_schedule_save failed" "says which step failed"
+  assert_file_contains "$WORK/roschedule/backup.env" "BACKUP_INTERVAL_HOURS=6" "the previous schedule is intact"
+  assert_file_not_contains "$WORK/roschedule/backup.env" "BACKUP_INTERVAL_HOURS=12" "and the failed save left nothing behind"
+fi
+
+# --- the new actions take no parameters they do not use -------------------
+: > "$WORK/argv.log"
+id="$(enqueue backup_import "{\"staged\": \"$ARCHIVE\", \"wait\": 30}")"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "failed" "backup_import does not take a wait"
+assert_contains "$(output_of "$id")" "it takes: staged" "and says what it does take"
+assert_eq "$(wc -c < "$WORK/argv.log" | tr -d ' ')" "0" "the over-specified import never ran"
+: > "$WORK/argv.log"
+id="$(enqueue backup_delete "{\"backup\": \"$ARCHIVE\", \"wait\": 30, \"confirm\": true}")"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "failed" "backup_delete does not take a wait"
+assert_contains "$(output_of "$id")" "it takes: backup, confirm" "and lists backup and confirm only"
+assert_eq "$(wc -c < "$WORK/argv.log" | tr -d ' ')" "0" "the over-specified delete never ran"
 
 assert_report
