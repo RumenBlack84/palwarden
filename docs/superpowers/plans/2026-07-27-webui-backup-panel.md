@@ -294,6 +294,8 @@ extraction writes anything."
 
 Create `tests/unit/test_restore_import.sh` asserting:
 - A staged archive with a valid name and valid members is **moved** into the backups dir, root-readable 0644, and removed from staging.
+- **The authoritative validation is the one on the promoted copy.** Simulate the in-place rewrite: make the staged file pass validation, then have the copy step observe different bytes (e.g. a stub or a `pwrite` between the passes), and assert the promotion is still refused and no archive appears in the backups dir. If that is impractical to simulate directly, assert the *ordering* instead — that validation runs against a path inside the backups dir, not the staging dir — and say in the report which you did and why.
+- A refused promotion leaves **no** temp file in the backups dir.
 - An invalid name is refused **before** any file is touched: staging file still present, backups dir unchanged.
 - A hostile archive (reuse Task 1's traversing tarball, renamed to a valid name) is refused and **left in staging** for inspection, with the reason on stderr.
 - A staged name containing `/` or `\` is refused.
@@ -315,11 +317,42 @@ Expected: FAIL — `can't open file '.../sbin/palworld-restore'`.
 
 Create `sbin/palworld-restore` (Python, `argparse`). For this task implement only `--import`:
 
-1. Reject a `staged` value containing a path separator or failing `valid_archive_name`, before touching the filesystem.
-2. Resolve inside `PALWARDEN_UPLOAD_DIR`; refuse if `Path.is_symlink()`; require a regular file.
-3. `validate_archive` it. On `ArchiveError`, print the reason to stderr, leave the staged file, exit non-zero.
-4. Promote: open the destination `O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW` mode 0644 and copy through descriptors, then unlink the staged file. `O_EXCL` gives the no-overwrite guarantee and refuses a planted symlink at the destination in one syscall. (A rename would be cheaper but crosses filesystems in the container, where `/var/lib` and `/opt` are separate volumes.)
-5. Print the promoted path on stdout; the job output is the operator's record.
+**Order matters here, and it is not the obvious order.** Validating the staged file
+and then copying it does **not** guarantee the promoted bytes are the validated
+bytes: the web process *owns* the staging file, and holding a descriptor stops a
+name swap but not a write to the inode you are holding (`O_WRONLY` without
+`O_TRUNC`, or `pwrite`). So **promote first, then validate the promotion**, where
+the copy sits in a directory the web process cannot write:
+
+1. Reject a `staged` value containing a path separator or failing
+   `valid_archive_name`, before touching the filesystem.
+2. Resolve inside `PALWARDEN_UPLOAD_DIR`; refuse if `Path.is_symlink()`; require a
+   regular file (`open_archive_fd`). Note `O_NOFOLLOW` does **not** stop the web
+   user hardlinking a file it can read into staging, so staging content is fully
+   untrusted even when the name looks right — which this ordering handles.
+3. **Free-space check** before copying (`os.statvfs` on the backups filesystem). A
+   web process that can fill that volume by uploading is a denial of service
+   against `palworld-backup` itself.
+4. **Advisory pre-validate** via `validate_archive` on the staged fd — only to give
+   a good error message and to avoid copying obvious junk. Treat the result as
+   advisory; it is not the authority.
+5. **Copy** to a temp name in `PALWARDEN_SAVE_BACKUP_DIR`, created
+   `O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW` mode 0644, with `shutil.copyfileobj` from
+   the descriptor from step 2 — never `shutil.copy(path, ...)`, which re-opens by
+   name. Bound the copy by a compressed-size cap and abort if exceeded.
+6. **Validate the temp file in the backups directory.** This is the authoritative
+   check: that file is unwritable by the web process, so validated == persisted,
+   unconditionally — no window and no reasoning about descriptor lifetimes. On
+   refusal, `unlink` the temp, leave the staged file for inspection, exit non-zero.
+7. **Rename** the temp to the final `palworld-save-<stamp>.tar.gz`, refusing if that
+   name already exists. Build the destination name yourself from the
+   `valid_archive_name`-checked basename — never join anything client-supplied. A
+   half-copied or refused archive is therefore never visible to `/api/backups` or
+   to `--restore`.
+8. Unlink the staged file on success. Print the promoted path on stdout.
+
+This makes `--restore`'s own re-validation a genuine *second independent*
+guarantee rather than the only real one.
 
 Add `sys.path` entries for `/usr/local/lib` and the repo's `lib/` exactly as `palwarden-jobd` does, so the module resolves in both installed and dev layouts.
 
