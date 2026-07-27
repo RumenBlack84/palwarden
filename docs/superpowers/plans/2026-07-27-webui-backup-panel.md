@@ -522,7 +522,7 @@ Expected: FAIL — `can't open file '.../sbin/palworld-backups'`.
 
 - [ ] **Step 3: Write minimal implementation**
 
-Create `sbin/palworld-backups` (Python, `argparse`, mutually-exclusive mode group so `--help` exits 0 and an unknown flag exits non-zero):
+Create `sbin/palworld-backups` (Python, `argparse`; `--help` exits 0, an unknown flag and a bare invocation exit non-zero). **`--if-due` and `--prune` must compose in one invocation** — the spec's service wiring is literally `palworld-backups --if-due --prune`, so a strict mutually-exclusive group over all four modes would exit 2 and silently disable both scheduled backups and retention on both platforms. `--delete` and `--show-schedule` stay exclusive with everything. Run `--if-due` before `--prune`, so retention is applied to the collection *including* the archive just created:
 
 - `read_schedule()`: parse `PALWORLD_BACKUP_SCHEDULE` if present, apply defaults `BACKUP_ENABLED=true`, `BACKUP_INTERVAL_HOURS=24`, `BACKUP_RETENTION_DAYS=14`, `BACKUP_KEEP_MIN=3`, clamp to the spec's ranges (1–720, 1–3650, 1–100), warn on an out-of-range or unparseable value and fall back to the default rather than crashing — a typo in the file must not take out the scheduled backup.
 - `--delete <name>`: validate the name, refuse a symlink, require a regular file inside the backups dir, unlink. No floor.
