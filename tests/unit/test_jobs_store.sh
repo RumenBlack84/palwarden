@@ -303,4 +303,57 @@ finally:
 print("refused" if calls == [] else "CHOWNED %r" % (calls,))' 2>/dev/null)"
 assert_eq "$out" "refused" "a job file owned by neither root nor the queue owner is refused"
 
+# ...and the allowed set itself, not just its wiring. The stub above proves both
+# call sites consult it, but would pass just as green against a validator that
+# returned every uid on the box, or one that had quietly lost root (which would
+# make the worker refuse every job it had ever updated). On a queue directory we
+# own there are exactly two legitimate owners: root and us.
+reset
+out="$(py '
+import os
+import palwarden_jobs as j
+j.create_job("backup", {})   # creates the queue directory
+print("ok" if j._allowed_owner_uids() == {0, os.getuid()} else
+      "WRONG %r" % (sorted(j._allowed_owner_uids()),))')"
+assert_eq "$out" "ok" "the allowed owner set is exactly root plus the queue directory owner"
+
+# --- an oversized queue entry is refused, not read into root memory --------
+# The web user owns the queue directory, so it can put any regular file at
+# <id>.json — and every list_jobs() in the worker's poll loop reads each one
+# whole. read_text() was unbounded and so was its replacement; the cap makes a
+# planted multi-gigabyte file a refusal instead of root's RSS. Tested a little
+# over the limit rather than with a real giant file: the assertion is about the
+# check, and a 4 GiB fixture would be a worse test, not a better one.
+reset
+out="$(py '
+import palwarden_jobs as j
+job = j.create_job("backup", {})
+path = j.job_path(job["id"])
+with path.open("wb") as fh:
+    fh.write(b"{}" + b" " * (j.MAX_JOB_BYTES + 1))
+try:
+    j._read_job_text(path)
+    print("READ")
+except ValueError as exc:
+    print("refused" if "limit" in str(exc) else "other: %s" % exc)
+# ...and read_job treats the refusal as "absent" like every other one, so a
+# planted file cannot make a state update raise instead of skipping it.
+print("absent" if j.read_job(job["id"]) is None else "PARSED")
+print("listed %d" % len(j.list_jobs()))')"
+assert_eq "$out" "refused
+absent
+listed 0" "an over-limit job file is refused by the read primitive and treated as absent"
+
+# A job at the padded-but-legal size still reads, so the cap is a ceiling and not
+# an accidental refusal of ordinary jobs (whose largest field, output, is capped
+# at OUTPUT_LIMIT = 256 KiB — well inside it).
+reset
+out="$(py '
+import palwarden_jobs as j
+job = j.create_job("backup", {})
+j.append_output(job["id"], "x" * (j.OUTPUT_LIMIT + 1000))
+got = j.read_job(job["id"])
+print("ok" if got is not None and len(got["output"]) > 100000 else "REFUSED %r" % (got,))')"
+assert_eq "$out" "ok" "a job with the maximum permitted output still reads back"
+
 assert_report

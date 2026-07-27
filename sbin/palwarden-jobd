@@ -23,7 +23,6 @@ import importlib.machinery
 import importlib.util
 import os
 import re
-import shlex
 import subprocess
 import sys
 import time
@@ -51,38 +50,6 @@ ENGINE_CONFIG_BIN = Path(os.environ.get(
     "PALWARDEN_ENGINE_CONFIG_BIN", str(Path(__file__).resolve().parent / "palworld-engine-config")))
 JOBD_LOCK = Path(os.environ.get("PALWARDEN_JOBD_LOCK", "/run/palwarden-jobd.lock"))
 JOBD_INTERVAL_DEFAULT = 2.0
-
-
-def drop_priv_prefix() -> list[str]:
-    """Command prefix that runs an action as the unprivileged service account.
-
-    Not every action needs root. The ones whose whole effect is writing files in
-    trees the service account owns (see `drop_priv` in ACTIONS) must *not* run as
-    root, because root leaves root-owned artefacts behind in a tree the
-    unprivileged jobs then cannot write. The concrete failure: palworld-fps opens
-    the metrics DB with `PRAGMA journal_mode=WAL`, and SQLite creates the
-    `-wal`/`-shm` side files as the calling process. Normally the last connection
-    to close checkpoints and removes them, but root's is SIGKILLed mid-transaction
-    (the container's jobd gets 3s on `docker stop`) or a `steam` fps-sample
-    connection is still open, so root is not the last closer. A root-owned
-    `metrics.sqlite3-wal` then makes *every* subsequent unprivileged sample fail
-    with "attempt to write a readonly database" — opening a WAL database
-    read-write needs write access to both side files — and nothing cleans it up.
-    Telemetry stops for good, discovered days later.
-
-    Two spellings, because the container has no working `sudo`: docker/shims/sudo
-    is a passthrough that does not change uid at all, so PALWORLD_DROP_PRIV's
-    bare-metal `sudo -u palworld` would silently keep root there.
-
-      * container (PALWARDEN_CONTAINER=1): `s6-setuidgid <PALWORLD_USER>`.
-      * bare metal: PALWORLD_DROP_PRIV, same convention as palworld-update.
-        `${VAR-default}` semantics (os.environ.get with a default), so setting it
-        to the empty string disables dropping entirely rather than getting the
-        default back — an operator escape hatch on hosts without sudo.
-    """
-    if os.environ.get("PALWARDEN_CONTAINER") == "1":
-        return ["s6-setuidgid", os.environ.get("PALWORLD_USER") or "steam"]
-    return shlex.split(os.environ.get("PALWORLD_DROP_PRIV", "sudo -u palworld"))
 
 
 def _interval_from_env(raw: str | None) -> float:
@@ -320,11 +287,20 @@ def write_engine_env(settings: dict[str, str]) -> None:
 # parameter names the action recognises. engine_save has no command at all — it
 # only writes a file — so it is handled separately in build_commands/run_job.
 #
-# `drop_priv` (absent = False) marks the actions whose entire effect is writing
-# files in trees the service account owns, so they run as that account instead of
-# root — see drop_priv_prefix for why root there is actively harmful. Everything
-# else genuinely needs root: cycling the server's unit/s6 service, SteamCMD,
-# writing /etc/palworld/engine.env, applying the game config.
+# Every action runs as root, the uid this worker already has. A `drop_priv` flag
+# on the file-only actions (mark, snapshot_create, config_pretty) was tried and
+# reverted: it was justified by root leaving root-owned SQLite `-wal`/`-shm` side
+# files that unprivileged fps-samples could then not write, but SQLite's
+# robustFchown() (os_unix.c) chowns both side files to the *database's* owner when
+# it is running as root, precisely so the original owner keeps working — measured,
+# then confirmed in the source. Dropping privilege instead *created* a bare-metal
+# failure: palworld-fps-sample.service has no User=, so it creates
+# /var/lib/palworld/metrics.sqlite3 as root on first use (install.sh does not
+# pre-create it; only the container entrypoint does, which is why the container
+# looked fine), and a `mark` dropped to palworld then dies on every write with
+# "attempt to write a readonly database". Ownership of an action's *outputs* is
+# the individual tool's job, done on the descriptor it wrote — see
+# palworld-config-pretty's fchown and palworld-config-snapshot's chown_tree.
 #
 # `params` is a whitelist, not documentation: validate_params refuses any key
 # not listed (plus `confirm`, which every disruptive action takes) and builds the
@@ -441,13 +417,11 @@ def _argv_engine_save_apply_restart(params: dict) -> list[list[str]]:
 ACTIONS: dict[str, dict] = {
     "config_apply": {"argv": _argv_config_apply, "disruptive": False, "params": ()},
     "engine_apply": {"argv": _argv_engine_apply, "disruptive": False, "params": ("dry_run",)},
-    "config_pretty": {"argv": _argv_config_pretty, "disruptive": False, "params": (),
-                      "drop_priv": True},
+    "config_pretty": {"argv": _argv_config_pretty, "disruptive": False, "params": ()},
     "snapshot_create": {"argv": _argv_snapshot_create, "disruptive": False,
-                        "params": ("label",), "drop_priv": True},
+                        "params": ("label",)},
     "backup": {"argv": _argv_backup, "disruptive": False, "params": ()},
-    "mark": {"argv": _argv_mark, "disruptive": False, "params": ("text",),
-             "drop_priv": True},
+    "mark": {"argv": _argv_mark, "disruptive": False, "params": ("text",)},
     "engine_save": {"argv": None, "disruptive": False, "params": ("settings",)},
     "graceful_restart": {"argv": _argv_graceful_restart, "disruptive": True,
                          "params": ("wait", "message")},
@@ -535,17 +509,10 @@ def build_commands(action: str, params: dict) -> list[list[str]]:
     spec = ACTIONS[action]
     if spec["argv"] is None:
         return []  # engine_save: file-only, no command
-    commands = spec["argv"](params)
-    if spec.get("drop_priv"):
-        # Prefixed here rather than inside each _argv_* builder so the argv the
-        # builders produce stays exactly the tool's own command line — the thing
-        # the tests assert on — and so the privilege decision lives in the table
-        # next to the action, not scattered across builders. An empty prefix
-        # (PALWORLD_DROP_PRIV="") means "do not drop"; see drop_priv_prefix.
-        prefix = drop_priv_prefix()
-        if prefix:
-            commands = [prefix + argv for argv in commands]
-    return commands
+    # Exactly the tool's own command line, with no privilege-changing prefix: the
+    # worker is already root and every action stays there (see the ACTIONS
+    # preamble on the reverted drop_priv flag).
+    return spec["argv"](params)
 
 
 def run_job(job: dict) -> int:

@@ -17,23 +17,26 @@ RestartSec=5
 # job queue plus telemetry DB under /var/lib/palworld, and its own flock at
 # /run/palwarden-jobd.lock.
 ProtectSystem=true
-ProtectKernelModules=true
-LockPersonality=true
 # ProtectSystem=true (not =strict, not =full) is the strongest setting compatible
 # with that list: it makes /usr and /boot read-only, which the worker never
 # writes, while leaving /etc, /opt, /var and /run writable. =full would make /etc
 # read-only and break engine_save; =strict would make all of the above read-only
-# and turn every action into a job that fails at its last step.
-# ProtectKernelModules and LockPersonality cost nothing here: nothing in the job
-# chain loads a kernel module or calls personality(2) — SteamCMD's 32-bit binaries
-# are executed directly, not via a linux32 personality wrapper.
+# and turn every action into a job that fails at its last step. It is also the one
+# directive here that installs no syscall filter, so it cannot surprise SteamCMD.
 #
 # Deliberately still absent:
 #  * ProtectHome= — SteamCMD (update_apply) writes the service account's
 #    ~/.steam, and PALWORLD_DROP_PRIV runs it from this unit's process tree.
 #  * NoNewPrivileges= — palworld-update drops to the service account with sudo
-#    (PALWORLD_DROP_PRIV), as does jobd itself for the unprivileged actions
-#    (mark, snapshot_create, config_pretty). Both need a setuid exec.
+#    (PALWORLD_DROP_PRIV), which needs a setuid exec.
+#  * ProtectKernelModules=/LockPersonality= — both were briefly set here and
+#    removed. Both install a seccomp filter (and the former also hides
+#    /usr/lib/modules) directly in the path of SteamCMD's 32-bit binaries during
+#    update_apply, and no bare-metal update_apply has ever been run under this
+#    unit: the integration suite is Docker/s6 only and cannot exercise a systemd
+#    unit at all, so `systemd-analyze verify` — a parse, not a run — was the whole
+#    of the evidence. Good candidates once someone has run a real bare-metal
+#    update under this unit and seen it succeed.
 #  * PrivateTmp=/PrivateDevices=/ProtectKernelTunables= — untested against the
 #    full job chain (game restarts, SteamCMD); not added on speculation.
 #

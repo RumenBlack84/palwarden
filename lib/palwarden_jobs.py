@@ -30,6 +30,14 @@ JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 STATES = ("queued", "running", "succeeded", "failed")
 OUTPUT_LIMIT = 262144
 TRUNCATION_MARKER = "\n[output truncated at 256 KiB]\n"
+# Hard ceiling on how much of a queue entry root will read into memory. A job
+# file is a small JSON object whose largest field is `output`, capped at
+# OUTPUT_LIMIT — 4 MiB is an order of magnitude of headroom over any legitimate
+# one. The web user owns the queue directory, so without a cap it could plant a
+# multi-gigabyte regular file at `<id>.json` and every list_jobs() in the root
+# worker's poll loop would read it whole. Refused rather than truncated: a partial
+# read is not valid JSON anyway, so there is nothing to salvage.
+MAX_JOB_BYTES = 4 * 1024 * 1024
 
 
 def new_job_id() -> str:
@@ -208,6 +216,8 @@ def _read_job_text(path: Path) -> str:
         rejects the descriptor.
       * owner validation: a file root would otherwise parse as a job, placed by a
         third account (see _allowed_owner_uids).
+      * size cap: an oversized entry is refused rather than read into root's
+        memory (see MAX_JOB_BYTES).
 
     Raises OSError or ValueError, both of which read_job already treats as
     "absent": a refused file is not a job.
@@ -219,11 +229,22 @@ def _read_job_text(path: Path) -> str:
             raise ValueError(f"job file is not a regular file; refused: {path}")
         if st.st_uid not in _allowed_owner_uids():
             raise ValueError(f"job file has unexpected owner uid={st.st_uid}; refused: {path}")
+        if st.st_size > MAX_JOB_BYTES:
+            raise ValueError(f"job file is {st.st_size} bytes, over the "
+                             f"{MAX_JOB_BYTES}-byte limit; refused: {path}")
         chunks: list[bytes] = []
+        total = 0
         while True:
             chunk = os.read(fd, 1 << 16)
             if not chunk:
                 break
+            total += len(chunk)
+            # The fstat above is a snapshot; the owner of the queue directory can
+            # keep appending after it. Enforce on what we have actually read too,
+            # so the ceiling holds against a file growing under us.
+            if total > MAX_JOB_BYTES:
+                raise ValueError(f"job file exceeded the {MAX_JOB_BYTES}-byte "
+                                 f"limit while reading; refused: {path}")
             chunks.append(chunk)
     finally:
         os.close(fd)

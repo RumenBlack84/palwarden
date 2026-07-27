@@ -239,4 +239,16 @@ assert_eq "$state" "succeeded" "J: the root worker ran the queued job to success
 # and the job's actual effect landed
 assert_rc 0 docker exec pw-it-g sh -c 'ls -d /opt/palworld/config-snapshots/*itest-jobd'
 
+# The worker is root, so the snapshot it just wrote must still end up owned by the
+# service account — the web UI lists and prunes these unprivileged. The tool does
+# that itself, from PALWORLD_USER/PALWORLD_GROUP; those names were hardcoded to
+# "palworld", which does not exist in this image, and the LookupError was swallowed
+# by a bare `except`, so the whole tree stayed root-owned in exactly this scenario.
+# Asserted on the directory AND its contents: the old code chowned the directory
+# first, so a dir-only check would have passed while every file inside was root's.
+assert_eq "$(docker exec pw-it-g sh -c 'stat -c %U $(ls -d /opt/palworld/config-snapshots/*itest-jobd)')" \
+  "steam" "J: a root-run snapshot_create leaves the snapshot dir owned by steam"
+assert_eq "$(docker exec pw-it-g sh -c 'stat -c %U /opt/palworld/config-snapshots/*itest-jobd/* | sort -u | tr "\n" ","')" \
+  "steam," "J: ...and every file inside it, not just the directory"
+
 assert_report

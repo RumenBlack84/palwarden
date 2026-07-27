@@ -30,6 +30,42 @@ MANIFEST = Path("/opt/palworld/server/steamapps/appmanifest_2394010.acf")
 SECRET_ENV_RE = re.compile(r"^(\s*(?:ADMIN_PASSWORD|SERVER_PASSWORD|PALWORLD_DISCORD_WEBHOOK|DISCORD_WEBHOOK|.*SECRET.*|.*TOKEN.*|.*PASSWORD.*)\s*=).*$", re.I)
 
 
+def chown_tree(snapshot_dir: Path) -> None:
+    """Hand a finished snapshot to the service account, best effort but audibly.
+
+    This normally runs as *root* (jobd's snapshot_create action) into a directory
+    the unprivileged account owns, so the tree it just wrote would otherwise be
+    root-owned and the web UI could not read or prune it. The account name comes
+    from PALWORLD_USER/PALWORLD_GROUP like every other script in this repo: these
+    were hardcoded to "palworld", which raised LookupError in the container (the
+    account there is `steam`) into a bare `except Exception: pass` — so root
+    snapshots landed root-owned and nothing said so. Same treatment as
+    palworld-config-pretty's fchown: never fatal — a snapshot with the wrong owner
+    still beats no snapshot — but never silent either.
+    """
+    user = os.environ.get("PALWORLD_USER", "palworld")
+    group = os.environ.get("PALWORLD_GROUP", "palworld")
+    # One resolution attempt for the whole tree: an unknown account fails
+    # identically for every entry, and warning once per snapshot is the useful
+    # amount rather than once per file.
+    try:
+        shutil.chown(snapshot_dir, user=user, group=group)
+    except LookupError as exc:
+        print(f"Warning: unknown owner {user}:{group} ({exc}); leaving {snapshot_dir} as is",
+              file=sys.stderr)
+        return
+    except OSError as exc:
+        print(f"Warning: cannot set owner {user}:{group} on {snapshot_dir}: {exc}",
+              file=sys.stderr)
+        return
+    for path in snapshot_dir.iterdir():
+        try:
+            shutil.chown(path, user=user, group=group)
+        except (LookupError, OSError) as exc:
+            print(f"Warning: cannot set owner {user}:{group} on {path}: {exc}",
+                  file=sys.stderr)
+
+
 def now_stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
@@ -169,12 +205,7 @@ def create_snapshot(
     (snapshot_dir / "buildid.txt").write_text(f"{manifest.get('buildid') or 'unknown'}\n")
     (snapshot_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
 
-    try:
-        shutil.chown(snapshot_dir, user="palworld", group="palworld")
-        for path in snapshot_dir.iterdir():
-            shutil.chown(path, user="palworld", group="palworld")
-    except Exception:
-        pass
+    chown_tree(snapshot_dir)
 
     if mark:
         subprocess.run(

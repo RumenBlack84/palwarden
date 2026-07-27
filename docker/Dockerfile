@@ -105,9 +105,10 @@ COPY docker/s6-rc.d/ /etc/s6-overlay/s6-rc.d/
 # Both name prefixes are globbed: `palworld-*` alone missed `palwarden-jobd`,
 # whose executable bit then depended entirely on the git mode of the copied file.
 # config-snapshots must exist owned by steam for the same reason config-backups
-# does: jobd runs snapshot_create as steam (see drop_priv_prefix), so a directory
-# root created on first use would be unwritable for every snapshot after it —
-# and bare metal already gets this from install.sh.
+# does: the web UI lists and prunes snapshots unprivileged, and the tool hands
+# each finished snapshot to PALWORLD_USER itself, so a directory root created on
+# first use would leave the tree unreachable from that side. This also just makes
+# the image match bare metal, where install.sh already creates it steam-owned.
 RUN chmod +x \
         /usr/local/bin/palwarden-entrypoint \
         /usr/local/bin/palwarden-run-periodic \
