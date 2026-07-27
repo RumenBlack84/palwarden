@@ -33,15 +33,27 @@ avoids copying obvious junk; it is never the authority.
 A consequence worth stating: this makes `--restore`'s own re-validation a genuine
 second, independent guarantee rather than the only real one.
 
-`--restore` itself is not implemented here yet; the mode group has room for it.
+`--restore` turns one of those archives back into a running world, and it inherits
+the same reasoning one directory further along — see `restore_archive`. The short
+version: the backups directory is root-owned so the *name* cannot be substituted,
+but `palworld-backup` hands each archive it writes to the service account and
+`palwarden-webui` runs as that account, so the *bytes* of any archive in there are
+still web-writable. `--restore` therefore copies the chosen archive into a
+root-only scratch directory through one descriptor and validates and extracts only
+that copy.
 """
 
 from __future__ import annotations
 
 import argparse
+import grp
 import os
+import pwd
 import secrets
+import shutil
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 # Mirror how palwarden-jobd locates palwarden_jobs: prepend the bare-metal lib
@@ -57,6 +69,62 @@ UPLOAD_DIR = Path(os.environ.get("PALWARDEN_UPLOAD_DIR", "/var/lib/palworld/uplo
 # lists for /api/backups (PALWORLD_BACKUP_DIR already means *config* backups in
 # this repo), so one override moves writer, lister and importer together.
 BACKUP_DIR = Path(os.environ.get("PALWARDEN_SAVE_BACKUP_DIR", "/opt/palworld/backups"))
+
+# --- --restore only ---------------------------------------------------------
+
+# Where the operational tools live, located exactly as palwarden-jobd locates
+# them, so one override moves the queue runner and this tool together (and so the
+# suite can point at stubs that log their argv).
+SBIN = Path(os.environ.get("PALWARDEN_SBIN_DIR", "/usr/local/sbin"))
+
+# `systemctl` is not one of ours, so it is not under SBIN — and it deliberately is
+# not branched on PALWARDEN_CONTAINER either: in the container the `systemctl` on
+# PATH is docker/shims/systemctl, which already translates `start`/`is-active` to
+# s6. Adding a second translation here would be a second thing to keep in sync
+# with the shim. Overridable only so the suite can stub it.
+SYSTEMCTL = os.environ.get("PALWARDEN_SYSTEMCTL_BIN") or "systemctl"
+# Hardcoded like every other script in this repo (palworld-status,
+# palworld-memory-watch, palworld-graceful-restart); the shim maps it to the s6
+# service name.
+SERVICE_UNIT = "palworld.service"
+
+# Root-owned, mode 0700. The entire integrity argument of --restore rests on this
+# being a directory the unprivileged web process cannot write; see
+# `_scratch_copy`. Task 8 has the installer and the container entrypoint create
+# it, and `_open_scratch_dir` creates it defensively too.
+SCRATCH_DIR = Path(os.environ.get("PALWARDEN_RESTORE_SCRATCH",
+                                  "/var/lib/palworld/restore-scratch"))
+
+# The live world tree, resolved exactly as palworld-backup resolves it — same
+# variables, same precedence, and the same `${PALWORLD_SAVED_DIR-...}` semantics
+# where a *set but empty* override is honoured while an unset one falls through
+# PALWORLD_INSTALL_DIR. Two tools disagreeing about which directory is the world
+# would make the safety backup archive a different tree than the one replaced.
+_saved = os.environ.get("PALWORLD_SAVED_DIR")
+if _saved is None:
+    _saved = (os.environ.get("PALWORLD_INSTALL_DIR") or "/opt/palworld/server") + "/Pal/Saved"
+SAVED_DIR = Path(_saved)
+
+# Never a hardcoded "palworld": that account does not exist in the container
+# (it is `steam` there), which is the bug that left config snapshots root-owned.
+# `.get(name, default)` and not `or default`, so an explicitly empty override is
+# honoured — it means "leave that half of the ownership alone", matching what
+# `chown ":group"` does in the bash tools.
+SERVICE_USER = os.environ.get("PALWORLD_USER", "palworld")
+SERVICE_GROUP = os.environ.get("PALWORLD_GROUP", "palworld")
+
+# Readiness bound, same default as palworld-graceful-restart's --startup-timeout,
+# polled at the same 3s interval. Matched rather than re-chosen: "up" has one
+# definition in this repo and it lives in that script.
+STARTUP_TIMEOUT = archive.env_int("PALWARDEN_RESTORE_STARTUP_TIMEOUT", 180)
+POLL_SECONDS = archive.env_int("PALWARDEN_RESTORE_POLL_SECONDS", 3)
+
+# Ceiling on the compressed size of the archive copied into scratch. Same purpose
+# as the import cap, with a sharper justification: the premise of the scratch copy
+# is that an archive in the backups directory *is* web-writable, so it can be
+# grown without limit, and an unbounded copy would fill the scratch volume —
+# /var/lib/palworld, where the job queue and the telemetry DB also live.
+MAX_RESTORE_BYTES = archive.env_int("PALWARDEN_RESTORE_MAX_BYTES", 8 * 1024**3)
 
 # Ceiling on the *compressed* size of a single upload. This is not the
 # decompression-bomb cap (palwarden_archive owns that, on the uncompressed size);
@@ -349,21 +417,558 @@ def import_staged(staged: str) -> Path:
     return final
 
 
+# ---------------------------------------------------------------------------
+# --restore
+# ---------------------------------------------------------------------------
+
+
+def _backup_path(name: str) -> Path:
+    """Resolve a backup name inside BACKUP_DIR, or raise ArchiveError.
+
+    Same two checks as `_staged_path`, in the same order and for the same
+    reasons — the separator guard states the intent where a reader looks for it
+    and the pattern is what actually decides. Deliberately a second, tiny
+    function rather than a shared one parameterised by directory: the two
+    messages name different directories and the suites pin them separately, and
+    the parameterised version reads worse than the four lines it saves.
+    """
+    if not isinstance(name, str) or "/" in name or "\\" in name:
+        raise archive.ArchiveError(
+            f"backup must be a bare file name, got {name!r}")
+    if not archive.valid_archive_name(name):
+        raise archive.ArchiveError(
+            f"{name!r} is not a name palworld-backup could have written; refused")
+    return BACKUP_DIR / name
+
+
+def _run(argv: list[str], echo: bool = False) -> tuple[int, str]:
+    """Run a fixed argv list; return (exit code, stdout). Never a shell.
+
+    A list, `shell=False`, and no parameter ever interpolated into a command
+    string — the operator-supplied backup name never reaches any of these
+    commands in the first place, but the rule holds regardless.
+
+    stderr is inherited rather than captured, so a sub-tool's diagnostics reach
+    the job log in the order they happened instead of being buffered and
+    re-emitted out of sequence. `echo` mirrors stdout for the tools whose output
+    the operator wants to see (the backup, the stop); the readiness poll leaves
+    it off because it can run dozens of times.
+    """
+    sys.stdout.flush()
+    try:
+        proc = subprocess.run(argv, stdout=subprocess.PIPE, text=True, check=False)
+    except OSError as exc:
+        raise archive.ArchiveError(f"cannot run {argv[0]}: {exc}") from exc
+    out = proc.stdout or ""
+    if echo and out:
+        sys.stdout.write(out)
+        sys.stdout.flush()
+    return proc.returncode, out
+
+
+def _within(parent: Path, child: Path) -> bool:
+    """True when `child` resolves to something strictly under `parent`.
+
+    realpath on both sides, so a symlinked scratch or backups directory is judged
+    on where it actually lands rather than on how it was spelled.
+    """
+    try:
+        p = os.path.realpath(parent)
+        c = os.path.realpath(child)
+        return c != p and os.path.commonpath([p, c]) == p
+    except (OSError, ValueError):
+        return False
+
+
+def _open_scratch_dir() -> int:
+    """Open SCRATCH_DIR as a root-only directory, creating it. Returns a dir fd.
+
+    Task 8 has the installer and the container entrypoint create this 0700
+    root-owned. It is created here too so a restore on a host that predates that
+    — or on a fresh volume — is not what discovers the omission, which would be
+    the one moment the tool exists for.
+
+    O_NOFOLLOW because a symlink at this name would relocate the single directory
+    the integrity argument below depends on, and `fchmod` on the descriptor we
+    then use rather than `chmod` on the name so a directory left group-writable
+    by an earlier install is tightened with no check-then-use gap in between.
+    """
+    try:
+        SCRATCH_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError as exc:
+        raise archive.ArchiveError(
+            f"cannot create the restore scratch directory {SCRATCH_DIR}: {exc}") from exc
+    try:
+        dfd = os.open(SCRATCH_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise archive.ArchiveError(
+            f"cannot open the restore scratch directory {SCRATCH_DIR}: {exc}") from exc
+    try:
+        # mkdir's mode is masked by the umask, so this is also what actually
+        # guarantees 0700 on the directory we just created.
+        os.fchmod(dfd, 0o700)
+    except OSError as exc:
+        os.close(dfd)
+        raise archive.ArchiveError(
+            f"cannot secure the restore scratch directory {SCRATCH_DIR}: {exc}") from exc
+    return dfd
+
+
+def _scratch_copy(src: Path) -> Path:
+    """Copy `src` into the root-only scratch directory. Returns the copy's path.
+
+    **This is the security core of --restore, not belt-and-braces.** Two
+    guarantees are in play and they come from two different mechanisms:
+
+      * The archive's *name* is guaranteed by BACKUP_DIR being root-owned 0755
+        (see palworld-backup): nothing unprivileged can substitute the directory
+        entry root opens.
+      * The archive's *bytes* are guaranteed only by this copy. palworld-backup
+        chowns every archive it writes to PALWORLD_USER:PALWORLD_GROUP and
+        palwarden-webui runs as exactly that account, so every archive in the
+        backups directory is writable by the untrusted web process *today*. A
+        web-owned file can be rewritten in place (O_WRONLY without O_TRUNC, or
+        pwrite) between any two reads: holding a descriptor defeats a rename, it
+        does not defeat a write. Validating in place would therefore guarantee
+        the name and not the bytes — the same unsoundness `--import` was
+        reordered to avoid, and exactly what
+        `palwarden_archive.extract_archive`'s docstring puts on its caller.
+
+    That settles the ownership question in one place rather than two:
+    palworld-backup's chown *stays*, because it is what lets an operator rotate
+    and copy backups off the host without sudo, and integrity comes from this
+    copy instead.
+
+    The bytes come from the descriptor `open_archive_fd` returned and the source
+    name is never re-opened — no `shutil.copy(path, ...)`, nothing that resolves
+    `src` a second time. After this function returns, BACKUP_DIR is never touched
+    again by a restore.
+    """
+    fd = archive.open_archive_fd(src)
+    try:
+        dfd = _open_scratch_dir()
+        try:
+            # Dot-prefixed and carrying entropy for the same reason the import
+            # temp name does: two concurrent restores of the same archive must
+            # not collide. O_EXCL below is what refuses an occupied name.
+            tmp_name = f".{src.name}.restore.{secrets.token_hex(8)}"
+            tmp_path = SCRATCH_DIR / tmp_name
+            try:
+                dst_fd = os.open(tmp_name,
+                                 os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
+                                 0o600, dir_fd=dfd)
+            except OSError as exc:
+                raise archive.ArchiveError(
+                    f"cannot create the restore scratch copy {tmp_path}: {exc}") from exc
+        finally:
+            os.close(dfd)
+        copied = 0
+        try:
+            # fchmod on the held descriptor, not chmod on the name: 0600 makes the
+            # copy unreadable to the service account regardless of umask, so even
+            # reading the bytes root is about to trust is not something the web
+            # process can do.
+            try:
+                os.fchmod(dst_fd, 0o600)
+                dst = os.fdopen(dst_fd, "wb")  # fdopen takes ownership of the fd
+            except BaseException:
+                os.close(dst_fd)
+                raise
+            with dst:
+                while True:
+                    chunk = os.read(fd, COPY_CHUNK)
+                    if not chunk:
+                        break
+                    copied += len(chunk)
+                    if copied > MAX_RESTORE_BYTES:
+                        raise archive.ArchiveError(
+                            f"{src.name} exceeded the {MAX_RESTORE_BYTES}-byte "
+                            f"restore limit while copying; refused")
+                    dst.write(chunk)
+        except BaseException:
+            _unlink_quietly(tmp_path)
+            raise
+    finally:
+        os.close(fd)
+    return tmp_path
+
+
+def _validate_scratch(scratch: Path) -> dict:
+    """THE authoritative validation — and it must be of the scratch copy.
+
+    The two guards are not decoration. They are what makes "restore validates the
+    copy, never the web-writable original" a property of the code rather than of
+    a reader's memory: a scratch directory misconfigured to sit inside the
+    backups directory would silently return --restore to validating a
+    web-writable file with every other line of this file unchanged. Both are
+    reachable by configuration alone, so both are falsifiable and the suite
+    pins each message.
+    """
+    if not _within(SCRATCH_DIR, scratch):
+        raise archive.ArchiveError(
+            f"refusing to validate {scratch}: it is not inside the restore "
+            f"scratch directory {SCRATCH_DIR}")
+    if _within(BACKUP_DIR, scratch):
+        raise archive.ArchiveError(
+            f"refusing to validate {scratch}: the restore scratch directory "
+            f"{SCRATCH_DIR} is inside the backups directory {BACKUP_DIR}, whose "
+            f"archives the unprivileged web process can rewrite")
+    return archive.validate_archive(scratch)
+
+
+def _saved_populated() -> bool:
+    """True when SAVED_DIR exists and holds at least one entry.
+
+    A restore is disaster recovery: `Pal/Saved` may not exist at all on a rebuilt
+    host, and an *empty* one is what a partially-created install leaves behind.
+    Neither is a reason to abort, and neither is worth an archive of nothing —
+    which is why this is a question and not an assertion. scandir stops at the
+    first entry rather than listing a few thousand save files to learn one bit.
+    """
+    try:
+        with os.scandir(SAVED_DIR) as entries:
+            for _ in entries:
+                return True
+        return False
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError as exc:
+        # Anything else (EACCES, EIO) is a real problem with the world directory
+        # and must not be silently read as "nothing to preserve".
+        raise archive.ArchiveError(f"cannot inspect {SAVED_DIR}: {exc}") from exc
+
+
+def _safety_backup() -> str | None:
+    """Archive the current world before replacing it. Returns its name, or None.
+
+    Conditional, per the disaster-recovery case: skipped with a printed note when
+    there is no world to preserve. A *failed* backup, on the other hand, aborts —
+    replacing a world that does exist with no way back is the one outcome this
+    tool must never produce.
+    """
+    if not _saved_populated():
+        print(f"safety backup: skipped - {SAVED_DIR} does not exist or is empty, "
+              f"so there is no world to preserve (the normal case on a rebuilt "
+              f"host).")
+        return None
+    rc, out = _run([str(SBIN / "palworld-backup")], echo=True)
+    if rc != 0:
+        raise archive.ArchiveError(
+            f"the pre-restore safety backup failed (exit {rc}); refusing to "
+            f"replace a world with no way back to it")
+    # palworld-backup prints the archive path on stdout as its last line.
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    name = os.path.basename(lines[-1].strip()) if lines else "(unknown)"
+    print(f"safety backup: {name}")
+    return name
+
+
+def _service_active() -> bool:
+    """True when the game server is running, via the same command everything else
+    in this repo asks with (and which the container shim answers from s6)."""
+    rc, _ = _run([SYSTEMCTL, "is-active", "--quiet", SERVICE_UNIT])
+    return rc == 0
+
+
+def _graceful_stop(wait: int | None) -> None:
+    """Stop the server, tolerating "already stopped". Raises on a real failure.
+
+    The server being down is the *expected* state for a restore — it is why the
+    operator is here — so a stop that fails because there was nothing to stop
+    must not abort. But "ignore the exit code" would equally swallow a stop that
+    genuinely could not stop a *running* server, and replacing the world under a
+    live server corrupts both the restore and the save the server then writes.
+
+    So the postcondition decides, not the exit code: a non-zero stop is tolerated
+    only when the server is demonstrably not running. This is a real shape, not a
+    hypothetical: `s6-svc -d` on a service directory that does not exist yet
+    (fresh container, server service not yet selected) exits non-zero with
+    nothing running, and bare-metal `graceful-stop` exits non-zero if the REST
+    save call fails on a crashlooping server.
+    """
+    argv = [str(SBIN / "palworld-graceful-stop")]
+    if wait is not None:
+        argv += ["--wait", str(wait)]
+    rc, _ = _run(argv, echo=True)
+    if rc == 0:
+        print("stop: graceful stop completed.")
+        return
+    if _service_active():
+        raise archive.ArchiveError(
+            f"graceful stop failed (exit {rc}) and {SERVICE_UNIT} is still "
+            f"active; refusing to replace the world under a running server")
+    print(f"stop: graceful stop exited {rc}, but {SERVICE_UNIT} is not active - "
+          f"treating it as already stopped.")
+
+
+def _resolve_account() -> tuple[int, int]:
+    """(uid, gid) for the service account; -1 for either half we must not change.
+
+    Warns and returns -1 rather than aborting on an unresolvable name: a restored
+    world owned by root is a fixable annoyance, a restore refused at the last step
+    is not. Silence is the thing to avoid — that was the swallowed LookupError in
+    palworld-config-snapshot.
+    """
+    uid = gid = -1
+    if SERVICE_USER:
+        try:
+            uid = pwd.getpwnam(SERVICE_USER).pw_uid
+        except KeyError:
+            print(f"palworld-restore: warning: user {SERVICE_USER!r} does not "
+                  f"exist; leaving the restored tree's owner as is", file=sys.stderr)
+    if SERVICE_GROUP:
+        try:
+            gid = grp.getgrnam(SERVICE_GROUP).gr_gid
+        except KeyError:
+            print(f"palworld-restore: warning: group {SERVICE_GROUP!r} does not "
+                  f"exist; leaving the restored tree's group as is", file=sys.stderr)
+    return uid, gid
+
+
+def _chown_tree(root: Path) -> None:
+    """Give the restored tree to the service account. Never fatal.
+
+    `os.walk(followlinks=False)` plus `lchown`, so a symlink *inside* the tree
+    cannot redirect the chown at a path outside it. The guarantee that makes this
+    belt and braces is `extract_archive`'s `filter="data"`, which refuses symlink
+    and hardlink members outright — so the tree we just created cannot contain
+    one. It is kept anyway because that guarantee is one keyword argument in
+    another module, and the cost of it ever being loosened is root handing
+    ownership of an arbitrary path to the service account. `followlinks=False` is
+    os.walk's default; it is written out because the whole point of the line is
+    that it must not change.
+    """
+    uid, gid = _resolve_account()
+    if uid == -1 and gid == -1:
+        return
+    failures = 0
+    first: str | None = None
+
+    def chown(path: str) -> None:
+        nonlocal failures, first
+        try:
+            os.lchown(path, uid, gid)
+        except OSError as exc:
+            failures += 1
+            if first is None:
+                first = f"{path}: {exc}"
+
+    chown(str(root))
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        for entry in dirnames + filenames:
+            chown(os.path.join(dirpath, entry))
+    if failures:
+        # One warning with a count, not one per file: a wrong uid would otherwise
+        # bury the rest of the restore's output under thousands of lines.
+        print(f"palworld-restore: warning: could not set owner "
+              f"{SERVICE_USER}:{SERVICE_GROUP} on {failures} path(s) under "
+              f"{root}; first was {first}", file=sys.stderr)
+    else:
+        print(f"ownership: {root} given to {SERVICE_USER or '(unchanged)'}:"
+              f"{SERVICE_GROUP or '(unchanged)'}")
+
+
+def _confirm_startup(timeout: int) -> str:
+    """Poll for readiness. Returns "ready", "unverifiable", or "timeout".
+
+    The mechanism is palworld-graceful-restart's, reused rather than reinvented:
+    `palworld-api info` succeeding is what "up" means in this repo.
+
+    The three-way return is the point. palworld-api exits **2** for "REST API not
+    enabled / no ADMIN_PASSWORD", which no amount of waiting can fix;
+    graceful-restart treats that as "restarted, readiness not checked" and exits
+    0. For a restore that is *not* a confirmed startup, and it drives a different
+    decision than a timeout does — so it gets its own answer instead of being
+    folded into either success or failure. Deletion of the replaced tree hangs on
+    a positive "ready", never on the absence of an error.
+    """
+    argv = [str(SBIN / "palworld-api"), "info"]
+    deadline = time.monotonic() + timeout
+    while True:
+        rc, _ = _run(argv)
+        if rc == 0:
+            return "ready"
+        if rc == 2:
+            return "unverifiable"
+        if time.monotonic() >= deadline:
+            return "timeout"
+        time.sleep(POLL_SECONDS)
+
+
+def _print_recovery(replaced: Path | None, safety: str | None) -> None:
+    """Name every route back, on the failure path. Two of them where possible.
+
+    Printed before the error itself is reported, and to stderr, so a failed
+    restore ends with the operator holding both the cheap undo (a rename) and the
+    durable one (an archive) rather than having to work out what state the tree
+    was left in.
+    """
+    if replaced is not None:
+        print(f"palworld-restore: the replaced world is kept at {replaced}; "
+              f"moving it back over {SAVED_DIR} undoes this restore",
+              file=sys.stderr)
+    if safety is not None:
+        print(f"palworld-restore: the pre-restore safety archive is {safety} "
+              f"in {BACKUP_DIR}", file=sys.stderr)
+    else:
+        print(f"palworld-restore: no pre-restore safety archive was taken (there "
+              f"was no world in {SAVED_DIR} to preserve)", file=sys.stderr)
+
+
+def restore_archive(name: str, wait: int | None = None,
+                    startup_timeout: int | None = None) -> int:
+    """Turn the named backup back into a running world. Raises ArchiveError.
+
+    Returns 0 when the world was restored (whether or not readiness could be
+    confirmed) and raises on anything that stopped the restore short.
+
+    The order below is the design, and each step's failure stops the next:
+    validate the scratch copy → conditional safety backup → graceful stop →
+    extract *beside* the target → swap by rename → chown → start and confirm →
+    delete the replaced tree only on a confirmed startup.
+    """
+    src = _backup_path(name)
+    if startup_timeout is None:
+        startup_timeout = STARTUP_TIMEOUT
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    safety: str | None = None
+    replaced: Path | None = None
+
+    scratch = _scratch_copy(src)
+    try:
+        try:
+            info = _validate_scratch(scratch)
+            print(f"validated: {name} ({info['members']} members, {info['bytes']} "
+                  f"bytes uncompressed), from the root-owned scratch copy {scratch}")
+
+            safety = _safety_backup()
+            _graceful_stop(wait)
+
+            new_tree = SAVED_DIR.parent / f"{SAVED_DIR.name}.restore-{stamp}"
+            replaced_path = SAVED_DIR.parent / f"{SAVED_DIR.name}.replaced-{stamp}"
+            try:
+                # The parent may not exist at all on a rebuilt host.
+                SAVED_DIR.parent.mkdir(parents=True, exist_ok=True)
+                # mkdir, not makedirs(exist_ok=True): a name already occupied at
+                # this second is a clean refusal rather than an extraction into
+                # someone else's directory.
+                os.mkdir(new_tree, 0o755)
+            except OSError as exc:
+                raise archive.ArchiveError(
+                    f"cannot create the staging tree {new_tree}: {exc}") from exc
+            try:
+                # Extract beside the target, never over it: a partial extraction
+                # must not be able to leave a half-replaced world. Everything up
+                # to here is reversible by doing nothing.
+                archive.extract_archive(scratch, new_tree)
+            except BaseException:
+                # The live tree has not been touched yet, so the only debris is
+                # ours. ignore_errors so a cleanup problem cannot mask the
+                # extraction failure that is the real news.
+                shutil.rmtree(new_tree, ignore_errors=True)
+                raise
+            print(f"extracted: {new_tree}")
+
+            try:
+                # is_symlink as well as exists, so a symlinked Pal/Saved is moved
+                # aside rather than skipped and then clobbered by the rename below.
+                if SAVED_DIR.exists() or SAVED_DIR.is_symlink():
+                    os.rename(SAVED_DIR, replaced_path)
+                    replaced = replaced_path
+                    print(f"replaced: previous world moved to {replaced}")
+                else:
+                    print(f"replaced: nothing to move aside - {SAVED_DIR} did not exist")
+                os.rename(new_tree, SAVED_DIR)
+            except OSError as exc:
+                raise archive.ArchiveError(
+                    f"cannot swap the restored tree into {SAVED_DIR}: {exc}") from exc
+            print(f"restored: {SAVED_DIR}")
+
+            _chown_tree(SAVED_DIR)
+
+            rc, _ = _run([SYSTEMCTL, "start", SERVICE_UNIT], echo=True)
+            if rc != 0:
+                raise archive.ArchiveError(
+                    f"the world was restored, but starting {SERVICE_UNIT} failed "
+                    f"(exit {rc})")
+            state = _confirm_startup(startup_timeout)
+            if state == "timeout":
+                raise archive.ArchiveError(
+                    f"the world was restored and {SERVICE_UNIT} was started, but "
+                    f"the REST API did not become ready within {startup_timeout}s, "
+                    f"so the startup is not confirmed")
+        except BaseException:
+            _print_recovery(replaced, safety)
+            raise
+    finally:
+        # On both success and failure: nothing may be left in the scratch
+        # directory, which is the one place a restore reads its authoritative
+        # bytes from.
+        _unlink_quietly(scratch)
+
+    if state == "ready":
+        print(f"started: {SERVICE_UNIT} is up and the REST API is healthy.")
+        if replaced is not None:
+            # Conditional on a *positive* confirmation, never on the absence of
+            # an error: until the restored server answers, the replaced tree is
+            # the fastest undo there is (a rename, no untarring). Keeping it
+            # forever would cost a full world save per restore, so it goes now
+            # that the durable safety net (the archive above) is the only one
+            # still needed.
+            shutil.rmtree(replaced, ignore_errors=True)
+            print(f"cleaned up: removed the replaced world {replaced}")
+    else:  # "unverifiable"
+        print(f"started: {SERVICE_UNIT} was started, but the REST API is not "
+              f"configured (palworld-api exit 2), so readiness could NOT be "
+              f"verified.")
+        if replaced is not None:
+            print(f"kept: the replaced world stays at {replaced} precisely "
+                  f"because the startup could not be confirmed; remove it by hand "
+                  f"once the server is known good.")
+    if safety is not None:
+        print(f"safety archive retained: {safety} in {BACKUP_DIR}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         prog="palworld-restore",
         description="Import and restore Palworld world-save archives.")
-    # A group, not a bare flag: --restore joins it next, and the two must never
-    # be given together. `required` keeps a bare invocation an error rather than
-    # a silent no-op, while leaving --help at exit 0.
+    # A group, not two bare flags: the two modes must never be given together.
+    # `required` keeps a bare invocation an error rather than a silent no-op,
+    # while leaving --help at exit 0.
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument("--import", dest="import_name", metavar="ARCHIVE",
                       help="promote an uploaded archive from the staging "
                            "directory into the backups directory")
+    mode.add_argument("--restore", dest="restore_name", metavar="ARCHIVE",
+                      help="replace the live world with the contents of an "
+                           "archive from the backups directory")
+    # --restore only. Left off --import rather than accepted-and-ignored there:
+    # a flag that silently does nothing is how an operator learns the wrong model
+    # of a tool. argparse's own error names the flag, so no extra check is needed.
+    ap.add_argument("--wait", type=int, metavar="SECONDS",
+                    help="player-warning window forwarded to palworld-graceful-stop "
+                         "(--restore only; the stop tool's own default applies "
+                         "when omitted)")
+    ap.add_argument("--startup-timeout", type=int, metavar="SECONDS",
+                    default=None,
+                    help=f"how long to wait for REST API readiness after starting "
+                         f"the server (--restore only; default {STARTUP_TIMEOUT})")
     args = ap.parse_args(argv)
 
+    if args.import_name is not None and (args.wait is not None
+                                         or args.startup_timeout is not None):
+        ap.error("--wait and --startup-timeout apply to --restore only")
+    if args.wait is not None and args.wait < 0:
+        ap.error("--wait must not be negative")
+
     try:
-        print(import_staged(args.import_name))
+        if args.import_name is not None:
+            print(import_staged(args.import_name))
+        else:
+            return restore_archive(args.restore_name, wait=args.wait,
+                                   startup_timeout=args.startup_timeout)
     except archive.ArchiveError as exc:
         print(f"palworld-restore: {exc}", file=sys.stderr)
         return 1

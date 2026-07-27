@@ -58,6 +58,44 @@ Tars `Pal/Saved/{SaveGames,Config}` to
 `/opt/palworld/backups/palworld-save-<UTC>.tar.gz`, prints the path, and notifies
 success/failure with the archive size.
 
+### `palworld-restore`
+`/usr/local/sbin/palworld-restore {--import ARCHIVE | --restore ARCHIVE [--wait S] [--startup-timeout S]}`
+
+Turns a world-save archive back into a world. Runs as **root** (normally via
+`palwarden-jobd`'s `backup_import` / `backup_restore` actions). Import is
+**round-trip only**: the name must be exactly what `palworld-backup` writes
+(`palworld-save-<UTC>.tar.gz`) and every member must resolve under `SaveGames/`
+or `Config/` — see [`palwarden_archive`](#libraries).
+
+- `--import ARCHIVE`: promote an upload out of the web-writable staging dir
+  (`PALWARDEN_UPLOAD_DIR`, default `/var/lib/palworld/uploads`) into the
+  root-owned backups dir, 0644, **refusing to overwrite** an existing archive.
+  It **copies first and validates the copy**, because the staging file's owner
+  (the web process) can rewrite it in place between two reads. Prints the
+  promoted path; deletes the upload only on success.
+- `--restore ARCHIVE`: replace the live world with the archive's contents.
+  In order, stopping at the first failure: copy the archive into a root-only
+  scratch dir (`PALWARDEN_RESTORE_SCRATCH`, default
+  `/var/lib/palworld/restore-scratch`, 0700) and **validate that copy** — every
+  archive in the backups dir is writable by the web process, so validating one
+  in place would guarantee the name and not the bytes; a **conditional** safety
+  backup via `palworld-backup` (skipped with a printed note when there is no
+  world to preserve); `palworld-graceful-stop [--wait S]`, where an
+  already-stopped server is success but a stop that leaves the server *running*
+  aborts; extract into `Pal/Saved.restore-<stamp>` **beside** the target, rename
+  the live tree to `Pal/Saved.replaced-<stamp>`, rename the new tree into place;
+  `chown -R` to `PALWORLD_USER`/`PALWORLD_GROUP`; start the service and wait for
+  REST readiness (`--startup-timeout`, default 180s — the same check
+  `graceful-restart` uses).
+
+  The replaced tree is **deleted only on a confirmed startup**. If the start
+  fails, readiness times out, **or the REST API is not configured so readiness
+  cannot be verified at all**, it is kept and its path is printed alongside the
+  safety archive's name, so there are two routes back.
+
+Designed for disaster recovery, so it never assumes existing state: a missing or
+empty `Pal/Saved` and a server that is already down are both normal.
+
 ---
 
 ## REST API helpers
