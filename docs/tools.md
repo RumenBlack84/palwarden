@@ -76,7 +76,7 @@ or `Config/` — see [`palwarden_archive`](#libraries).
 - `--restore ARCHIVE`: replace the live world with the archive's contents.
   In order, stopping at the first failure: copy the archive into a root-only
   scratch dir (`PALWARDEN_RESTORE_SCRATCH`, default
-  `/var/lib/palworld/restore-scratch`, 0700) and **validate that copy** — every
+  `/opt/palworld/restore-scratch`, 0700) and **validate that copy** — every
   archive in the backups dir is writable by the web process, so validating one
   in place would guarantee the name and not the bytes; a **conditional** safety
   backup via `palworld-backup` (skipped with a printed note when there is no
@@ -92,6 +92,23 @@ or `Config/` — see [`palwarden_archive`](#libraries).
   fails, readiness times out, **or the REST API is not configured so readiness
   cannot be verified at all**, it is kept and its path is printed alongside the
   safety archive's name, so there are two routes back.
+
+  The scratch dir lives under `/opt/palworld` and not next to the uploads dir
+  because `/var/lib/palworld` is 0755 **service-account-owned** on both
+  platforms: a "root-only" directory inside it is not root-only. The tool
+  `fstat`s the directory it opened and refuses one it does not own or that has
+  any group/other bits, holds that descriptor for the whole restore, and refuses
+  if the scratch copy's inode changes between validation and extraction.
+
+  Any `Pal/Saved.replaced-*` trees left by earlier restores are **listed at the
+  start** of a restore (named only — never sized, never deleted), because each is
+  a full world save and nothing else ever mentions them again.
+
+`--restore` is **refused in `PALWARDEN_MODE=external`**: the game runs on another
+host, so `systemctl is-active` (via the shim's `pgrep` fallback) cannot see it,
+and a stop that failed against a *live* server would read as "already stopped"
+and the world would be replaced underneath it. Stop and restore on the host that
+runs the server.
 
 Designed for disaster recovery, so it never assumes existing state: a missing or
 empty `Pal/Saved` and a server that is already down are both normal.

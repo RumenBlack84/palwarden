@@ -40,7 +40,14 @@ but `palworld-backup` hands each archive it writes to the service account and
 `palwarden-webui` runs as that account, so the *bytes* of any archive in there are
 still web-writable. `--restore` therefore copies the chosen archive into a
 root-only scratch directory through one descriptor and validates and extracts only
-that copy.
+that copy. "Root-only" is *verified*, not assumed — both the directory's owner and
+its parent's, see `SCRATCH_DIR` and `_open_scratch_dir` — because the whole scheme
+is worth nothing if the scratch directory turns out to be somewhere the web
+account can write.
+
+`--restore` also refuses to run at all in `PALWARDEN_MODE=external`, where the
+question "is the server running?" has no truthful local answer; see
+`_require_answerable_service_state`.
 """
 
 from __future__ import annotations
@@ -51,6 +58,7 @@ import os
 import pwd
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -92,8 +100,27 @@ SERVICE_UNIT = "palworld.service"
 # being a directory the unprivileged web process cannot write; see
 # `_scratch_copy`. Task 8 has the installer and the container entrypoint create
 # it, and `_open_scratch_dir` creates it defensively too.
+#
+# **The parent matters as much as the directory does.** `/var/lib/palworld` — the
+# obvious home, next to the uploads directory and the job queue — is created 0755
+# owned by the *service account* by both `install.sh` and
+# `docker/entrypoint.sh`, so a scratch directory under it sits inside a tree the
+# untrusted web process can write. That is not a theoretical problem: the web
+# account could pre-create the scratch directory itself (`mkdir(exist_ok=True)`
+# succeeds and `fchmod` does not change ownership), or `rename` root's directory
+# aside and put its own at the same name at any moment. `/opt/palworld` is the
+# root-owned parent this repo already puts `backups` and `config-snapshots` under
+# for exactly that reason, so the scratch directory goes there too — and
+# `_open_scratch_dir` verifies the directory it opened rather than trusting the
+# path to have been created correctly.
 SCRATCH_DIR = Path(os.environ.get("PALWARDEN_RESTORE_SCRATCH",
-                                  "/var/lib/palworld/restore-scratch"))
+                                  "/opt/palworld/restore-scratch"))
+
+# `embedded` (this container runs the game) or `external` (the game runs
+# somewhere else and we only manage it). Unset on bare metal, where systemd
+# answers for the unit locally. `--restore` refuses to run in `external` mode; see
+# `_require_answerable_service_state`.
+PALWARDEN_MODE = (os.environ.get("PALWARDEN_MODE") or "").strip().lower()
 
 # The live world tree, resolved exactly as palworld-backup resolves it — same
 # variables, same precedence, and the same `${PALWORLD_SAVED_DIR-...}` semantics
@@ -123,7 +150,7 @@ POLL_SECONDS = archive.env_int("PALWARDEN_RESTORE_POLL_SECONDS", 3)
 # as the import cap, with a sharper justification: the premise of the scratch copy
 # is that an archive in the backups directory *is* web-writable, so it can be
 # grown without limit, and an unbounded copy would fill the scratch volume —
-# /var/lib/palworld, where the job queue and the telemetry DB also live.
+# /opt/palworld, where the backups themselves and the config snapshots live.
 MAX_RESTORE_BYTES = archive.env_int("PALWARDEN_RESTORE_MAX_BYTES", 8 * 1024**3)
 
 # Ceiling on the *compressed* size of a single upload. This is not the
@@ -480,6 +507,32 @@ def _within(parent: Path, child: Path) -> bool:
         return False
 
 
+def _at(dfd: int, name: str) -> str:
+    """A path that reaches `name` *through* the directory descriptor `dfd`.
+
+    Every read of the scratch copy goes through one of these rather than through
+    `SCRATCH_DIR / name`, and the difference is not cosmetic. A path spelled from
+    the root resolves `restore-scratch` afresh on each use, so whoever can write
+    the *parent* can `rename` the verified directory aside between two uses and be
+    read from instead. `/proc/self/fd/<dfd>/<name>` resolves the directory from
+    the descriptor `_open_scratch_dir` already fstat'd, so the directory half of
+    the lookup is pinned for the life of the restore.
+
+    The alternative — `dir_fd=` on every call — is not available: the two doors
+    into `palwarden_archive` that this file must use (`validate_archive_fileobj`
+    via `open_archive_fd`, and `extract_archive`) take a path, and teaching them
+    `dir_fd` is a change to a module two other tools share. `O_NOFOLLOW` still
+    does its job through this spelling, because it constrains the *final*
+    component only, and that component is the ordinary file we created.
+
+    /proc is required for this, which costs nothing anywhere palwarden runs: the
+    container mounts it (s6 does not start without it) and `palworld-status`,
+    `palworld-memory-watch` and every `pgrep` in the repo already depend on it.
+    `_open_scratch_dir` proves it works rather than assuming it.
+    """
+    return f"/proc/self/fd/{dfd}/{name}"
+
+
 def _open_scratch_dir() -> int:
     """Open SCRATCH_DIR as a root-only directory, creating it. Returns a dir fd.
 
@@ -492,6 +545,21 @@ def _open_scratch_dir() -> int:
     the integrity argument below depends on, and `fchmod` on the descriptor we
     then use rather than `chmod` on the name so a directory left group-writable
     by an earlier install is tightened with no check-then-use gap in between.
+
+    **Creating it is not the same as it being ours.** `mkdir(exist_ok=True)`
+    succeeds on a directory that was already there, `O_DIRECTORY|O_NOFOLLOW`
+    succeeds on it too (it is a real directory), and `fchmod` sets the *mode*
+    without touching the *owner* — so a scratch directory pre-created by the
+    untrusted web account would come out of all three steps looking perfect while
+    still being fully writable by that account, which is precisely the property
+    the rest of this file rests on not being true. So the owner is checked on the
+    descriptor we are going to use, with its own message: this is the check whose
+    removal turns the whole scratch scheme back into decoration.
+
+    The owner has to be *us* rather than a literal uid 0. In production the two
+    are the same thing (this tool runs as root under palwarden-jobd), and writing
+    `geteuid()` is what lets the suite exercise the refusal unprivileged instead
+    of leaving the most important check in the file untested.
     """
     try:
         SCRATCH_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -504,17 +572,41 @@ def _open_scratch_dir() -> int:
         raise archive.ArchiveError(
             f"cannot open the restore scratch directory {SCRATCH_DIR}: {exc}") from exc
     try:
+        me = os.geteuid()
+        owner = os.fstat(dfd).st_uid
+        if owner != me:
+            raise archive.ArchiveError(
+                f"the restore scratch directory {SCRATCH_DIR} is owned by uid "
+                f"{owner}, not by uid {me} that this tool runs as; refusing to "
+                f"stage a restore in a directory another account can rewrite")
         # mkdir's mode is masked by the umask, so this is also what actually
-        # guarantees 0700 on the directory we just created.
+        # guarantees 0700 on the directory we just created — and it is what
+        # tightens one an older install left group-readable.
         os.fchmod(dfd, 0o700)
+        # A postcondition, not a second opinion: it is what notices an fchmod that
+        # reported success without taking effect, and what fails loudly if the
+        # tighten above is ever dropped or moved after the first read.
+        mode = stat.S_IMODE(os.fstat(dfd).st_mode)
+        if mode & 0o077:
+            raise archive.ArchiveError(
+                f"the restore scratch directory {SCRATCH_DIR} is still mode "
+                f"{mode:04o} after being tightened; refusing to stage a restore "
+                f"in a directory other accounts can read or write")
+        # Prove the descriptor-relative spelling every later read uses actually
+        # resolves, here, where the failure is a clean refusal — rather than
+        # halfway through a restore as a mystery ENOENT.
+        os.stat(_at(dfd, "."))
     except OSError as exc:
         os.close(dfd)
         raise archive.ArchiveError(
             f"cannot secure the restore scratch directory {SCRATCH_DIR}: {exc}") from exc
+    except BaseException:
+        os.close(dfd)
+        raise
     return dfd
 
 
-def _scratch_copy(src: Path) -> Path:
+def _scratch_copy(src: Path, dfd: int) -> Path:
     """Copy `src` into the root-only scratch directory. Returns the copy's path.
 
     **This is the security core of --restore, not belt-and-braces.** Two
@@ -542,26 +634,29 @@ def _scratch_copy(src: Path) -> Path:
     The bytes come from the descriptor `open_archive_fd` returned and the source
     name is never re-opened — no `shutil.copy(path, ...)`, nothing that resolves
     `src` a second time. After this function returns, BACKUP_DIR is never touched
-    again by a restore.
+    again by a restore. `tests/unit/test_restore_apply.sh`'s `swapdir` harness is
+    what holds that to a behaviour rather than a docstring: it renames a different
+    archive over `src`'s directory entry while our descriptor is open, so a copy
+    that resolved the name a second time would land the other archive.
+
+    `dfd` is the caller's verified scratch-directory descriptor, held open for the
+    whole restore, so the destination is created in the directory that was
+    checked and not merely at a path that spells the same thing.
     """
     fd = archive.open_archive_fd(src)
     try:
-        dfd = _open_scratch_dir()
+        # Dot-prefixed and carrying entropy for the same reason the import
+        # temp name does: two concurrent restores of the same archive must
+        # not collide. O_EXCL below is what refuses an occupied name.
+        tmp_name = f".{src.name}.restore.{secrets.token_hex(8)}"
+        tmp_path = SCRATCH_DIR / tmp_name
         try:
-            # Dot-prefixed and carrying entropy for the same reason the import
-            # temp name does: two concurrent restores of the same archive must
-            # not collide. O_EXCL below is what refuses an occupied name.
-            tmp_name = f".{src.name}.restore.{secrets.token_hex(8)}"
-            tmp_path = SCRATCH_DIR / tmp_name
-            try:
-                dst_fd = os.open(tmp_name,
-                                 os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
-                                 0o600, dir_fd=dfd)
-            except OSError as exc:
-                raise archive.ArchiveError(
-                    f"cannot create the restore scratch copy {tmp_path}: {exc}") from exc
-        finally:
-            os.close(dfd)
+            dst_fd = os.open(tmp_name,
+                             os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
+                             0o600, dir_fd=dfd)
+        except OSError as exc:
+            raise archive.ArchiveError(
+                f"cannot create the restore scratch copy {tmp_path}: {exc}") from exc
         copied = 0
         try:
             # fchmod on the held descriptor, not chmod on the name: 0600 makes the
@@ -586,15 +681,38 @@ def _scratch_copy(src: Path) -> Path:
                             f"restore limit while copying; refused")
                     dst.write(chunk)
         except BaseException:
-            _unlink_quietly(tmp_path)
+            _unlink_quietly_at(dfd, tmp_name, tmp_path)
             raise
     finally:
         os.close(fd)
     return tmp_path
 
 
-def _validate_scratch(scratch: Path) -> dict:
+def _unlink_quietly_at(dfd: int, name: str, display: Path) -> None:
+    """`_unlink_quietly` for a name inside the scratch directory descriptor.
+
+    Removal goes through `dfd` for the same reason every read does: the name must
+    be removed from the directory that was verified, not from whatever is at that
+    path by the time the cleanup runs. `display` is only ever used in the message.
+    """
+    try:
+        os.unlink(name, dir_fd=dfd)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        print(f"palworld-restore: warning: cannot remove {display}: {exc}",
+              file=sys.stderr)
+
+
+def _validate_scratch(scratch: Path, dfd: int) -> tuple[dict, tuple[int, int]]:
     """THE authoritative validation — and it must be of the scratch copy.
+
+    Returns `(info, ident)`, where `ident` is the `(st_dev, st_ino)` of the inode
+    these bytes were actually read from, obtained by `fstat` on the descriptor the
+    validation ran over rather than by a separate `stat` of the name. That is what
+    lets `_check_scratch_identity` say, before the extraction, "the file about to
+    be unpacked is the file that was validated" — not "a file with the same name
+    is there".
 
     The two guards are not decoration. They are what makes "restore validates the
     copy, never the web-writable original" a property of the code rather than of
@@ -602,7 +720,15 @@ def _validate_scratch(scratch: Path) -> dict:
     backups directory would silently return --restore to validating a
     web-writable file with every other line of this file unchanged. Both are
     reachable by configuration alone, so both are falsifiable and the suite
-    pins each message.
+    pins each message. They judge `scratch` — the path as spelled, which is what
+    an operator sees and what a misconfiguration gets wrong — while the read goes
+    through `_at(dfd, ...)`.
+
+    `validate_archive_fileobj` and not `validate_archive`, for the reason
+    `_pre_validate` gives: `validate_archive` takes a path and opens it itself, so
+    there would be no descriptor left to `fstat`. The fd-safety obligation that
+    entry point documents is met the only way it can be — the descriptor comes
+    straight from `open_archive_fd`, which is what refuses a symlink or a FIFO.
     """
     if not _within(SCRATCH_DIR, scratch):
         raise archive.ArchiveError(
@@ -613,7 +739,53 @@ def _validate_scratch(scratch: Path) -> dict:
             f"refusing to validate {scratch}: the restore scratch directory "
             f"{SCRATCH_DIR} is inside the backups directory {BACKUP_DIR}, whose "
             f"archives the unprivileged web process can rewrite")
-    return archive.validate_archive(scratch)
+    fd = archive.open_archive_fd(_at(dfd, scratch.name))
+    try:
+        st = os.fstat(fd)
+        fh = os.fdopen(fd, "rb")
+    except OSError as exc:
+        os.close(fd)
+        raise archive.ArchiveError(f"cannot read {scratch}: {exc}") from exc
+    except BaseException:
+        os.close(fd)
+        raise
+    with fh:
+        info = archive.validate_archive_fileobj(
+            fh, scratch, max_members=archive.MAX_MEMBERS,
+            max_bytes=archive.MAX_UNCOMPRESSED_BYTES)
+    return info, (st.st_dev, st.st_ino)
+
+
+def _check_scratch_identity(scratch: Path, dfd: int,
+                            ident: tuple[int, int]) -> None:
+    """Refuse if the scratch copy is no longer the inode that was validated.
+
+    `extract_archive` re-opens by name, so validation and extraction are two
+    lookups of the same directory entry. Holding `dfd` pins the *directory* half
+    of that lookup; this pins the *file* half. Without it, anything that can
+    write the scratch directory — which is meant to be nobody, but "meant to be"
+    is what the check is for — can `unlink` the validated copy between the two
+    passes and drop a different, individually valid archive at the same name, and
+    the restore unpacks bytes no pass ever checked while reporting success. A
+    reviewer did exactly that.
+
+    It is a check and not a structural guarantee because there is no door into
+    `palwarden_archive` that extracts from a descriptor; making one is a change to
+    a module `--import` and the web handler also use. What it does buy is that the
+    window is no longer silent: the mismatch is a refusal *before* the world is
+    touched, which is the only ordering that matters here.
+    """
+    try:
+        st = os.stat(scratch.name, dir_fd=dfd)
+    except OSError as exc:
+        raise archive.ArchiveError(
+            f"the restore scratch copy {scratch} became unreadable after it was "
+            f"validated ({exc}); refusing to extract") from exc
+    if (st.st_dev, st.st_ino) != ident:
+        raise archive.ArchiveError(
+            f"the restore scratch copy {scratch} was replaced between validation "
+            f"and extraction (it is no longer the inode that was checked); "
+            f"refusing to extract bytes that were never validated")
 
 
 def _saved_populated() -> bool:
@@ -729,14 +901,22 @@ def _chown_tree(root: Path) -> None:
     """Give the restored tree to the service account. Never fatal.
 
     `os.walk(followlinks=False)` plus `lchown`, so a symlink *inside* the tree
-    cannot redirect the chown at a path outside it. The guarantee that makes this
-    belt and braces is `extract_archive`'s `filter="data"`, which refuses symlink
-    and hardlink members outright — so the tree we just created cannot contain
-    one. It is kept anyway because that guarantee is one keyword argument in
-    another module, and the cost of it ever being loosened is root handing
-    ownership of an arbitrary path to the service account. `followlinks=False` is
-    os.walk's default; it is written out because the whole point of the line is
-    that it must not change.
+    cannot redirect the chown at a path outside it.
+
+    The guarantee that makes this belt and braces is `palwarden_archive`'s
+    `_check_member` type rule — `if not (member.isreg() or member.isdir())` — which
+    refuses a symlink or hardlink member by *type*, before any name reasoning, so
+    the tree we just created cannot contain a link at all. That rule, in another
+    module, is the one whose loosening would matter here, and the cost of it being
+    loosened is root handing ownership of an arbitrary path to the service
+    account.
+
+    `extract_archive`'s `filter="data"` is the second-order backstop and covers
+    strictly less: Python's data filter refuses a link whose target is absolute or
+    escapes the destination, and *accepts* an internal relative symlink (verified,
+    not assumed). So it would not on its own keep a link out of this walk —
+    `_check_member` is what does. `followlinks=False` is os.walk's default; it is
+    written out because the whole point of the line is that it must not change.
     """
     uid, gid = _resolve_account()
     if uid == -1 and gid == -1:
@@ -795,6 +975,71 @@ def _confirm_startup(timeout: int) -> str:
         time.sleep(POLL_SECONDS)
 
 
+def _require_answerable_service_state() -> None:
+    """Refuse --restore where "is the server running?" has no truthful answer.
+
+    `_graceful_stop` tolerates a failed stop *only* when the service is
+    demonstrably inactive, and that logic is only as good as `is-active`. In
+    `PALWARDEN_MODE=external` it is not good at all: there is no `palworld-server`
+    s6 service in that mode, so `docker/shims/systemctl` finds nothing for
+    `s6-svstat`, falls through to `pgrep -f PalServer-Linux-Shipping`, and finds
+    nothing there either — because the game is running on another host entirely. A
+    stop that failed against a live external server therefore reports "not
+    active", `_graceful_stop` prints "treating it as already stopped", and the
+    restore replaces `Pal/Saved` under a running server: the exact outcome that
+    branch exists to prevent, produced by the branch itself.
+
+    So an unanswerable question is refused rather than read as "inactive". This is
+    a refusal and not a best-effort attempt for a second reason as well: `systemctl
+    start` has nothing to start in external mode either, so the restore as
+    currently written would replace the world and *then* report failure. Refusing
+    up front is the only version of this that cannot destroy a world.
+
+    Gated on PALWARDEN_MODE rather than on probing for a service directory: the
+    mode is what the entrypoint decides everything else from, it is set in the
+    environment every job inherits, and it is unset on bare metal — where systemd
+    answers for the unit locally and the question is answerable — so bare metal
+    keeps working with no branch of its own.
+    """
+    if PALWARDEN_MODE == "external":
+        raise archive.ArchiveError(
+            "--restore is not supported in PALWARDEN_MODE=external: the game "
+            "server runs on another host, so this tool cannot tell whether it is "
+            "running, cannot stop it, and cannot start it again - and a restore "
+            "that mistakes a live server for a stopped one replaces the world "
+            "underneath it. Stop the server and restore on the host that runs it")
+
+
+def _report_stale_replaced() -> None:
+    """Name any replaced-world trees earlier restores left behind. Never fatal.
+
+    Every restore whose startup could not be confirmed keeps a full copy of the
+    previous world beside the target, on purpose and forever — it is the fastest
+    undo there is. Nothing ever mentions them again, so they accumulate silently
+    at one world save each, and `shutil.rmtree(..., ignore_errors=True)` is this
+    file's one deliberate silence. Naming them at the *start* of a restore is the
+    cheapest fix: the operator sees the accumulation at the moment they are already
+    thinking about this directory, before adding one more to it.
+
+    Deliberately no `du` and no deletion: sizing means walking a few thousand save
+    files for a number the operator can get themselves, and deleting someone's
+    only route back to a world is not something a tool should do unasked.
+    """
+    try:
+        stale = sorted(p.name for p in
+                       SAVED_DIR.parent.glob(f"{SAVED_DIR.name}.replaced-*"))
+    except OSError:
+        # The parent may not exist at all on a rebuilt host, and a directory we
+        # cannot list is not a reason to refuse a disaster-recovery restore.
+        return
+    if not stale:
+        return
+    print(f"note: {len(stale)} replaced world tree(s) from earlier restores are "
+          f"still in {SAVED_DIR.parent}, each holding a full world save: "
+          f"{', '.join(stale)}. Remove them by hand once those servers are known "
+          f"good.")
+
+
 def _print_recovery(replaced: Path | None, safety: str | None) -> None:
     """Name every route back, on the failure path. Two of them where possible.
 
@@ -826,7 +1071,13 @@ def restore_archive(name: str, wait: int | None = None,
     validate the scratch copy → conditional safety backup → graceful stop →
     extract *beside* the target → swap by rename → chown → start and confirm →
     delete the replaced tree only on a confirmed startup.
+
+    The scratch-directory descriptor is opened before the copy and held until the
+    restore is over, so the copy, the validation, the extraction and the cleanup
+    all reach the scratch file through one verified directory rather than through
+    four independent resolutions of its path.
     """
+    _require_answerable_service_state()
     src = _backup_path(name)
     if startup_timeout is None:
         startup_timeout = STARTUP_TIMEOUT
@@ -834,10 +1085,13 @@ def restore_archive(name: str, wait: int | None = None,
     safety: str | None = None
     replaced: Path | None = None
 
-    scratch = _scratch_copy(src)
+    _report_stale_replaced()
+    dfd = _open_scratch_dir()
+    scratch: Path | None = None
     try:
+        scratch = _scratch_copy(src, dfd)
         try:
-            info = _validate_scratch(scratch)
+            info, ident = _validate_scratch(scratch, dfd)
             print(f"validated: {name} ({info['members']} members, {info['bytes']} "
                   f"bytes uncompressed), from the root-owned scratch copy {scratch}")
 
@@ -857,10 +1111,16 @@ def restore_archive(name: str, wait: int | None = None,
                 raise archive.ArchiveError(
                     f"cannot create the staging tree {new_tree}: {exc}") from exc
             try:
+                # Immediately before the extraction, not anywhere earlier: the
+                # point is that no unchecked bytes reach the staging tree.
+                _check_scratch_identity(scratch, dfd, ident)
                 # Extract beside the target, never over it: a partial extraction
                 # must not be able to leave a half-replaced world. Everything up
                 # to here is reversible by doing nothing.
-                archive.extract_archive(scratch, new_tree)
+                #
+                # Reached through the held directory descriptor, like every other
+                # read of this file — see `_at`.
+                archive.extract_archive(_at(dfd, scratch.name), new_tree)
             except BaseException:
                 # The live tree has not been touched yet, so the only debris is
                 # ours. ignore_errors so a cleanup problem cannot mask the
@@ -903,8 +1163,12 @@ def restore_archive(name: str, wait: int | None = None,
     finally:
         # On both success and failure: nothing may be left in the scratch
         # directory, which is the one place a restore reads its authoritative
-        # bytes from.
-        _unlink_quietly(scratch)
+        # bytes from. `scratch` is None when the copy itself never got as far as
+        # creating a file, in which case there is nothing to remove and — as in
+        # `_copy_fd_to_temp` — nothing of ours to guess at either.
+        if scratch is not None:
+            _unlink_quietly_at(dfd, scratch.name, scratch)
+        os.close(dfd)
 
     if state == "ready":
         print(f"started: {SERVICE_UNIT} is up and the REST API is healthy.")

@@ -155,19 +155,74 @@ loader.exec_module(mod)
 if mode == "record":
     # Which path the *authoritative* validation and the extraction actually run
     # against. Both must be the scratch copy.
-    orig_validate = mod.archive.validate_archive
+    #
+    # The validation wrapper is on validate_archive_fileobj, which is the door
+    # --restore uses (it needs the descriptor back to fstat, so it cannot use the
+    # path-taking validate_archive); its `label` argument is the scratch path as
+    # spelled. The extraction is reported by *realpath*, because the tool reaches
+    # the file through /proc/self/fd/<dirfd>/ so the descriptor cannot be
+    # re-resolved to a different directory - realpath is where that lands, which
+    # is the thing worth asserting.
+    orig_validate_fileobj = mod.archive.validate_archive_fileobj
     orig_extract = mod.archive.extract_archive
 
-    def validate(path, *a, **k):
-        print("VALIDATE=%s" % path)
-        return orig_validate(path, *a, **k)
+    def validate_fileobj(fh, label, *a, **k):
+        print("VALIDATE=%s" % label)
+        return orig_validate_fileobj(fh, label, *a, **k)
 
     def extract(path, dest, *a, **k):
-        print("EXTRACT=%s" % path)
+        print("EXTRACT=%s" % os.path.realpath(path))
         return orig_extract(path, dest, *a, **k)
 
-    mod.archive.validate_archive = validate
+    mod.archive.validate_archive_fileobj = validate_fileobj
     mod.archive.extract_archive = extract
+elif mode == "substitute":
+    # The reviewer's probe against the scratch scheme, and the one an
+    # fstat-less implementation loses to: between the authoritative validation
+    # and the extraction, unlink the scratch copy and drop a *different but
+    # individually valid* archive at exactly the same name. This is what the owner
+    # of the scratch directory can do - which, with the pre-fix default of
+    # /var/lib/palworld/restore-scratch, was the unprivileged web account.
+    #
+    # Both passes re-open the copy by name, so without an identity check the
+    # extraction happily unpacks bytes nothing ever validated and the restore
+    # reports success. The refusal must name the substitution.
+    with open(mode_arg, "rb") as fh:
+        replacement = fh.read()
+    orig_validate_fileobj = mod.archive.validate_archive_fileobj
+
+    def substituting_validate(fh, label, *a, **k):
+        info = orig_validate_fileobj(fh, label, *a, **k)
+        for entry in os.listdir(mod.SCRATCH_DIR):
+            target = os.path.join(str(mod.SCRATCH_DIR), entry)
+            os.unlink(target)
+            with open(target, "wb") as out:
+                out.write(replacement)
+        return info
+
+    mod.archive.validate_archive_fileobj = substituting_validate
+elif mode == "swapdir":
+    # The *backups* directory entry swapped while root's descriptor is open:
+    # open_archive_fd hands back a descriptor on the good archive, then the entry
+    # is renamed over with the evil one. A copy that reads from the descriptor
+    # lands the good bytes; a copy that resolves `src` a second time (a
+    # `shutil.copy(str(src), ...)`, say) lands the evil ones.
+    #
+    # This is a different attack from `rewrite` below and catches a different
+    # mistake: rewrite swaps the *inode contents* after the copy has finished, so
+    # a by-name copy would still have read the good bytes and pass.
+    orig_open = mod.archive.open_archive_fd
+
+    def swapping_open(path):
+        fd = orig_open(path)
+        # Only the backups-directory source, and only once: open_archive_fd is
+        # also how the scratch copy is later read, and those calls must be left
+        # alone.
+        if os.path.dirname(str(path)) == str(mod.BACKUP_DIR) and os.path.exists(mode_arg):
+            os.rename(mode_arg, str(path))
+        return fd
+
+    mod.archive.open_archive_fd = swapping_open
 elif mode == "rewrite":
     # The attacker's write, landing *after* the scratch copy is taken and before
     # the extraction reads it. The backups directory is root-owned, so the name
@@ -177,8 +232,8 @@ elif mode == "rewrite":
         replacement = fh.read()
     orig_copy = mod._scratch_copy
 
-    def rewriting_copy(src):
-        scratch = orig_copy(src)
+    def rewriting_copy(src, dfd):
+        scratch = orig_copy(src, dfd)
         wfd = os.open(str(src), os.O_WRONLY)   # no O_TRUNC: same inode
         try:
             os.pwrite(wfd, replacement, 0)
@@ -190,7 +245,7 @@ elif mode == "rewrite":
 elif mode == "nocopy":
     # The regression this task exists to prevent: skip the copy and hand the
     # backups-directory path straight to the validation.
-    mod._scratch_copy = lambda src: src
+    mod._scratch_copy = lambda src, dfd: src
 elif mode == "extractfail":
     # A partial extraction. Writes into the staging tree, then fails.
     def failing_extract(path, dest, *a, **k):
@@ -240,7 +295,7 @@ reset_all() {
   : > "$LOGD/backup.log"; : > "$LOGD/stop.log"
   : > "$LOGD/api.log"; : > "$LOGD/systemctl.log"
   unset STUB_BACKUP_RC STUB_STOP_RC STUB_API_RC STUB_START_RC STUB_ACTIVE_RC \
-        SCRATCH_OVERRIDE 2>/dev/null || true
+        SCRATCH_OVERRIDE PALWARDEN_MODE 2>/dev/null || true
 }
 
 # A world that is already there, with a file no archive contains — so "the live
@@ -291,9 +346,14 @@ assert_eq "$(replaced_trees)" "0" "the replaced tree is deleted on a confirmed s
 assert_eq "$(staging_trees)" "0" "no staging tree is left beside the target"
 assert_eq "$(scratch_entries)" "0" "the scratch copy is deleted on success"
 assert_eq "$(stat -c %a "$SC")" "700" "the scratch directory is tightened to 0700"
-assert_contains "$out" "cleaned up" "the output says the replaced tree was removed"
-assert_contains "$out" "palworld-save-20260101T000000Z.tar.gz" \
-  "the output records the safety archive's name"
+assert_contains "$out" "cleaned up: removed the replaced world" \
+  "the output says the replaced tree was removed"
+# Pinned on the closing report's own wording, not on the bare archive name: the
+# `safety backup: <name>` progress line printed earlier already contains the name,
+# so asserting the name alone passed with this whole report deleted. Same shape the
+# failure-path reports above were fixed for, third instance in this feature.
+assert_contains "$out" "safety archive retained: palworld-save-20260101T000000Z.tar.gz" \
+  "the closing report records the safety archive by name"
 
 # --wait is forwarded to the stop tool, which is where the player warning lives.
 reset_all
@@ -498,7 +558,8 @@ else
   out="$(run --restore "$NAME" 2>&1)"; rc=$?
   chmod 755 "$PAL"
   assert_ne "$rc" "0" "a staging tree that cannot be created aborts the restore"
-  assert_contains "$out" "staging tree" "the refusal names the staging tree"
+  assert_contains "$out" "cannot create the staging tree" \
+    "the refusal names the staging tree"
   assert_eq "$(cat "$SAVED/SaveGames/old.sav")" "PREVIOUS" "the live tree survives it"
 fi
 
@@ -566,6 +627,129 @@ assert_not_contains "$out" "escaped.sav" "the traversing member never reached va
 assert_path_absent "$PAL/escaped.sav" "nothing was written outside the restored tree"
 assert_eq "$(cat "$SAVED/SaveGames/marker.txt" 2>/dev/null)" "GOOD" "the good world landed"
 
+# The copy must come from the held descriptor, and this is what makes that a
+# behaviour rather than a docstring: `open_archive_fd` returns a descriptor on the
+# good archive and the *directory entry* is then renamed over with the evil one
+# while it is open. A descriptor-based copy still lands GOOD; replacing the copy
+# loop with `shutil.copy(str(src), str(tmp_path))` lands EVIL and fails here.
+# (The `rewrite` case above cannot catch that: it swaps the inode's contents after
+# the copy is finished, so a by-name copy would have read the good bytes too.)
+reset_all
+populate_world
+stage
+cp "$WORK/evil.tar.gz" "$WORK/evil.swap.tar.gz"
+out="$(harness swapdir "$WORK/evil.swap.tar.gz" --restore "$NAME" --startup-timeout 5 2>&1)"
+assert_contains "$out" "rc=0" "the restore completes with the source entry swapped (output: $out)"
+assert_eq "$(cat "$SAVED/SaveGames/marker.txt" 2>/dev/null)" "GOOD" \
+  "the copy read the descriptor, not the swapped-in directory entry"
+assert_file_exists "$SAVED/SaveGames/0/Level.sav" \
+  "the whole archive the descriptor pointed at landed"
+assert_eq "$(tar -xzOf "$BK/$NAME" SaveGames/marker.txt 2>/dev/null)" "EVIL" \
+  "the swap really did put a different archive at the source name"
+
+# ===========================================================================
+# PROPERTY 1a: the scratch directory itself is verified, not just created
+# ===========================================================================
+# The reviewer's probe: substitute a *different but individually valid* archive at
+# the scratch copy's name between the authoritative validation and the extraction.
+# Both passes re-open by name, so nothing but an identity check stands between the
+# operator and an extracted world that was never validated - and with the pre-fix
+# default under /var/lib/palworld (0755, service-account-owned) the account that
+# could do this was the untrusted web account.
+reset_all
+populate_world
+stage
+out="$(harness substitute "$WORK/evil.tar.gz" --restore "$NAME" --startup-timeout 5 2>&1)"
+assert_not_contains "$out" "rc=0" "a scratch copy substituted after validation is refused"
+assert_contains "$out" "was replaced between validation and extraction" \
+  "the refusal is the identity check itself, naming the substitution"
+assert_ne "$(cat "$SAVED/SaveGames/marker.txt" 2>/dev/null)" "EVIL" \
+  "the substituted archive never reached the world"
+assert_eq "$(cat "$SAVED/SaveGames/old.sav" 2>/dev/null)" "PREVIOUS" \
+  "the live world survives the substitution attempt"
+assert_eq "$(staging_trees)" "0" "no staging tree survives the refusal"
+assert_eq "$(replaced_trees)" "0" "nothing was moved aside"
+assert_eq "$(cat "$LOGD/systemctl.log")" "" "the server was never started"
+
+# And the check that makes the probe unreachable in production in the first place:
+# a scratch directory owned by *another* account is refused outright, because
+# mkdir(exist_ok=True), O_DIRECTORY|O_NOFOLLOW and fchmod all succeed on a
+# directory someone else owns - chmod does not change ownership. /tmp is a
+# convenient stand-in: root-owned, and we are not root.
+if [ "$(id -u)" = "0" ]; then
+  echo "  (note: running as root; skipping the foreign-owned scratch case)"
+else
+  reset_all
+  populate_world
+  stage
+  out="$(SCRATCH_OVERRIDE="/tmp" run --restore "$NAME" 2>&1)"
+  assert_ne "$?" "0" "a scratch directory owned by another account is refused"
+  assert_contains "$out" "is owned by uid" \
+    "the refusal is the ownership check itself, not a mode or a path complaint"
+  assert_eq "$(cat "$LOGD/stop.log")" "" "the ownership check fires before anything is stopped"
+  assert_eq "$(cat "$SAVED/SaveGames/old.sav")" "PREVIOUS" "the world is untouched"
+fi
+
+# ===========================================================================
+# external mode: the service question has no truthful answer, so refuse
+# ===========================================================================
+# In PALWARDEN_MODE=external the game runs on another host: there is no
+# palworld-server s6 service, so the systemctl shim falls through to `pgrep -f
+# PalServer-Linux-Shipping` and finds nothing. A failed stop against a *live*
+# external server would then read as "not active" and the restore would replace
+# Pal/Saved underneath it - the one thing that code path exists to prevent.
+reset_all
+populate_world
+stage
+out="$(PALWARDEN_MODE=external run --restore "$NAME" 2>&1)"
+assert_ne "$?" "0" "--restore is refused in external mode"
+assert_contains "$out" "not supported in PALWARDEN_MODE=external" \
+  "the refusal names the mode as the reason"
+assert_contains "$out" "cannot tell whether it is running" \
+  "the refusal says why: the service state is unanswerable here"
+assert_eq "$(cat "$LOGD/stop.log")" "" "nothing was stopped in external mode"
+assert_eq "$(cat "$LOGD/systemctl.log")" "" "the service was never touched in external mode"
+assert_eq "$(cat "$SAVED/SaveGames/old.sav")" "PREVIOUS" "the external world is untouched"
+assert_eq "$(scratch_entries)" "0" "no scratch copy was even taken"
+
+# embedded (and bare metal, where the variable is unset) are unaffected.
+reset_all
+populate_world
+stage
+out="$(PALWARDEN_MODE=embedded run --restore "$NAME" --startup-timeout 5 2>&1)"
+assert_eq "$?" "0" "embedded mode restores normally (output: $out)"
+assert_eq "$(cat "$SAVED/SaveGames/marker.txt" 2>/dev/null)" "GOOD" "the embedded restore landed"
+
+# ===========================================================================
+# pre-existing replaced trees are named, so they stop being invisible
+# ===========================================================================
+# Every unverifiable-readiness restore leaves one of these beside the target
+# forever. Nothing ever mentioned them again, so they accumulate at a full world
+# save each; listing them at the start is the whole fix (no du, no deleting).
+reset_all
+populate_world
+stage
+mkdir -p "$SAVED.replaced-20260101T000000Z/SaveGames" \
+         "$SAVED.replaced-20260102T000000Z/SaveGames"
+out="$(run --restore "$NAME" --startup-timeout 5 2>&1)"
+assert_eq "$?" "0" "pre-existing replaced trees do not stop a restore"
+assert_contains "$out" "2 replaced world tree(s) from earlier restores" \
+  "the restore counts the trees left by earlier ones"
+assert_contains "$out" "Saved.replaced-20260101T000000Z" "the first stale tree is named"
+assert_contains "$out" "Saved.replaced-20260102T000000Z" "the second stale tree is named"
+# This restore's own replaced tree is deleted on its confirmed startup; the two
+# older ones are named and left exactly where they were.
+assert_eq "$(replaced_trees)" "2" "naming the stale trees does not delete them"
+rm -rf "$SAVED".replaced-*
+
+# With none there, no note is printed - so the note cannot be a constant string.
+reset_all
+populate_world
+stage
+out="$(run --restore "$NAME" --startup-timeout 5 2>&1)"
+assert_not_contains "$out" "from earlier restores" \
+  "a first restore says nothing about trees that are not there"
+
 # ===========================================================================
 # ownership
 # ===========================================================================
@@ -603,7 +787,13 @@ out="$(run --restore "$NAME" --startup-timeout 5 2>&1)"
 rc=$?
 OWNER_USER="$(id -un)"; OWNER_GROUP="$(id -gn)"
 assert_eq "$rc" "0" "an unresolvable service account does not fail the restore"
-assert_contains "$out" "does not exist" "the unresolvable account is warned about, not swallowed"
+# Pinned on the account name too: a bare "does not exist" is also in
+# _safety_backup's skip message, so the loose form would pass for the wrong reason
+# on any run where the world happened to be missing.
+assert_contains "$out" "user 'definitely-no-such-user-palwarden' does not exist" \
+  "the unresolvable user is warned about, not swallowed"
+assert_contains "$out" "group 'definitely-no-such-group-palwarden' does not exist" \
+  "the unresolvable group is warned about separately"
 assert_eq "$(cat "$SAVED/SaveGames/marker.txt" 2>/dev/null)" "GOOD" "the world was still restored"
 
 # ===========================================================================
