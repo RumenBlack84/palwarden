@@ -181,4 +181,101 @@ else
   fail "node not found; cannot exercise payloadError()"
 fi
 
+# --- job status on the dashboard (Task 6) ----------------------------------
+# GET /api/jobs is a read: it must work with Basic auth alone, no token.
+assert_eq "$(code -u "$CREDS" "$U/api/jobs")" "200" "job list readable with Basic auth alone, no token"
+empty_jobs="$(body -u "$CREDS" "$U/api/jobs")"
+assert_contains "$empty_jobs" '"ok": true' "empty job list still uses the API envelope"
+assert_contains "$empty_jobs" '"data": []' "no jobs yet is an empty data array"
+
+# Plant job files directly in the queue directory, in the same shape
+# palwarden_jobs.create_job()/update_job() write (see lib/palwarden_jobs.py).
+# One has HTML in its output: output is whatever the invoked tool printed, so
+# it is exactly as attacker-influenceable as the error/blocked_by strings the
+# existing structural guard (tests/unit/test_webui_jobs.sh) already checks,
+# and it is the fixture that would actually catch a regression to innerHTML.
+mkdir -p "$WORK/jobs"
+python3 - "$WORK/jobs" <<'EOF'
+import json, pathlib, sys
+jobs_dir = pathlib.Path(sys.argv[1])
+jobs_dir.mkdir(parents=True, exist_ok=True)
+
+def plant(job_id, seq, action, state, output):
+    job = {
+        "id": job_id, "action": action, "params": {}, "state": state,
+        "created_at": 1000, "seq": seq, "started_at": 1000,
+        "finished_at": 1000 if state in ("succeeded", "failed") else None,
+        "exit_code": 0 if state == "succeeded" else None,
+        "output": output,
+    }
+    (jobs_dir / f"{job_id}.json").write_text(json.dumps(job, indent=2, sort_keys=True))
+
+plant("a" * 32, 1, "backup", "succeeded", "backup ok\n")
+# newest (highest seq): the one the dashboard's "most recent" logic must pick
+plant("b" * 32, 2, "engine_save", "succeeded",
+      "applied\n<img src=x onerror=alert(1)>\n")
+EOF
+
+listing="$(body -u "$CREDS" "$U/api/jobs")"
+assert_contains "$listing" '"action": "engine_save"' "planted job appears in the list"
+assert_contains "$listing" '<img src=x onerror=alert(1)>' \
+  "the raw HTML in output is served as JSON, unescaped (the page must neutralise it, not the API)"
+
+# --- renderJobsText()/jobIsUnfinished() extracted from the real page --------
+# A grep proving id="jobs" exists is weak; run the page's own pure rendering
+# and polling-continuation logic under node against fixture payloads,
+# including the HTML-bearing job above, and check what it actually produces.
+if command -v node >/dev/null 2>&1; then
+  JOBS_JS="$WORK/renderJobs.js"
+  {
+    grep '^const JOBS_UNFINISHED' "$REAL_ROOT/palwarden.html"
+    awk '/^function jobIsUnfinished/{f=1} f{print} f && /^}/{exit}' "$REAL_ROOT/palwarden.html"
+    awk '/^function renderJobsText/{f=1} f{print} f && /^}/{exit}' "$REAL_ROOT/palwarden.html"
+  } > "$JOBS_JS"
+  cat >> "$JOBS_JS" <<'EOF'
+
+let failures = 0;
+function check(desc, cond) { if (!cond) { failures++; console.log("FAIL: " + desc); } }
+
+// no jobs: a pw-empty placeholder, not a blank region
+const none = renderJobsText([]);
+check("no jobs yields the empty placeholder text", none.text === "No jobs yet");
+check("no jobs marks empty:true", none.empty === true);
+
+// most recent (list[0]) is what's shown; action/state/output-tail all present,
+// and the HTML in output comes through as literal text, not parsed.
+const htmlJob = { id: "b".repeat(32), action: "engine_save", state: "succeeded",
+                   output: "applied\n<img src=x onerror=alert(1)>\n" };
+const oldJob = { id: "a".repeat(32), action: "backup", state: "succeeded", output: "backup ok\n" };
+const rendered = renderJobsText([htmlJob, oldJob]);
+check("renders the action", rendered.text.indexOf("engine_save") !== -1);
+check("renders the state", rendered.text.indexOf("succeeded") !== -1);
+check("renders the output tail", rendered.text.indexOf("applied") !== -1);
+check("HTML in output survives as literal text (proves it is a plain string, not markup)",
+      rendered.text.indexOf("<img src=x onerror=alert(1)>") !== -1);
+check("not marked empty when a job exists", rendered.empty === false);
+
+// polling continuation: queued/running keep polling; every job terminal stops
+check("queued is unfinished", jobIsUnfinished({ state: "queued" }) === true);
+check("running is unfinished", jobIsUnfinished({ state: "running" }) === true);
+check("succeeded is finished", jobIsUnfinished({ state: "succeeded" }) === false);
+check("failed is finished", jobIsUnfinished({ state: "failed" }) === false);
+check("a list with one unfinished job keeps polling",
+      [{ state: "succeeded" }, { state: "running" }].some(jobIsUnfinished) === true);
+check("a list where every job is terminal stops polling",
+      [{ state: "succeeded" }, { state: "failed" }].some(jobIsUnfinished) === false);
+
+console.log(failures === 0 ? "OK" : "FAIL");
+EOF
+  jobs_out="$(node "$JOBS_JS" 2>&1)"
+  assert_eq "$jobs_out" "OK" "renderJobsText()/jobIsUnfinished() extracted from the dashboard behave correctly"
+elif [ -n "${CI:-}" ]; then
+  # As with payloadError() above: silently skipping this would delete the
+  # dashboard's only behavioural coverage of its job rendering without anyone
+  # noticing.
+  fail "node is required in CI to execute renderJobsText()/jobIsUnfinished()"
+else
+  echo "  (skipping the node checks of renderJobsText()/jobIsUnfinished(): node not found)" >&2
+fi
+
 assert_report

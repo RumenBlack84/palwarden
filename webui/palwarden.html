@@ -162,6 +162,7 @@
       <section class="pw-card"><h2>Engine.ini</h2><pre class="pw-log" id="engine" aria-live="polite">…</pre></section>
       <section class="pw-card"><h2>Backups</h2><pre class="pw-log" id="backups" aria-live="polite">…</pre></section>
       <section class="pw-card"><h2>Snapshots</h2><pre class="pw-log" id="snapshots" aria-live="polite">…</pre></section>
+      <section class="pw-card"><h2>Jobs</h2><pre class="pw-log" id="jobs" aria-live="polite">…</pre></section>
     </div>
   </div>
 </div>
@@ -319,8 +320,66 @@ async function refresh() {
   }
 }
 
+// --- job status (Task 6) ----------------------------------------------------
+// The most recent job (list[0]; GET /api/jobs returns newest-first) is shown
+// here so an operator who submitted a Save from the Engine.ini editor can see
+// it land without switching tabs. This is a read: GET /api/jobs needs only the
+// Basic auth this page already has, no X-Palwarden-Token.
+const JOBS_UNFINISHED = ["queued", "running"];
+const JOBS_POLL_INTERVAL_MS = 5000;
+// Bounded so a dashboard left open is not polling forever if a job somehow
+// never reaches a terminal state; ~10 minutes at 5 s. On expiry the region
+// says so and stops, rather than either polling forever or silently going
+// stale with no indication.
+const JOBS_POLL_MAX_ATTEMPTS = 120;
+
+function jobIsUnfinished(job) {
+  return JOBS_UNFINISHED.indexOf(job && job.state) !== -1;
+}
+
+// Pure, so it can be exercised under node without a DOM. job.action, state,
+// id and output are all server-supplied and output is straight from whatever
+// tool the job ran (attacker-influenceable), so this only ever joins them
+// into one plain string; the caller renders that string with textContent
+// (see text()), never innerHTML.
+function renderJobsText(list) {
+  if (!list || !list.length) return { text: "No jobs yet", empty: true };
+  const job = list[0];
+  const tail = String(job.output || "").split("\n").slice(-20).join("\n");
+  const lines = [
+    (job.action || "unknown") + " — " + (job.state || "unknown"),
+    "id " + (job.id || ""),
+  ];
+  if (tail) lines.push("", tail);
+  return { text: lines.join("\n"), empty: false };
+}
+
+let jobsPollTimer = null;
+async function pollJobs(attempt) {
+  attempt = attempt || 0;
+  try {
+    const r = await get("/api/jobs");
+    const err = payloadError(r);
+    if (err) throw new Error(err);
+    const list = r.data || [];
+    const rendered = renderJobsText(list);
+    text("jobs", rendered.text, rendered.empty);
+    if (!list.some(jobIsUnfinished)) return; // every job terminal (or none): stop
+    if (attempt + 1 >= JOBS_POLL_MAX_ATTEMPTS) {
+      const minutes = Math.round(JOBS_POLL_MAX_ATTEMPTS * JOBS_POLL_INTERVAL_MS / 60000);
+      text("jobs", rendered.text + "\n\n(stopped polling after " + minutes +
+        " minutes; reload the page to resume)", false);
+      return;
+    }
+    jobsPollTimer = setTimeout(function () { pollJobs(attempt + 1); }, JOBS_POLL_INTERVAL_MS);
+  } catch (e) {
+    text("jobs", String(e && e.message || e), true);
+  }
+}
+
 refresh();
 setInterval(refresh, 15000);
+pollJobs();
 </script>
 </body>
 </html>
