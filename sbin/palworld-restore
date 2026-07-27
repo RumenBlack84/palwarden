@@ -592,6 +592,14 @@ def _open_scratch_dir() -> int:
                 f"the restore scratch directory {SCRATCH_DIR} is still mode "
                 f"{mode:04o} after being tightened; refusing to stage a restore "
                 f"in a directory other accounts can read or write")
+        # The directory being ours and 0700 is not enough on its own: write
+        # permission on any *parent* lets another account rename this directory
+        # aside and put its own at the same name. That is exactly how the default
+        # under /var/lib/palworld was unsound (the service account owns that tree),
+        # so verify the whole chain rather than trusting the default path to be the
+        # right one. _check_scratch_identity narrows the residual race; this is what
+        # stops it being reachable at all.
+        _refuse_writable_parents(SCRATCH_DIR)
         # Prove the descriptor-relative spelling every later read uses actually
         # resolves, here, where the failure is a clean refusal — rather than
         # halfway through a restore as a mystery ENOENT.
@@ -604,6 +612,35 @@ def _open_scratch_dir() -> int:
         os.close(dfd)
         raise
     return dfd
+
+
+def _refuse_writable_parents(path: Path) -> None:
+    """Refuse if any ancestor of `path` is writable by an account other than ours.
+
+    Raises ArchiveError naming the offending component. Symlinked ancestors are
+    resolved first, because it is the *real* directory whose permissions decide who
+    can rename our scratch dir out from under us.
+    """
+    me = os.geteuid()
+    for parent in Path(os.path.realpath(path)).parents:
+        try:
+            st = os.stat(parent)
+        except OSError as exc:
+            raise archive.ArchiveError(
+                f"cannot check the restore scratch parent {parent}: {exc}") from exc
+        # Sticky directories (/tmp) are excluded from the group/other-write test:
+        # the sticky bit is precisely what stops one account renaming another's
+        # entry, which is the attack this loop exists to prevent.
+        sticky = bool(st.st_mode & stat.S_ISVTX)
+        if st.st_uid != me and st.st_uid != 0:
+            raise archive.ArchiveError(
+                f"the restore scratch parent {parent} is owned by uid {st.st_uid}, "
+                f"which could rename the scratch directory aside; refusing")
+        if not sticky and st.st_mode & 0o022:
+            raise archive.ArchiveError(
+                f"the restore scratch parent {parent} is mode "
+                f"{stat.S_IMODE(st.st_mode):04o} and so is writable by other "
+                f"accounts, which could rename the scratch directory aside; refusing")
 
 
 def _scratch_copy(src: Path, dfd: int) -> Path:

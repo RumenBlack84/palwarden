@@ -691,6 +691,37 @@ else
 fi
 
 # ===========================================================================
+# a world-writable *parent* is refused too
+# ===========================================================================
+# Owning the scratch dir and 0700 is not enough: write permission on any parent
+# lets another account rename our directory aside and substitute its own. This is
+# exactly why the default under /var/lib/palworld was unsound - the service
+# account owns that tree - so the guarantee has to be checked, not inherited from
+# the default path being correct.
+reset_all
+populate_world
+stage
+PARENT_WW="$WORK/ww-parent"
+mkdir -p "$PARENT_WW/scratch"
+chmod 0777 "$PARENT_WW"
+out="$(SCRATCH_OVERRIDE="$PARENT_WW/scratch" run --restore "$NAME" 2>&1)"
+assert_ne "$?" "0" "a scratch dir under a world-writable parent is refused"
+assert_contains "$out" "writable by other accounts" \
+  "the refusal names the parent, not the scratch dir itself"
+assert_eq "$(cat "$LOGD/stop.log")" "" "the parent check fires before anything is stopped"
+assert_eq "$(cat "$SAVED/SaveGames/old.sav")" "PREVIOUS" "the world is untouched"
+
+# ...and a sticky world-writable parent (/tmp) is NOT refused on that ground:
+# the sticky bit is precisely what stops one account renaming another's entry.
+reset_all
+populate_world
+stage
+STICKY_SCRATCH="$(mktemp -d)/scratch"
+out="$(SCRATCH_OVERRIDE="$STICKY_SCRATCH" run --restore "$NAME" 2>&1)"
+assert_not_contains "$out" "writable by other accounts" \
+  "a sticky parent is not treated as writable by others"
+
+# ===========================================================================
 # external mode: the service question has no truthful answer, so refuse
 # ===========================================================================
 # In PALWARDEN_MODE=external the game runs on another host: there is no

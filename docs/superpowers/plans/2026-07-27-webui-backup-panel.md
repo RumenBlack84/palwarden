@@ -441,8 +441,14 @@ Add `--restore` to `sbin/palworld-restore`, stopping at the first failure:
    must **verify** the directory it opened: `fstat` the descriptor and refuse unless
    `st_uid == 0` and no group/other bits are set, with its own message so the check
    is mutation-visible. Keep that descriptor open for the whole restore and reach
-   the scratch copy via `dir_fd=` for both validation and extraction, so the
-   validate→extract window is closed even in a hostile directory, then validate and extract **only** from
+   the scratch copy through it for both validation and extraction, so the
+   validate→extract window is closed even in a hostile directory. Note `dir_fd=`
+   is **not** available on the paths `tarfile` needs, so the shipped code uses the
+   `/proc/self/fd/<dirfd>/` reopen idiom plus an inode-identity re-check. A
+   descriptor-taking `extract_archive_fileobj` in `lib/palwarden_archive.py` would
+   make that identity check structural and drop the `/proc` dependency — scheduled
+   as its own change after Task 8, since it touches a module `--import` and the web
+   handler both share, then validate and extract **only** from
    the scratch copy, and delete it when done (including on failure).
 
    Also settle ownership here, as one decision rather than two: whether
