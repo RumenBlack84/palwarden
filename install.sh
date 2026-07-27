@@ -116,6 +116,10 @@ for d in /var/lib/palworld /var/log/palworld \
          /opt/palworld/backups /opt/palworld/config-backups /opt/palworld/config-snapshots; do
   run install -d -m 0755 "${owner_args[@]}" "$d"
 done
+# The control plane's job queue: written only by the unprivileged web UI (hence
+# the service account, not root), read and updated by the root worker
+# palwarden-jobd. 0700 because job files can carry config values.
+run install -d -m 0700 "${owner_args[@]}" /var/lib/palworld/jobs
 
 # 7. Reload systemd so the new/updated units are visible.
 run systemctl daemon-reload
@@ -129,4 +133,7 @@ echo "  2. (Optional) Create /etc/palworld/notify.env with PALWORLD_DISCORD_WEBH
 echo "  3. Enable the units/timers you want, e.g.:"
 echo "       systemctl enable --now palworld.service"
 echo "       systemctl enable --now palworld-fps-sample.timer palworld-update-check.timer"
+echo "     The web UI needs both halves of the control plane — the unprivileged"
+echo "     server and the root worker that executes the jobs it queues:"
+echo "       systemctl enable --now palworld-config-webui.service palwarden-jobd.service"
 echo "  See README.md for the full list and security notes."

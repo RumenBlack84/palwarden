@@ -1,0 +1,16 @@
+#!/command/with-contenv bash
+# shellcheck shell=bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Brian Grant
+#
+# Job worker for the web UI control plane. Replaces palwarden-jobd.service.
+#
+# Runs as ROOT (no s6-setuidgid, unlike config-webui): that asymmetry *is* the
+# control plane's privilege split. The web UI runs as steam and can only drop
+# job files into the queue; every privileged effect — applying config, cycling
+# the server's s6 service, SteamCMD updates — happens here, after jobd
+# re-validates the action and every parameter against its own allowlist.
+#
+# Not wrapped in palwarden-run-periodic (as memory-watch is): jobd has its own
+# poll loop and its own flock, so it is a long-running process, not a timer.
+exec palwarden-jobd

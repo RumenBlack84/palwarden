@@ -39,6 +39,13 @@ esac
 # ---------------------------------------------------------------------------
 mkdir -p /etc/palworld
 install -d -o steam -g steam /var/lib/palworld /opt/palworld/config-backups
+# Job queue for the control plane. Owned by the *web* user (steam) because the
+# unprivileged web UI is the only writer; the root worker reads and updates the
+# files it finds and is not constrained by the mode. 0700 keeps job files — which
+# can carry config values — off-limits to anything else in the container.
+# Only the mount point's own child is created here (never a recursive chown of a
+# mounted volume; see CLAUDE.md / runbook §11).
+install -d -o steam -g steam -m 0700 /var/lib/palworld/jobs
 # Pre-create the telemetry DB owned by steam so root-context boot steps (e.g.
 # config-apply-env's event marker) don't leave it root-owned.
 [[ -e /var/lib/palworld/metrics.sqlite3 ]] \
@@ -85,7 +92,8 @@ rm -f "$S6_USER_CONTENTS"/palworld-server \
       "$S6_USER_CONTENTS"/daily-report \
       "$S6_USER_CONTENTS"/update-check \
       "$S6_USER_CONTENTS"/public-info-watch \
-      "$S6_USER_CONTENTS"/service-events
+      "$S6_USER_CONTENTS"/service-events \
+      "$S6_USER_CONTENTS"/jobd
 enable_service() { : > "$S6_USER_CONTENTS/$1"; log "service enabled: $1"; }
 
 if [[ "$MODE" == "embedded" ]]; then
@@ -161,6 +169,9 @@ if [[ "$MODE" == "embedded" ]]; then
   # Memory watchdog runs as root (needs s6 service control) and restarts the
   # server's s6 service when memory is high.
   enable_service memory-watch
+  # Root half of the web UI control plane. Paired with config-webui (enabled
+  # just above): without it, jobs the UI accepts would sit in the queue forever.
+  enable_service jobd
 fi
 
 if [[ "$TELEMETRY_READY" == "1" ]]; then

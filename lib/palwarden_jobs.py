@@ -41,6 +41,18 @@ def job_path(job_id: str) -> Path:
     return JOBS_DIR / f"{job_id}.json"
 
 
+def _preserve_owner(fd: int, path: Path) -> None:
+    """Give `fd` the uid/gid of `path`, if `path` exists and we are allowed to."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return
+    try:
+        os.fchown(fd, st.st_uid, st.st_gid)
+    except OSError:
+        pass
+
+
 def _write(job: dict) -> dict:
     # Job files can carry config values and paths, so keep the directory and
     # every file owner-only from the instant they exist — no umask-dependent
@@ -50,6 +62,17 @@ def _write(job: dict) -> dict:
     tmp = path.with_name(path.name + ".tmp")
     fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
     try:
+        # Carry the existing owner onto the replacement inode. The atomic replace
+        # below creates a *new* file, so the first update by the root worker would
+        # otherwise turn a web-created job root-owned — and the unprivileged web
+        # process, which must keep reading it to answer GET /api/jobs/<id>, would
+        # report every job it enqueued as "unknown job" the moment work started on
+        # it. The uid can only be root's or the web user's (the queue directory is
+        # owner-only), so this hands nothing to an attacker. Unconditional so the
+        # path is exercised by ordinary same-user writes too; EPERM (an
+        # unprivileged writer, which by definition already owns the file) is not
+        # an error.
+        _preserve_owner(fd, path)
         with os.fdopen(fd, "w") as fh:
             fh.write(json.dumps(job, indent=2, sort_keys=True))
         tmp.replace(path)

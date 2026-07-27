@@ -178,10 +178,65 @@ assert_eq "$(code 'http://127.0.0.1:8088/PalWorldSettingsEditor.html')" "401" "I
 assert_eq "$(code "-u '$webui_user:$webui_pass' http://127.0.0.1:8088/")" "200" "I: authenticated dashboard loads"
 body="$(docker exec pw-it-g sh -c "curl -s -u '$webui_user:$webui_pass' http://127.0.0.1:8088/api/health")"
 assert_contains "$body" '"ok"' "I: /api/health returns JSON"
-# mutations are not available yet
-assert_eq "$(code "-u '$webui_user:$webui_pass' -X POST http://127.0.0.1:8088/api/jobs")" "501" "I: POST not implemented yet"
+# a POST with Basic auth only is refused: the token header is a separate gate
+# (scenario J drives the accepted path end to end).
+assert_eq "$(code "-u '$webui_user:$webui_pass' -X POST http://127.0.0.1:8088/api/jobs")" "403" "I: POST without the token header is refused"
 # and the server is unprivileged
 owner="$(docker exec pw-it-g sh -c 'ps -o user= -p $(pgrep -f palwarden-webui | head -1)' | tr -d " ")"
 assert_eq "$owner" "steam" "I: webui runs as steam, not root"
+
+# --- Scenario J: the control plane's privilege split, end to end -------------
+# The unprivileged web UI only writes job files; the root worker (jobd) executes
+# them. Everything here is observed through the real services in pw-it-g.
+assert_contains "$(services_of pw-it-g)" "jobd" "J: job worker enabled in embedded mode"
+
+# Ownership comes from the *running processes*, not the service definitions:
+# s6-svstat needs root, so anything asked via `docker exec` (which is root)
+# could agree with the service file while the service itself ran as the wrong
+# user. The `job[d]` bracket keeps pgrep -f from matching the `sh -c` that
+# invokes it — it matches its own command line otherwise.
+proc_user() { docker exec "$1" sh -c "ps -o user= -p \$(pgrep -f '$2' | head -1)" | tr -d ' '; }
+assert_eq "$(proc_user pw-it-g 'palwarden-job[d]')" "root" "J: jobd runs as root"
+assert_eq "$(proc_user pw-it-g 'palwarden-webu[i]')" "steam" "J: webui runs unprivileged"
+
+# The queue is the only channel between them, and it belongs to the web user.
+assert_eq "$(docker exec pw-it-g stat -c '%U %a' /var/lib/palworld/jobs)" "steam 700" \
+  "J: queue dir owned by the web user, owner-only"
+
+# Basic auth alone must not be able to enqueue: a browser attaches it to a
+# cross-origin POST for free, so the token header is the CSRF defence.
+csrf_body='{"action":"snapshot_create","params":{"label":"itest-csrf"}}'
+csrf_code="$(docker exec pw-it-g sh -c "curl -s -o /dev/null -w '%{http_code}' -X POST \
+  -u '$webui_user:$webui_pass' -H 'Content-Type: application/json' \
+  -d '$csrf_body' http://127.0.0.1:8088/api/jobs")"
+assert_eq "$csrf_code" "403" "J: POST with Basic auth only is refused"
+
+# With both credentials the job is queued (202) and the worker runs it.
+# snapshot_create is file-only, needs no confirmation and does not touch the
+# running server.
+webui_token="$(docker exec pw-it-g sh -c 'sed -n "s/^WEBUI_TOKEN=\"\(.*\)\"$/\1/p" /etc/palworld/webui.env')"
+enq="$(docker exec pw-it-g sh -c "curl -s -w '\n%{http_code}' -X POST \
+  -u '$webui_user:$webui_pass' -H 'X-Palwarden-Token: $webui_token' \
+  -H 'Content-Type: application/json' \
+  -d '{\"action\":\"snapshot_create\",\"params\":{\"label\":\"itest-jobd\"}}' \
+  http://127.0.0.1:8088/api/jobs")"
+assert_eq "$(printf '%s' "$enq" | tail -1)" "202" "J: POST with both credentials is accepted"
+job_id="$(printf '%s' "$enq" | grep -oE '[0-9a-f]{32}' | head -1)"
+if [ "${#job_id}" -eq 32 ]; then pass; else fail "J: enqueue returned no job id (response: $enq)"; fi
+
+# Bounded poll: a stuck worker must fail the suite, not hang it.
+state=""
+for _ in {1..45}; do
+  jbody="$(docker exec pw-it-g sh -c "curl -s -u '$webui_user:$webui_pass' \
+    http://127.0.0.1:8088/api/jobs/$job_id")"
+  state="$(printf '%s' "$jbody" | sed -n 's/.*"state": "\([a-z]*\)".*/\1/p' | head -1)"
+  case "$state" in
+    queued|running|"") sleep 1 ;;
+    *) break ;;
+  esac
+done
+assert_eq "$state" "succeeded" "J: the root worker ran the queued job to success"
+# and the job's actual effect landed
+assert_rc 0 docker exec pw-it-g sh -c 'ls -d /opt/palworld/config-snapshots/*itest-jobd'
 
 assert_report

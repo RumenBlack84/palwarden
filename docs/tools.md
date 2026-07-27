@@ -289,6 +289,7 @@ Installed to `/etc/systemd/system`. Enable only what you need.
 |------|------|----------|------|
 | `palworld.service` | service | — | The dedicated server (`PalServer.sh`). |
 | `palworld-config-webui.service` | service | — | Local-only static config editor on `127.0.0.1:8088` (hardened: `ProtectSystem=strict`, etc.). |
+| `palwarden-jobd.service` | service | — | Root worker that executes the jobs the web UI queues. Deliberately unsandboxed (it writes `/etc/palworld`, the game config and `/var/lib/palworld`); enable it alongside `palworld-config-webui.service` or queued jobs never run. |
 | `palworld-fps-sample.timer` | timer | every 15s (after boot+1m) | `palworld-fps sample --retention-days 7` under a lock. |
 | `palworld-fps-daily-report.timer` | timer | 09:00 daily | `palworld-health-report discord --window 24h`. |
 | `palworld-update-check.timer` | timer | every 30m | `palworld-update` under a lock. |

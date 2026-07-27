@@ -1,0 +1,27 @@
+[Unit]
+Description=Palworld web UI job worker (privileged half of the control plane)
+After=network.target
+
+[Service]
+Type=simple
+# Runs as root on purpose. This is the whole point of the split: the web UI
+# (palworld-config-webui.service, User=palworld) can only *write* job files,
+# while everything that needs privilege — applying config, restarting
+# palworld.service, running SteamCMD — happens here, behind jobd's own
+# allowlist re-validation of every action and parameter.
+ExecStart=/usr/local/sbin/palwarden-jobd
+Restart=on-failure
+RestartSec=5
+# No ProtectSystem=/ProtectHome= sandbox: the worker legitimately writes
+# /etc/palworld/engine.env, the game's config directory under /opt/palworld and
+# the job queue plus telemetry DB under /var/lib/palworld. A strict sandbox
+# would turn every one of those into a job that fails at the last step.
+# NoNewPrivileges is likewise omitted: palworld-update drops to the service
+# account with sudo (PALWORLD_DROP_PRIV), which needs a setuid exec.
+#
+# The worker serialises itself with an exclusive flock on
+# /run/palwarden-jobd.lock, which it creates itself; with /run writable (no
+# sandbox above) nothing else is required for that.
+
+[Install]
+WantedBy=multi-user.target

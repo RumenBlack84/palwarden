@@ -117,6 +117,7 @@ RUN chmod +x \
         /etc/s6-overlay/s6-rc.d/update-check/run \
         /etc/s6-overlay/s6-rc.d/public-info-watch/run \
         /etc/s6-overlay/s6-rc.d/service-events/run \
+        /etc/s6-overlay/s6-rc.d/jobd/run \
     && (chmod +x /usr/local/sbin/palworld-* /usr/local/bin/palworld-config-parser 2>/dev/null || true) \
     && install -d -o steam -g steam \
         /opt/palworld/server/Pal/Saved/Config/LinuxServer \

@@ -130,4 +130,27 @@ assert j.has_pending() is False
 print("ok")')"
 assert_eq "$out" "ok" "invalid-UTF-8 job file is ignored, not fatal"
 
+# --- an update keeps the creator's ownership -------------------------------
+# The web process creates the file and must keep being able to read it; the root
+# worker rewrites the same job on every state change, and the atomic replace
+# makes a new inode. Without the fchown the job becomes root-owned and the web UI
+# answers "unknown job" for work it queued itself. Cannot be tested by actually
+# changing uid unprivileged, so assert the syscall happens with the *existing*
+# owner (the same result root gets).
+reset
+out="$(py '
+import os
+import palwarden_jobs as j
+calls = []
+real = os.fchown
+os.fchown = lambda fd, uid, gid: calls.append((uid, gid)) or real(fd, uid, gid)
+job = j.create_job("backup", {})
+assert calls == [], "no owner to preserve on create: %r" % (calls,)
+st = os.stat(j.job_path(job["id"]))
+j.update_job(job["id"], state="running")
+assert calls == [(st.st_uid, st.st_gid)], (calls, st.st_uid, st.st_gid)
+assert j.read_job(job["id"])["state"] == "running"
+print("ok")')"
+assert_eq "$out" "ok" "update preserves the job file's owner"
+
 assert_report
