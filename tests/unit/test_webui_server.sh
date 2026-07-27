@@ -278,4 +278,15 @@ else
   echo "  (skipping the node checks of renderJobsText()/jobIsUnfinished(): node not found)" >&2
 fi
 
+# --- the tested functions are actually wired into the page -------------------
+# renderJobsText()/jobIsUnfinished() are extracted and executed above, which
+# proves the logic but not that the page reaches it: deleting the pollJobs() call
+# or mistyping the element id would leave every assertion green while the
+# dashboard silently never showed a job.
+DASH="$DIR/../../webui/palwarden.html"
+assert_file_contains "$DASH" 'id="jobs"' "the dashboard has the job region the renderer targets"
+assert_rc 0 grep -qE '^pollJobs\(\);' "$DASH" "the dashboard starts polling for jobs at load"
+assert_rc 0 grep -qE "text\('jobs'|text\(\"jobs\"" "$DASH" \
+  "job text reaches the DOM through the guarded text() helper"
+
 assert_report
