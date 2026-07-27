@@ -1,5 +1,13 @@
 # palwarden
 
+> [!WARNING]
+> **Under active development — not complete or stable.**
+> `palwarden` is still being built and its interfaces, file layouts and defaults
+> can change without notice. It has not been proven across a wide range of hosts
+> or Palworld versions. Test it against a server you can afford to break — take
+> backups first, and use it at your own risk. This notice will be removed once the
+> project is closer to done.
+
 [![CI](https://github.com/RumenBlack84/palwarden/actions/workflows/ci.yml/badge.svg)](https://github.com/RumenBlack84/palwarden/actions/workflows/ci.yml)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
 
