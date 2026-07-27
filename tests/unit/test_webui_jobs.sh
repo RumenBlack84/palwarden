@@ -164,7 +164,7 @@ assert_eq "$(stat -c %a "$JOBS")" "700" "queue directory is 0700"
 # assertion that the two halves fit — a token fetched from the API is accepted by
 # the mutation path, with nothing typed in by a human anywhere.
 fetched_tok="$(body -u "$CREDS" -H 'Accept: application/json' "$U/api/token" \
-  | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')"
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["token"])')"
 assert_eq "$fetched_tok" "tok-for-tests" "GET /api/token yields the real token"
 roundtrip="$(code -u "$CREDS" -H "X-Palwarden-Token: $fetched_tok" \
   -H 'Content-Type: application/json' -H 'Sec-Fetch-Site: same-origin' \
@@ -667,7 +667,7 @@ function json(status, body) {
 
 (async () => {
   // 1. happy path: fetched, cached, and NOT prompted for
-  reset((url) => { check("fetches /api/token", url === "/api/token"); return json(200, {ok: true, token: "T-from-api"}); });
+  reset((url) => { check("fetches /api/token", url === "/api/token"); return json(200, {ok: true, data: {token: "T-from-api"}}); });
   check("returns the fetched token", (await token()) === "T-from-api");
   check("the happy path never prompts", prompts === 0);
   check("the fetched token is cached in sessionStorage", store[TOKEN_KEY] === "T-from-api");

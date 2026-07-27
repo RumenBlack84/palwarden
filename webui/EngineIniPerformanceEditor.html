@@ -412,10 +412,11 @@ async function token(){
     if(res.status===401){ unauthenticated=true; throw new Error('HTTP 401'); }
     if(!res.ok) throw new Error('HTTP '+res.status);
     const json=await res.json();
-    if(!json || json.ok===false || !json.token){
+    const payload=json && json.data;
+    if(!json || json.ok===false || !payload || !payload.token){
       throw new Error((json && json.error) ? json.error : 'the response carried no token');
     }
-    const t=String(json.token);
+    const t=String(payload.token);
     sessionStorage.setItem(TOKEN_KEY, t);
     return t;
   } catch(e) {

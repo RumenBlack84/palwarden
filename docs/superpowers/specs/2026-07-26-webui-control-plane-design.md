@@ -137,7 +137,7 @@ Read endpoints (Basic auth only, `GET`, JSON, each with a subprocess timeout):
 | `/api/config` | live `PalWorldSettings.ini`, parsed to key/value JSON with `AdminPassword`/`ServerPassword` replaced by `"<redacted>"` (the same `SECRET_KEYS` set `palworld-config-diff`/`-summary` already use) |
 | `/api/backups`, `/api/snapshots` | directory listings |
 | `/api/jobs`, `/api/jobs/<id>` | queue state |
-| `/api/token` | `WEBUI_TOKEN`, as `{"ok": true, "token": "..."}`, so our own pages need not prompt for it |
+| `/api/token` | `WEBUI_TOKEN`, as `{"ok": true, "data": {"token": "..."}}` — wrapped in `data` like every other read, so one client helper unwraps them all — so our own pages need not prompt for it |
 
 There is deliberately no `/api/status` endpoint: `palworld-status` is a bash
 script that prints a human-readable dashboard with no `--json` mode, and

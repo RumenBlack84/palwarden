@@ -752,7 +752,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send_json(403, {"ok": False,
                                   "error": f"cross-origin request refused{detail}"})
             return
-        self._send_json(200, {"ok": True, "token": self.credentials["WEBUI_TOKEN"]},
+        # Wrapped in "data" like every other read endpoint, so one client helper
+        # can unwrap them all rather than special-casing this one.
+        self._send_json(200, {"ok": True, "data": {"token": self.credentials["WEBUI_TOKEN"]}},
                         extra_headers=(("Pragma", "no-cache"),))
 
     def _enqueue(self) -> None:
