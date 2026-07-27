@@ -80,7 +80,11 @@ TOKEN_HEADER = "X-Palwarden-Token"
 # A client that disappears mid-response is routine (a browser tab closing, curl
 # --max-time), not an internal error: it must never produce a traceback, and it
 # must never make a response attempt raise a *second* time out of the handler.
-CLIENT_GONE = (BrokenPipeError, ConnectionResetError, TimeoutError)
+# ConnectionError is the whole family (BrokenPipe, ConnectionReset,
+# ConnectionAborted): naming the members individually silently omitted
+# ConnectionAbortedError, which is what a local stack can raise instead of a
+# reset. TimeoutError is the socket timeout below, not a connection error.
+CLIENT_GONE = (ConnectionError, TimeoutError)
 # 64 KiB is far more than any job body needs (the largest is an engine settings
 # object) and small enough that an unauthenticated-shaped flood cannot make this
 # process buffer anything interesting.
@@ -90,13 +94,12 @@ MAX_BODY_BYTES = 65536
 # knob on purpose — a typo in a unit file would become a traceback at import,
 # and 10s is generous for a loopback listener even over an SSH tunnel.
 REQUEST_TIMEOUT = 10.0
-# Extra hostnames a browser may legitimately reach this server as, for the
-# reverse-proxy deployments that do not use the documented SSH tunnel.
-EXTRA_ORIGIN_HOSTS = frozenset(
-    h.strip().lower()
-    for h in os.environ.get("PALWARDEN_WEBUI_ORIGIN_HOSTS", "").split(",")
-    if h.strip()
-)
+# One limit for both "which jobs does GET /api/jobs show" and "which jobs can
+# block a disruptive POST with a 409". They must be the same number: a job the
+# operator cannot see in the listing must not be able to block them forever
+# (palwarden-jobd runs one job at a time regardless, so the 409 is a UI
+# nicety — the real serialisation is the worker's single-job loop).
+JOBS_LIST_LIMIT = 200
 
 
 def _escape(val: str) -> str:
@@ -230,12 +233,32 @@ def check_token(headers, creds: dict[str, str]) -> bool:
 
 
 def origin_host_allowed(origin: str) -> bool:
-    """Is this Origin one this server can legitimately be reached as?
+    """Is this Origin's *host* a loopback name or address?
 
-    Only the *host* is checked, never the port: the documented access path is an
-    SSH tunnel, which remaps the port freely (`-L 9000:localhost:8088`), so
-    pinning PORT here would reject every real browser session. A foreign
-    hostname is what a rebinding or plain CSRF attempt cannot avoid.
+    This is a same-*machine* check, not a same-origin one, and the difference
+    matters. Only the host is compared, never the scheme or port: the documented
+    access path is an SSH tunnel, which remaps the port freely
+    (`-L 9000:localhost:8088`), so pinning PORT here would reject every real
+    browser session.
+
+    What that defeats: DNS rebinding (an attacker name resolving to 127.0.0.1
+    still carries its own hostname in Origin, which no rebinding can change) and
+    any ordinary cross-site page on a public origin.
+
+    What it does NOT defeat: another local origin. A dev server, a notebook, or
+    anything else on 127.0.0.1 that serves attacker-supplied HTML gets an Origin
+    this function accepts, and for those the X-Palwarden-Token header is the only
+    remaining barrier — which is exactly why the token exists and is required
+    independently (a cross-origin page cannot set it without a preflight we never
+    answer).
+
+    A non-loopback BIND is deliberately *not* allowed here: it would have to be
+    accepted by hostname, and there is no vetted list of those (the removed
+    PALWARDEN_WEBUI_ORIGIN_HOSTS knob was an untested relaxation of a security
+    control). Consequence if someone sets PALWARDEN_WEBUI_BIND to a routable
+    address anyway: reads keep working, but a browser loaded from that address
+    sends its own Origin and every mutation is refused with a 403 naming the
+    host. That fails closed; the supported remote path is the SSH tunnel.
     """
     try:
         host = urllib.parse.urlsplit(origin.strip()).hostname
@@ -246,7 +269,7 @@ def origin_host_allowed(origin: str) -> bool:
         # unparseable value land here.
         return False
     host = host.lower()
-    if host == "localhost" or host == BIND.lower() or host in EXTRA_ORIGIN_HOSTS:
+    if host == "localhost":
         return True
     try:
         return ipaddress.ip_address(host).is_loopback
@@ -312,6 +335,25 @@ def disruptive_actions(jobd) -> frozenset[str]:
     return frozenset(name for name, spec in jobd.ACTIONS.items() if spec["disruptive"])
 
 
+def find_blocking_job(actions: frozenset[str]) -> dict | None:
+    """The unfinished job of one of `actions` that stands in the way, or None.
+
+    Used instead of `jobs.has_pending`, which answers yes/no over
+    `list_jobs(limit=1000)` — a different window from the one GET /api/jobs
+    shows. Scanning the *same* JOBS_LIST_LIMIT window here keeps the two
+    consistent: anything that can produce a 409 is also something the operator
+    can list. The oldest match is returned, since that is the one actually
+    holding the queue.
+    """
+    candidates = [job for job in jobs.list_jobs(limit=JOBS_LIST_LIMIT)
+                  if job.get("state") in ("queued", "running")
+                  and job.get("action") in actions]
+    if not candidates:
+        return None
+    # list_jobs sorts newest-first; the blocker is the oldest of these.
+    return candidates[-1]
+
+
 def check_jobs_dir() -> str | None:
     """Return None if the queue directory is usable, else why it is not.
 
@@ -319,15 +361,22 @@ def check_jobs_dir() -> str | None:
     only has to confirm the result is ours to write. A wrong owner here is the
     most likely deployment mistake — POST must say so plainly instead of
     tracebacking on the first enqueue.
+
+    Called once, at startup (see Handler.jobs_dir_error), so both messages have
+    to tell the operator that fixing the directory is not enough on its own:
+    re-checking on every POST would mean a stat per request to detect something
+    that only a deployment change can alter.
     """
     try:
         jobs.JOBS_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     except OSError as exc:
         return (f"job queue directory {jobs.JOBS_DIR} cannot be created: {exc.strerror}. "
-                "Create it owned by the web UI user.")
+                "Create it owned by the web UI user, then restart the service "
+                "(this is checked once at startup).")
     if not os.access(jobs.JOBS_DIR, os.W_OK | os.X_OK):
         return (f"job queue directory {jobs.JOBS_DIR} is not writable by this process. "
-                "Check that it is owned by the web UI user.")
+                "Check that it is owned by the web UI user, then restart the service "
+                "(this is checked once at startup).")
     return None
 
 
@@ -539,8 +588,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         """
         try:
             self._send_json(status, payload)
-        except CLIENT_GONE:
-            self.close_connection = True
+        except CLIENT_GONE as exc:
+            self._note_client_gone("sending an error response", exc)
+
+    def _note_client_gone(self, what: str, exc: BaseException) -> None:
+        """Give up on a connection, leaving one line behind.
+
+        Silence here would hide real failures: a TimeoutError raised by endpoint
+        code (not by the socket) also lands in these handlers, and without a log
+        line the request would end with no response and no trace of why.
+        """
+        self.close_connection = True
+        self.log_message("client gone while %s: %s", what, type(exc).__name__)
 
     def _challenge(self) -> None:
         body = b"authentication required\n"
@@ -562,19 +621,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         Returns (body, error) with exactly one populated. Every rejection here is
         a 400: a missing, duplicated, non-integer, negative or oversized length
-        must never become a hang or a traceback.
+        must never become a hang or a traceback. Callers must close the
+        connection on a rejection — see `_reject`.
         """
         if self.headers.get("Transfer-Encoding"):
             return None, "chunked transfer encoding is not supported; send Content-Length"
         raw = self.headers.get_all("Content-Length") or []
         if len(raw) != 1:
             return None, "exactly one Content-Length header is required"
-        try:
-            length = int(raw[0].strip())
-        except ValueError:
-            return None, "Content-Length is not an integer"
-        if length < 0:
-            return None, "Content-Length must not be negative"
+        value = raw[0].strip()
+        # RFC 9110 allows ASCII digits and nothing else, which is what
+        # `isascii() and isdigit()` accepts. `int()` is wrong here twice over: it
+        # takes PEP 515 underscores and a leading sign, so "1_0" would parse as
+        # 10 and "+5" as 5 — values no HTTP client sends but a smuggling attempt
+        # might, aimed at a proxy that framed the request differently. It also
+        # accepts non-ASCII digits that `isdigit()` alone would wave through
+        # while `int()` rejects, e.g. latin-1 "\xb2" (superscript two).
+        # This also subsumes the negative case: "-5" has no digits-only form.
+        if not (value.isascii() and value.isdigit()):
+            return None, "Content-Length must be a decimal, non-negative integer"
+        length = int(value)
         if length > MAX_BODY_BYTES:
             return None, f"request body must be at most {MAX_BODY_BYTES} bytes"
         if length == 0:
@@ -588,23 +654,41 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return None, "request body was shorter than Content-Length"
         return body, None
 
+    def _reject(self, status: int, error: str, **extra) -> None:
+        """Refuse a request whose body we have not read, and close the socket.
+
+        Anything left in the socket after an unread (or over-cap, or
+        wrongly-framed) body would be parsed as the *start of the next request*
+        on a kept-alive connection — a request-smuggling desync. Today that
+        cannot happen because `protocol_version` is BaseHTTPRequestHandler's
+        `HTTP/1.0` default, which closes after every response; this makes the
+        rejection paths safe on their own terms so that setting
+        `protocol_version = "HTTP/1.1"` stays the one-line change it looks like.
+        """
+        self.close_connection = True
+        self._send_json(status, {"ok": False, "error": error, **extra})
+
     def _enqueue(self) -> None:
         """POST /api/jobs: validate, then write a job file. Nothing else, ever."""
         # Basic auth is already established by the caller. It is not enough on
         # its own: the browser would attach it to a cross-origin POST for free.
         if not check_token(self.headers, self.credentials):
-            self._send_json(403, {"ok": False,
-                                  "error": f"missing or invalid {TOKEN_HEADER} header"})
+            self._reject(403, f"missing or invalid {TOKEN_HEADER} header")
             return
         if not origin_ok(self.headers):
-            self._send_json(403, {"ok": False, "error": "cross-origin request refused"})
+            # Name the Origin we refused: with a non-loopback bind (unsupported,
+            # but people try it) every mutation fails here, and a bare "refused"
+            # gives the operator nothing to correct.
+            origin = (self.headers.get("Origin") or "").strip()
+            detail = f" (Origin {origin!r})" if origin else ""
+            self._reject(403, f"cross-origin request refused{detail}")
             return
         if self.jobs_dir_error:
-            self._send_json(500, {"ok": False, "error": self.jobs_dir_error})
+            self._reject(500, self.jobs_dir_error)
             return
         body, error = self._read_body()
         if error is not None:
-            self._send_json(400, {"ok": False, "error": error})
+            self._reject(400, error)
             return
         try:
             payload = json.loads(body.decode("utf-8"))
@@ -644,10 +728,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         # Only disruptive jobs serialise against each other: a queued backup or
         # snapshot must not stand in the way of a restart the operator wants.
-        if jobd.ACTIONS[action]["disruptive"] and jobs.has_pending(disruptive_actions(jobd)):
-            self._send_json(409, {"ok": False,
-                                  "error": "another disruptive job is queued or running"})
-            return
+        if jobd.ACTIONS[action]["disruptive"]:
+            blocker = find_blocking_job(disruptive_actions(jobd))
+            if blocker is not None:
+                # Identify the blocker inline. Without this the operator can be
+                # stuck: if the worker died mid-job the blocker stays `running`
+                # forever (reap_orphans only runs when a worker *starts*), and a
+                # 409 that says only "something is in the way" leaves nothing to
+                # inspect or cancel. The id here is always one GET
+                # /api/jobs/<id> away, and JOBS_LIST_LIMIT keeps it in the
+                # listing too.
+                self._send_json(409, {
+                    "ok": False,
+                    "error": (f"another disruptive job is queued or running: "
+                              f"{blocker['action']} {blocker['id']} "
+                              f"({blocker.get('state')}); inspect it at "
+                              f"/api/jobs/{blocker['id']}"),
+                    "blocked_by": {"id": blocker["id"], "action": blocker["action"],
+                                   "state": blocker.get("state")},
+                })
+                return
         try:
             # Enqueue the *normalised* params, so the worker runs what we vetted
             # rather than the raw request body.
@@ -667,8 +767,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if parsed.path == "/api/jobs" or parsed.path.startswith("/api/jobs/"):
                 try:
                     self._send_jobs(parsed.path)
-                except CLIENT_GONE:
-                    self.close_connection = True
+                except CLIENT_GONE as exc:
+                    self._note_client_gone("answering the job API", exc)
                 except Exception as exc:  # never leak a traceback to the browser
                     self._send_json_safely(
                         500, {"ok": False, "error": f"internal error: {exc}"})
@@ -680,8 +780,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             query = urllib.parse.parse_qs(parsed.query)
             try:
                 self._send_json(200, handler(query))
-            except CLIENT_GONE:
-                self.close_connection = True
+            except CLIENT_GONE as exc:
+                self._note_client_gone("answering the read API", exc)
             except Exception as exc:  # never leak a traceback to the browser
                 self._send_json_safely(
                     500, {"ok": False, "error": f"internal error: {exc}"})
@@ -713,7 +813,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _send_jobs(self, path: str) -> None:
         if path == "/api/jobs":
-            self._send_json(200, {"ok": True, "data": jobs.list_jobs()})
+            # Same window find_blocking_job uses, so a job that can 409 a
+            # request is always visible here.
+            self._send_json(200, {"ok": True, "data": jobs.list_jobs(limit=JOBS_LIST_LIMIT)})
             return
         job_id = urllib.parse.unquote(path[len("/api/jobs/"):])
         # read_job returns None for a missing, corrupt or invalidly-named id, so a
@@ -732,11 +834,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         try:
             self._enqueue()
-        except CLIENT_GONE:
+        except CLIENT_GONE as exc:
             # The client hung up (or its body never arrived and the socket timed
             # out). There is nobody left to send a status to, and trying would
             # raise a second time straight out of the handler.
-            self.close_connection = True
+            self._note_client_gone("enqueueing a job", exc)
         except Exception as exc:  # never leak a traceback to the browser
             self._send_json_safely(500, {"ok": False, "error": f"internal error: {exc}"})
 

@@ -368,4 +368,63 @@ id="$(enqueue engine_rollback '{"backup": "../../etc/palworld/settings.env", "co
 jobd --once >/dev/null 2>&1
 assert_eq "$(state_of "$id")" "failed" "path traversal in backup name refused"
 
+# --- params are a whitelist: an unrecognised key is refused, not ignored ---
+# A copy-the-request normalisation stored whatever the caller sent (the API's
+# body cap is 64 KiB, so that was 64 KiB of junk per request), and silently
+# dropped a typo: `waitt: 30` produced a restart with no wait at all.
+: > "$WORK/argv.log"
+id="$(enqueue graceful_restart '{"waitt": 30, "confirm": true}')"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "failed" "an unrecognised param key is refused"
+assert_contains "$(output_of "$id")" "'waitt'" "the refusal names the offending key"
+assert_contains "$(output_of "$id")" "it takes: confirm, message, wait" "and lists what it does take"
+assert_file_not_contains "$WORK/argv.log" "graceful-restart" "the typo'd restart never ran"
+id="$(enqueue backup '{"pad": "xxxxx"}')"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "failed" "a param on an action that takes none is refused"
+assert_contains "$(output_of "$id")" "'pad'" "names the offending key there too"
+
+# ...and every recognised key still round-trips, for every action. Driven off
+# ACTIONS itself so a new param name (or one added to the whitelist with no
+# validator behind it) fails here instead of being quietly dropped.
+roundtrip="$(
+  PALWARDEN_JOBS_DIR="$WORK/jobs" PYTHONPATH="$LIB" PALWARDEN_SBIN_DIR="$WORK/bin" \
+  PALWORLD_ENGINE_ENV="$WORK/etc/engine.env" PALWORLD_BACKUP_DIR="$WORK/backups" \
+  PALWARDEN_JOBD_LOCK="$WORK/jobd.lock" \
+  python3 - "$JOBD" <<'EOF'
+import importlib.machinery, importlib.util, sys
+
+loader = importlib.machinery.SourceFileLoader("jobd_under_test", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+mod = importlib.util.module_from_spec(spec)
+sys.modules[loader.name] = mod
+loader.exec_module(mod)
+
+SAMPLES = {
+    "confirm": True,
+    "wait": 30,
+    "message": "maintenance",
+    "label": "before-tuning",
+    "text": "tuned tick rate",
+    "dry_run": True,
+    "settings": {"NET_SERVER_MAX_TICK_RATE": "60"},
+    "backup": "Engine.ini.20260710T182037Z",
+}
+for action in mod.ACTIONS:
+    keys = mod.recognised_params(action)
+    missing = sorted(k for k in keys if k not in SAMPLES)
+    if missing:
+        print(f"FAIL {action}: no sample value for {missing}")
+        continue
+    params = {k: SAMPLES[k] for k in keys}
+    got, err = mod.validate_params(action, params)
+    if err is not None:
+        print(f"FAIL {action}: {err}")
+    elif set(got) != set(keys):
+        print(f"FAIL {action}: normalised {sorted(got)} != recognised {sorted(keys)}")
+print("done")
+EOF
+)"
+assert_eq "$roundtrip" "done" "every recognised param key round-trips for every action"
+
 assert_report

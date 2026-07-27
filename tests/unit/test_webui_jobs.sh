@@ -16,6 +16,13 @@ REPO="$DIR/../.."
 WEBUI="$REPO/sbin/palwarden-webui"
 
 WORK="$(mktemp -d)"
+# One level deeper than $WORK on purpose: `../../` out of the queue directory
+# then lands *inside* the temp tree, so the traversal assertions below can plant
+# a real file at the exact path a working traversal would reach. With the queue
+# at $WORK/jobs that target was /tmp/etc/passwd, which does not exist — so a
+# traversal that genuinely worked would still have 404'd and "must not leak
+# root:" could never have fired.
+JOBS="$WORK/queue/jobs"
 PORT=18097
 PORT_RO=18096
 PID=""
@@ -48,6 +55,14 @@ printf '[/Script/Pal.PalGameWorldSettings]\nOptionSettings=(ServerName="Ygg")\n'
 # A real rollback source, so engine_rollback's validator has something valid to
 # accept and we can prove a *forged* name is still refused.
 : > "$WORK/backups/Engine.ini.20260101T000000Z"
+
+# Traversal bait. `/api/jobs/<id>` builds "$JOBS/<id>.json", so an id of
+# ../../etc/passwd would resolve to $WORK/etc/passwd.json; plant both spellings
+# with a sentinel so the "leaks nothing" assertions have something to detect.
+mkdir -p "$WORK/etc"
+SENTINEL="root:x:0:0:PLANTED-TRAVERSAL-TARGET:/root:/bin/sh"
+printf '%s\n' "$SENTINEL" > "$WORK/etc/passwd"
+printf '{"leak": "%s"}\n' "$SENTINEL" > "$WORK/etc/passwd.json"
 
 # raw request sender: the only way to exercise a missing, negative or
 # non-integer Content-Length, or a duplicated header, since curl builds those
@@ -98,7 +113,7 @@ start_server() {  # start_server <port> <jobs-dir> <logfile>
   done
 }
 
-start_server "$PORT" "$WORK/jobs" "$WORK/server.log"
+start_server "$PORT" "$JOBS" "$WORK/server.log"
 PID=$!
 
 U="http://127.0.0.1:$PORT"
@@ -141,7 +156,7 @@ assert_contains "$enq" '"id"' "token header enqueues"
 BACKUP_ID="$(printf '%s' "$enq" | sed -n 's/.*"id": *"\([0-9a-f]*\)".*/\1/p')"
 assert_eq "${#BACKUP_ID}" "32" "the response carries a 32-hex job id"
 # the queue directory is created owner-only: job params can carry config values
-assert_eq "$(stat -c %a "$WORK/jobs")" "700" "queue directory is 0700"
+assert_eq "$(stat -c %a "$JOBS")" "700" "queue directory is 0700"
 
 # --- cross-origin requests are refused even with both factors --------------
 assert_eq "$(code -u "$CREDS" -H "$TOKHDR" -H 'Sec-Fetch-Site: cross-site' -X POST \
@@ -153,10 +168,14 @@ assert_eq "$(code -u "$CREDS" -H "$TOKHDR" -H 'Sec-Fetch-Site: same-site' -X POS
 assert_eq "$(code -u "$CREDS" -H "$TOKHDR" -H 'Origin: http://evil.example' -X POST \
   -H 'Content-Type: application/json' -d '{"action":"backup"}' "$U/api/jobs")" "403" \
   "foreign Origin refused"
-# DNS rebinding: the attacker's name resolves to 127.0.0.1, so Host matches the
-# tunnel — the Origin host is what gives it away.
-assert_eq "$(code -u "$CREDS" -H "$TOKHDR" -H 'Origin: http://rebind.example:18097' \
-  -H "Host: 127.0.0.1:$PORT" -X POST -H 'Content-Type: application/json' \
+# DNS rebinding: the attacker's name resolves to 127.0.0.1, so the browser sends
+# BOTH Host and Origin as that name and the two agree — which is what makes this
+# different from the plain foreign-Origin case above, and what a naive
+# Origin-equals-Host check would wave straight through. (Sending
+# "Host: 127.0.0.1:$PORT" here, curl's own default for this URL, tested nothing:
+# it disagreed with the Origin, so the naive check would have refused it too.)
+assert_eq "$(code -u "$CREDS" -H "$TOKHDR" -H "Origin: http://rebind.example:$PORT" \
+  -H "Host: rebind.example:$PORT" -X POST -H 'Content-Type: application/json' \
   -d '{"action":"backup"}' "$U/api/jobs")" "403" "rebound Origin refused despite a matching Host"
 assert_eq "$(code -u "$CREDS" -H "$TOKHDR" -H 'Origin: null' -X POST \
   -H 'Content-Type: application/json' -d '{"action":"backup"}' "$U/api/jobs")" "403" \
@@ -190,16 +209,53 @@ assert_eq "$(post_json '{"action":"engine_save","params":{"settings":{"NET_SERVE
 assert_eq "$(post_json '{"action":"engine_save","params":{"settings":{"NOT_A_SETTING":60}}}')" \
   "400" "an unknown setting key is rejected"
 
+# --- params are a whitelist, so junk never reaches the queue ---------------
+# The worker's validate_params used to return a *copy* of params, so any key the
+# caller invented was stored verbatim in the job file — up to the 64 KiB body
+# cap of junk on disk per authenticated request — and a typo like `waitt` was
+# silently ignored instead of reported.
+assert_eq "$(post_json '{"action":"backup","params":{"pad":"xxxxx"}}')" "400" \
+  "an unrecognised param key is rejected"
+assert_contains "$(post_body '{"action":"backup","params":{"pad":"xxxxx"}}')" "'pad'" \
+  "the rejection names the offending key"
+assert_eq "$(post_json '{"action":"graceful_restart","params":{"waitt":30,"confirm":true}}')" \
+  "400" "a near-miss param name is rejected, not silently dropped"
+# (the recognised keys are proved to round-trip in the serialisation section
+# below, where the one accepted disruptive job carries all of them)
+
 # --- disruptive actions need confirm, then serialise ----------------------
 assert_eq "$(post_json '{"action":"graceful_restart","params":{"wait":30}}')" "400" \
   "disruptive action needs confirm"
-assert_eq "$(post_json '{"action":"graceful_restart","params":{"wait":30,"confirm":true}}')" "202" \
-  "confirmed disruptive action accepted"
+assert_eq "$(post_json '{"action":"graceful_restart","params":{"wait":30,"message":"maintenance","confirm":true}}')" \
+  "202" "confirmed disruptive action accepted"
+# every recognised key round-trips into the job file, and nothing else does: the
+# queued params are exactly what the worker's validator normalised.
+RESTART_ID="$(python3 -c '
+import json, pathlib, sys
+for p in pathlib.Path(sys.argv[1]).glob("*.json"):
+    job = json.loads(p.read_text())
+    if job["action"] == "graceful_restart":
+        print(job["id"])
+        print(json.dumps(job["params"], sort_keys=True))
+        break' "$JOBS")"
+assert_eq "$(printf '%s' "$RESTART_ID" | sed -n 2p)" \
+  '{"confirm": true, "message": "maintenance", "wait": 30}' \
+  "the queued params are exactly the recognised, normalised ones"
+RESTART_ID="$(printf '%s' "$RESTART_ID" | sed -n 1p)"
 assert_eq "$(post_json '{"action":"graceful_restart","params":{"wait":30,"confirm":true}}')" "409" \
   "only one pending disruptive job at a time"
 # wait is optional: the invoked tool's own default applies when it is absent
 assert_eq "$(post_json '{"action":"graceful_stop","params":{"confirm":true}}')" "409" \
   "any pending disruptive job blocks another disruptive action"
+# ...and the 409 has to be actionable: a worker killed mid-job leaves its job
+# `running` until a worker *starts* again, so "something is in the way" with no
+# id would be a permanent refusal with nothing to inspect.
+blocked="$(post_body '{"action":"graceful_stop","params":{"confirm":true}}')"
+assert_contains "$blocked" '"blocked_by"' "the 409 identifies the blocker"
+assert_contains "$blocked" '"action": "graceful_restart"' "the 409 names the blocking action"
+assert_contains "$blocked" "$RESTART_ID" "the 409 names the blocking job id"
+assert_contains "$(body -u "$CREDS" "$U/api/jobs/$RESTART_ID")" '"action": "graceful_restart"' \
+  "the blocker named in the 409 can be fetched"
 # a pending disruptive job must NOT block a harmless file-only one
 assert_eq "$(post_json '{"action":"backup"}')" "202" \
   "a pending disruptive job does not block a non-disruptive one"
@@ -215,8 +271,15 @@ assert_contains "$one" '"action": "backup"' "single job readable"
 assert_eq "$(code "$U/api/jobs")" "401" "the job list still requires auth"
 assert_eq "$(code -u "$CREDS" "$U/api/jobs/$(printf '0%.0s' $(seq 32))")" "404" "unknown job is 404"
 assert_eq "$(code -u "$CREDS" "$U/api/jobs/..%2f..%2fetc%2fpasswd")" "404" "crafted job id refused"
+# The bait planted at the top of this file is what makes these load-bearing: the
+# target of this traversal exists and is readable, so a working traversal would
+# return its contents instead of a 404.
+assert_not_contains "$(body -u "$CREDS" "$U/api/jobs/..%2f..%2fetc%2fpasswd")" \
+  "PLANTED-TRAVERSAL-TARGET" "the planted traversal target is never served"
 assert_not_contains "$(body -u "$CREDS" "$U/api/jobs/..%2f..%2fetc%2fpasswd")" "root:" "traversal leaks nothing"
 assert_eq "$(code --path-as-is -u "$CREDS" "$U/api/jobs/../../etc/passwd")" "404" "raw traversal refused"
+assert_not_contains "$(body --path-as-is -u "$CREDS" "$U/api/jobs/../../etc/passwd")" \
+  "PLANTED-TRAVERSAL-TARGET" "nor by the un-encoded spelling"
 assert_eq "$(code -u "$CREDS" "$U/api/jobs/x%00")" "404" "a NUL in the id is refused"
 
 # --- adversarial: none of these may raise or kill the server --------------
@@ -245,6 +308,15 @@ assert_eq "$(raw "$WORK/neglen.req")" "400" "negative Content-Length is 400"
 printf 'POST /api/jobs HTTP/1.1\r\nHost: 127.0.0.1:%s\r\nAuthorization: Basic %s\r\nX-Palwarden-Token: tok-for-tests\r\nContent-Length: abc\r\nConnection: close\r\n\r\n' \
   "$PORT" "$B64" > "$WORK/badlen.req"
 assert_eq "$(raw "$WORK/badlen.req")" "400" "non-integer Content-Length is 400"
+# int() accepts PEP 515 underscores and a leading sign, so "1_0" would have been
+# read as a length of 10 and "+19" as 19 — a framing a proxy would not agree
+# with. Only ASCII digits count.
+printf 'POST /api/jobs HTTP/1.1\r\nHost: 127.0.0.1:%s\r\nAuthorization: Basic %s\r\nX-Palwarden-Token: tok-for-tests\r\nContent-Length: 1_0\r\nConnection: close\r\n\r\n{"action":"backup"}\n' \
+  "$PORT" "$B64" > "$WORK/uslen.req"
+assert_eq "$(raw "$WORK/uslen.req")" "400" "an underscored Content-Length is 400"
+printf 'POST /api/jobs HTTP/1.1\r\nHost: 127.0.0.1:%s\r\nAuthorization: Basic %s\r\nX-Palwarden-Token: tok-for-tests\r\nContent-Length: +19\r\nConnection: close\r\n\r\n{"action":"backup"}' \
+  "$PORT" "$B64" > "$WORK/pluslen.req"
+assert_eq "$(raw "$WORK/pluslen.req")" "400" "a signed Content-Length is 400"
 printf 'POST /api/jobs HTTP/1.1\r\nHost: 127.0.0.1:%s\r\nAuthorization: Basic %s\r\nX-Palwarden-Token: tok-for-tests\r\nContent-Length: 99999999\r\nConnection: close\r\n\r\n{}\n' \
   "$PORT" "$B64" > "$WORK/hugelen.req"
 assert_eq "$(raw "$WORK/hugelen.req")" "400" "oversized Content-Length is refused before reading"
@@ -256,17 +328,20 @@ printf 'POST /api/jobs HTTP/1.1\r\nHost: 127.0.0.1:%s\r\nAuthorization: Basic %s
 short_code="$(raw "$WORK/short.req")"
 assert_ne "$short_code" "202" "a truncated body is never enqueued"
 
-# the cap boundary: exactly 64 KiB is accepted, one byte more is refused
+# the cap boundary: exactly 64 KiB is accepted, one byte more is refused.
+# Padded with insignificant JSON whitespace rather than a junk param: params are
+# a whitelist now, and padding with an unrecognised key would make the at-cap
+# case a 400 for the wrong reason (and would be exactly the "64 KiB of junk on
+# disk" the whitelist exists to prevent).
 python3 - "$WORK" <<'EOF'
 import json
 import sys
 work = sys.argv[1]
 for name, size in (("atcap", 65536), ("overcap", 65537)):
-    body = '{"action":"backup","params":{"pad":""}}'
-    pad = "x" * (size - len(body))
-    doc = '{"action":"backup","params":{"pad":"%s"}}' % pad
+    head = '{"action":"backup","params":{}'
+    doc = head + " " * (size - len(head) - 1) + "}"
     assert len(doc) == size, (len(doc), size)
-    json.loads(doc)
+    assert json.loads(doc)["action"] == "backup"
     with open(f"{work}/{name}.json", "w") as fh:
         fh.write(doc)
 EOF
@@ -274,6 +349,9 @@ assert_eq "$(code -u "$CREDS" -H "$TOKHDR" -H 'Content-Type: application/json' \
   --data-binary "@$WORK/atcap.json" "$U/api/jobs")" "202" "a body of exactly 64 KiB is accepted"
 assert_eq "$(code -u "$CREDS" -H "$TOKHDR" -H 'Content-Type: application/json' \
   --data-binary "@$WORK/overcap.json" "$U/api/jobs")" "400" "one byte over the cap is refused"
+assert_contains "$(body -u "$CREDS" -H "$TOKHDR" -H 'Content-Type: application/json' \
+  --data-binary "@$WORK/overcap.json" "$U/api/jobs")" "at most 65536 bytes" \
+  "the over-cap 400 is about the size, not the content"
 
 # POST to an unknown API path is a 404, not a 501 or a stray enqueue
 assert_eq "$(code -u "$CREDS" -H "$TOKHDR" -X POST -d '{}' "$U/api/nope")" "404" \
@@ -318,7 +396,7 @@ import json, pathlib, sys
 seen = set()
 for p in pathlib.Path(sys.argv[1]).glob("*.json"):
     seen.add(json.loads(p.read_text())["state"])
-print(",".join(sorted(seen)))' "$WORK/jobs")"
+print(",".join(sorted(seen)))' "$JOBS")"
 assert_eq "$states" "queued" "the web process only ever queued jobs, never ran one"
 
 assert_report

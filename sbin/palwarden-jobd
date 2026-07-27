@@ -283,9 +283,19 @@ def write_engine_env(settings: dict[str, str]) -> None:
 
 # --- action table ------------------------------------------------------------
 # Each entry maps to argv(params) -> list of argv lists, run in order, plus
-# whether the action is disruptive (requires confirm). engine_save has no
-# command at all — it only writes a file — so it is handled separately in
-# build_commands/run_job.
+# whether the action is disruptive (requires confirm) and the exact set of
+# parameter names the action recognises. engine_save has no command at all — it
+# only writes a file — so it is handled separately in build_commands/run_job.
+#
+# `params` is a whitelist, not documentation: validate_params refuses any key
+# not listed (plus `confirm`, which every disruptive action takes) and builds the
+# normalised dict from these names alone. Both halves matter. Copying the request
+# through meant a typo'd `waitt: 30` was silently ignored instead of reported,
+# and it let an authenticated caller store arbitrary JSON in the queue — the API
+# accepts a 64 KiB body, so that was 64 KiB of junk written to disk per request.
+# Fixing it here rather than in palwarden-webui fixes the API too: the web
+# process enqueues whatever this function returns, and the worker is the side
+# that must not trust the queue.
 
 
 def _argv_config_apply(_params: dict) -> list[list[str]]:
@@ -390,21 +400,37 @@ def _argv_engine_save_apply_restart(params: dict) -> list[list[str]]:
 
 
 ACTIONS: dict[str, dict] = {
-    "config_apply": {"argv": _argv_config_apply, "disruptive": False},
-    "engine_apply": {"argv": _argv_engine_apply, "disruptive": False},
-    "config_pretty": {"argv": _argv_config_pretty, "disruptive": False},
-    "snapshot_create": {"argv": _argv_snapshot_create, "disruptive": False},
-    "backup": {"argv": _argv_backup, "disruptive": False},
-    "mark": {"argv": _argv_mark, "disruptive": False},
-    "engine_save": {"argv": None, "disruptive": False},
-    "graceful_restart": {"argv": _argv_graceful_restart, "disruptive": True},
-    "graceful_stop": {"argv": _argv_graceful_stop, "disruptive": True},
-    "update_check": {"argv": _argv_update_check, "disruptive": True},
-    "update_apply": {"argv": _argv_update_apply, "disruptive": True},
-    "engine_rollback": {"argv": _argv_engine_rollback, "disruptive": True},
-    "api_save": {"argv": _argv_api_save, "disruptive": True},
-    "engine_save_apply_restart": {"argv": _argv_engine_save_apply_restart, "disruptive": True},
+    "config_apply": {"argv": _argv_config_apply, "disruptive": False, "params": ()},
+    "engine_apply": {"argv": _argv_engine_apply, "disruptive": False, "params": ("dry_run",)},
+    "config_pretty": {"argv": _argv_config_pretty, "disruptive": False, "params": ()},
+    "snapshot_create": {"argv": _argv_snapshot_create, "disruptive": False,
+                        "params": ("label",)},
+    "backup": {"argv": _argv_backup, "disruptive": False, "params": ()},
+    "mark": {"argv": _argv_mark, "disruptive": False, "params": ("text",)},
+    "engine_save": {"argv": None, "disruptive": False, "params": ("settings",)},
+    "graceful_restart": {"argv": _argv_graceful_restart, "disruptive": True,
+                         "params": ("wait", "message")},
+    "graceful_stop": {"argv": _argv_graceful_stop, "disruptive": True,
+                      "params": ("wait", "message")},
+    "update_check": {"argv": _argv_update_check, "disruptive": True, "params": ()},
+    "update_apply": {"argv": _argv_update_apply, "disruptive": True, "params": ("wait",)},
+    "engine_rollback": {"argv": _argv_engine_rollback, "disruptive": True,
+                        "params": ("backup",)},
+    "api_save": {"argv": _argv_api_save, "disruptive": True, "params": ()},
+    "engine_save_apply_restart": {"argv": _argv_engine_save_apply_restart, "disruptive": True,
+                                  "params": ("settings", "wait")},
 }
+
+
+def recognised_params(action: str) -> frozenset[str]:
+    """Every parameter name `action` accepts, `confirm` included where it applies."""
+    spec = ACTIONS[action]
+    names = set(spec["params"])
+    if spec["disruptive"]:
+        # Not listed per action: it is required of *all* of them, and forgetting
+        # it in one entry would make that action unenqueueable.
+        names.add("confirm")
+    return frozenset(names)
 
 
 def validate_params(action: str, params: dict) -> tuple[dict | None, str | None]:
@@ -413,19 +439,33 @@ def validate_params(action: str, params: dict) -> tuple[dict | None, str | None]
     Exactly one of the two return slots is populated. Never trust that params
     already passed validation elsewhere (the API, or an earlier version of this
     same job file) — the job file is untrusted input.
+
+    The returned dict is built key by key from the action's whitelist, so it
+    contains recognised, normalised values and nothing else. An unrecognised key
+    is an *error* rather than a silent drop: a caller that wrote `waitt` meant
+    something by it, and a restart that quietly ignored the wait it was asked for
+    is worse than one that was refused.
     """
     spec = ACTIONS.get(action)
     if spec is None:
         return None, f"{action!r} is not an allowed action"
     if not isinstance(params, dict):
         return None, "params must be an object"
+    unknown = sorted(k for k in params if k not in recognised_params(action))
+    if unknown:
+        allowed = ", ".join(sorted(recognised_params(action))) or "no parameters"
+        return None, (f"{action} does not take the parameter "
+                      f"{', '.join(repr(k) for k in unknown)}; it takes: {allowed}")
     if spec["disruptive"]:
         try:
             require_confirm(params)
         except ValueError as exc:
             return None, str(exc)
     try:
-        normalised = dict(params)
+        # Whitelist, not a copy: only the slots below ever reach the job file.
+        normalised: dict = {}
+        if spec["disruptive"]:
+            normalised["confirm"] = True  # already proven to be exactly True
         if action in ("engine_save", "engine_save_apply_restart"):
             normalised["settings"] = validate_settings(params)
         if action in ("graceful_restart", "graceful_stop", "update_apply", "engine_save_apply_restart"):
