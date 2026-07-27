@@ -400,6 +400,9 @@ Create `tests/unit/test_restore_apply.sh` with stub tools that log their argv, a
 - **Startup failure keeps the replaced tree** and prints its path plus the safety archive's name.
 - **Extraction failure leaves the original tree intact** — extract-then-swap, never extract over the live tree.
 - Ownership asserted with a **secondary group** so a non-root chown is observable (the primary group is what files get at creation, so asserting on it would pass either way). Skip with a printed note when the user has only one group.
+- **Restore validates the scratch copy, not the archive in the backups directory.** Assert the authoritative `validate_archive` is called against a path under the scratch directory. Then prove it behaviourally the way Task 2 did: rewrite the backups-directory archive in place between the copy and the extract, and assert the *originally copied* bytes are what gets extracted.
+- **The scratch copy is deleted on both success and failure**, and the scratch directory is left empty.
+- `docs/tools.md` gains a `palworld-restore` section — it is the first `sbin/` command without one.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -413,7 +416,30 @@ Expected: FAIL — `--restore` is not a recognised argument.
 
 Add `--restore` to `sbin/palworld-restore`, stopping at the first failure:
 
-1. Validate the named archive in `PALWARDEN_SAVE_BACKUP_DIR` (name + members). Nothing is stopped or replaced until this passes.
+0. **Copy the chosen archive into a root-owned scratch path first, and validate
+   *that*.** This is not belt-and-braces; it is required. `sbin/palworld-backup`
+   chowns every archive it writes to `PALWORLD_USER:PALWORLD_GROUP`, and
+   `palwarden-webui` runs as exactly that account — so **every archive in the
+   backups directory is writable by the untrusted web process today**. Validating
+   one in place would guarantee the name but not the bytes, which is the same
+   unsoundness Task 2 was reordered to avoid (`lib/palwarden_archive.py`'s
+   `extract_archive` docstring states the obligation explicitly: only ever extract
+   from a location the web process cannot write).
+
+   So: `open_archive_fd` the named archive, copy it through that descriptor into a
+   scratch file under a **root-owned, root-only** directory (`PALWARDEN_RESTORE_SCRATCH`,
+   default `/var/lib/palworld/restore-scratch`, mode 0700 root-owned — created by
+   the installer and entrypoint in Task 8), then validate and extract **only** from
+   the scratch copy, and delete it when done (including on failure).
+
+   Also settle ownership here, as one decision rather than two: whether
+   `palworld-backup`'s existing chown-to-service-account should stay. Recommendation
+   — keep it (it lets the operator rotate backups without sudo, which is the reason
+   it exists) and rely on the scratch copy for integrity. Say in the code comment
+   which guarantee comes from which mechanism, and add an assertion that restore
+   never validates a path inside the backups directory.
+
+1. Validate the named archive **in scratch** (name + members). Nothing is stopped or replaced until this passes.
 2. Safety backup, **conditional**: if the saved dir exists and is non-empty, run `palworld-backup` and record the filename it prints. Otherwise print that it was skipped and continue.
 3. `palworld-graceful-stop [--wait N]`. Treat "already stopped" as success — detect it rather than ignoring all failures, so a genuine stop failure still aborts. Print which case occurred.
 4. `extract_archive` into `<saved>.restore-<stamp>` **beside** the target, then `os.rename` the existing tree to `<saved>.replaced-<stamp>` and the new tree into place.
