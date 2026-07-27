@@ -63,14 +63,34 @@ Layered, because page loads and API calls need different mechanisms.
 2. **Mutating endpoints additionally require the token in `X-Palwarden-Token`.**
    This is the CSRF defence: with Basic alone the browser would attach
    credentials to a cross-origin POST, but a cross-origin page cannot set a
-   custom header without a CORS preflight, which we never grant. The control
-   panel supplies the token from `sessionStorage` (same-origin JS can; an
-   attacker's page cannot read it).
+   custom header without a CORS preflight, which we never grant.
 
    The token travels in its own header rather than `Authorization: Bearer`
    because Basic auth already occupies `Authorization` on every request — the two
    schemes cannot share one header. A custom header is exactly as CSRF-safe: the
    preflight requirement, not the scheme name, is what an attacker cannot satisfy.
+
+   **Our pages fetch the token from `GET /api/token`; the operator is never
+   prompted for it.** The pages are static files served from disk with no
+   templating step, so the original design had the Engine editor ask for the
+   token with `window.prompt` and cache it in `sessionStorage`. That friction is
+   not worth paying: the endpoint requires the same Basic session that served the
+   page, is Origin-checked, and answers `no-store`. A `window.prompt` fallback
+   remains for a server that does not offer the endpoint.
+
+   **The CSRF property is unchanged.** It never came from the operator's
+   knowledge of the token; it comes from the *custom header*, which a cross-site
+   page cannot set without a preflight we never answer, and from same-origin
+   policy, which stops an attacker's page reading our HTML or our JSON. How our
+   own page obtains the value does not touch either mechanism.
+
+   **What does change: Basic auth alone is now sufficient to mutate**, since
+   anyone who can load the page can also fetch the token. That is the accepted
+   trade-off. The token was never a second human factor — it lives in the same
+   0600 `webui.env` as the password and is handed to the same operator — so
+   requiring it separately bought no additional authorisation, only friction.
+   Blast radius is unchanged: web UI access already implies reading
+   `AdminPassword` from `GET /current/PalWorldSettings.ini`.
 3. **Origin / `Sec-Fetch-Site` validation on mutations.** Reject anything whose
    `Origin` is present and not our own; reject `Sec-Fetch-Site: cross-site`.
    Defeats DNS rebinding.
@@ -97,6 +117,12 @@ subsequent starts. Deliberately separate from `ADMIN_PASSWORD`: distinct blast
 radius, independently rotatable, and in-game admins do not get shell-level
 control. Gitignored; never baked into an image.
 
+`WEBUI_TOKEN` is a **CSRF token, not a second factor.** It is not an independent
+credential: it sits in this same file, is issued to the same operator, and any
+authenticated caller can read it back from `GET /api/token`. Treat the pair as one
+secret — rotate both together, and do not grant `WEBUI_PASSWORD` to anyone who
+should not be able to mutate.
+
 ## API
 
 Read endpoints (Basic auth only, `GET`, JSON, each with a subprocess timeout):
@@ -111,12 +137,27 @@ Read endpoints (Basic auth only, `GET`, JSON, each with a subprocess timeout):
 | `/api/config` | live `PalWorldSettings.ini`, parsed to key/value JSON with `AdminPassword`/`ServerPassword` replaced by `"<redacted>"` (the same `SECRET_KEYS` set `palworld-config-diff`/`-summary` already use) |
 | `/api/backups`, `/api/snapshots` | directory listings |
 | `/api/jobs`, `/api/jobs/<id>` | queue state |
+| `/api/token` | `WEBUI_TOKEN`, as `{"ok": true, "token": "..."}`, so our own pages need not prompt for it |
 
 There is deliberately no `/api/status` endpoint: `palworld-status` is a bash
 script that prints a human-readable dashboard with no `--json` mode, and
 `/api/health` already returns the same information as structured JSON (service
 state, live players, FPS windows, engine drift, buildid, disk, detected
 restarts). Wrapping the text output would duplicate that for no gain.
+
+`/api/token` is the one read that is **also** Origin-checked (`403` on a
+`Sec-Fetch-Site` that is not `same-origin`, or a non-loopback `Origin`), and it
+answers `Cache-Control: no-store` plus `Pragma: no-cache`. The other reads need
+neither: a cross-site page cannot read *any* of these responses, but this one *is*
+a secret rather than merely being protected by one, so it refuses to put the value
+on the wire at all instead of relying on the browser to withhold it. It is
+implemented as its own branch rather than a `READ_ENDPOINTS` entry — those are
+uniform `(query) -> dict` tool wrappers, and expressing two per-endpoint
+exceptions in that table costs more than a branch. The token appears in no log
+line (the request line is just `GET /api/token`) and in no error string.
+
+Anything scripting the API can use the endpoint the same way: Basic auth is
+enough to obtain the token, so no separate secret has to be provisioned.
 
 Mutating: `POST /api/jobs` with `{"action": "...", "params": {...}}` (Basic +
 `X-Palwarden-Token` + Origin checks) → `202 {"id": "..."}`.
@@ -180,7 +221,8 @@ with the vendored editors being single files):
 * **Actions:** buttons grouped file-only vs disruptive. Disruptive ones open a
   confirmation dialog naming the action and the player-warning window.
 * **Job log:** live view of the current/last job, polled while `running`.
-* Token entered once, kept in `sessionStorage`.
+* Token fetched from `GET /api/token` on first need and kept in `sessionStorage`
+  for the tab; never entered by hand except through the fallback prompt.
 
 ### Component vocabulary
 
@@ -297,6 +339,9 @@ server disagreeing with no indication in the UI.
 * Auth: no credentials → 401; wrong password → 401; correct Basic on a read →
   200; mutation without the token header → 403; with it → 202; cross-site `Origin` →
   403.
+* `GET /api/token`: unauthenticated → 401; Basic → 200 with the value and
+  `no-store`; cross-site or foreign `Origin` → 403; the token never in the log;
+  and the round trip (fetch the token, then use it to enqueue → 202).
 * Refusal to start as root; refusal to start without credentials.
 * Param validation: label/message/wait/backup rejection, including shell
   metacharacters and path traversal (`../`), asserting argv is never shell-joined.

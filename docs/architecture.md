@@ -118,8 +118,13 @@ with `jobd` down, jobs queue and never run.
 
 Authentication is Basic on every path from `/etc/palworld/webui.env`, plus
 `WEBUI_TOKEN` in `X-Palwarden-Token` and an `Origin`/`Sec-Fetch-Site` check on
-mutations, and `confirm: true` for disruptive actions. Details and the recovery
-procedures are in [`tools.md`](tools.md#web-ui-control-plane) and
+mutations, and `confirm: true` for disruptive actions. The token is a **CSRF
+defence, not a second factor**: the pages fetch it from `GET /api/token` with the
+Basic session they already hold, so Basic auth alone is what gates mutation. What
+the custom header stops is a *cross-site* page acting as you — it cannot set the
+header without a preflight we never answer, and it cannot read the token either.
+Details and the recovery procedures are in
+[`tools.md`](tools.md#web-ui-control-plane) and
 [`palworld-service-runbook.md`](palworld-service-runbook.md) §14.
 
 Two things this split deliberately does *not* do:

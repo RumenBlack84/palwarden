@@ -133,9 +133,47 @@ assert_contains "$broken" '"ok": false' "a tool that exits non-zero with empty s
 assert_eq "$(code -u "$CREDS" -X POST "$U/api/jobs")" "403" \
   "POST /api/jobs needs the token header, not just Basic auth"
 
+# --- GET /api/token hands the mutation token to an authenticated page ------
+# It replaces the operator prompt in the Engine editor, so it must be reachable
+# with exactly the Basic session that served the page — and with nothing less.
+assert_eq "$(code "$U/api/token")" "401" "GET /api/token is never reachable unauthenticated"
+assert_not_contains "$(body "$U/api/token")" "tok-for-tests" \
+  "the 401 body carries no token"
+assert_eq "$(code -u "$CREDS" "$U/api/token")" "200" "GET /api/token works with Basic auth"
+tokbody="$(body -u "$CREDS" "$U/api/token")"
+assert_contains "$tokbody" "tok-for-tests" "GET /api/token returns the WEBUI_TOKEN value"
+assert_contains "$tokbody" '"ok": true' "the token response uses the API envelope"
+# It must not be cached anywhere: no-store for HTTP/1.1, Pragma for an HTTP/1.0
+# intermediary (this server answers HTTP/1.0, so that is the realistic proxy).
+tokhdrs="$(curl -s -D - -o /dev/null -u "$CREDS" "$U/api/token")"
+assert_contains "$tokhdrs" "Cache-Control: no-store" "the token response is Cache-Control: no-store"
+assert_contains "$tokhdrs" "Pragma: no-cache" "the token response is Pragma: no-cache too"
+
+# Unlike every other read, this one is Origin-checked: the response *is* the
+# secret, so it refuses rather than trusting the browser not to expose it.
+assert_eq "$(code -u "$CREDS" -H 'Sec-Fetch-Site: cross-site' "$U/api/token")" "403" \
+  "a cross-site token fetch is refused"
+assert_not_contains "$(body -u "$CREDS" -H 'Sec-Fetch-Site: cross-site' "$U/api/token")" \
+  "tok-for-tests" "the cross-site refusal leaks no token"
+assert_eq "$(code -u "$CREDS" -H 'Origin: http://evil.example' "$U/api/token")" "403" \
+  "a foreign Origin cannot fetch the token"
+assert_not_contains "$(body -u "$CREDS" -H 'Origin: http://evil.example' "$U/api/token")" \
+  "tok-for-tests" "the foreign-Origin refusal leaks no token"
+# ...but the documented access path still works: an SSH tunnel remaps the port,
+# so a loopback Origin on any port is our own page.
+assert_eq "$(code -u "$CREDS" -H 'Origin: http://localhost:9999' \
+  -H 'Sec-Fetch-Site: same-origin' "$U/api/token")" "200" \
+  "our own page over a tunnelled port can fetch the token"
+# and it is a GET-only read: POST to it must not become a second mutation surface
+assert_eq "$(code -u "$CREDS" -H "X-Palwarden-Token: tok-for-tests" -X POST -d '{}' \
+  "$U/api/token")" "404" "POST /api/token is not a route"
+
 # --- nothing sensitive in the log ----------------------------------------
+# Includes every /api/token request above: the request line is "GET /api/token",
+# and the handler's 500 path reports no exception text for exactly this reason.
 assert_not_contains "$(cat "$WORK/server.log")" "pw-for-tests" "password never logged"
 assert_not_contains "$(cat "$WORK/server.log")" "tok-for-tests" "token never logged"
+assert_not_contains "$(cat "$WORK/server.log")" "Traceback" "no traceback reached the log"
 
 # --- the real dashboard page is what gets served at / ---------------------
 REAL_ROOT="$DIR/../../webui"

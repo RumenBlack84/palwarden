@@ -12,12 +12,19 @@ Every path — including the static editors — requires HTTP Basic auth. Basic 
 plain HTTP is acceptable only because the listener is loopback-bound and remote
 access goes through an SSH tunnel, which supplies the encryption.
 
-Mutations need a second factor on top of Basic: the shared token in the
-`X-Palwarden-Token` header. A browser attaches Basic credentials to a
-cross-origin POST all by itself, so Basic alone is not proof of intent; a
-cross-origin page cannot set a custom header without a CORS preflight, which we
-never answer. Origin/Sec-Fetch-Site are checked as well, which is what catches
-DNS rebinding (where Host alone would look legitimate).
+Mutations need the shared token in the `X-Palwarden-Token` header on top of
+Basic. A browser attaches Basic credentials to a cross-origin POST all by
+itself, so Basic alone is not proof of intent; a cross-origin page cannot set a
+custom header without a CORS preflight, which we never answer.
+Origin/Sec-Fetch-Site are checked as well, which is what catches DNS rebinding
+(where Host alone would look legitimate).
+
+The token is *not* a second human factor: our own pages fetch it from
+`GET /api/token`, which needs nothing but the same Basic session that served the
+page. So anyone who can authenticate can mutate — accepted deliberately, because
+the password and the token live in the same 0600 file and go to the same
+operator. What the custom header still buys is the CSRF property above, and that
+is unaffected by how our page obtains the value.
 """
 
 from __future__ import annotations
@@ -597,12 +604,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
     timeout = REQUEST_TIMEOUT
 
     # --- helpers ----------------------------------------------------------
-    def _send_json(self, status: int, payload: dict) -> None:
+    def _send_json(self, status: int, payload: dict,
+                   extra_headers: tuple[tuple[str, str], ...] = ()) -> None:
         body = json.dumps(payload, indent=2, sort_keys=True).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        for name, value in extra_headers:
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 
@@ -697,6 +707,53 @@ class Handler(http.server.BaseHTTPRequestHandler):
         """
         self.close_connection = True
         self._send_json(status, {"ok": False, "error": error, **extra})
+
+    def _send_token(self) -> None:
+        """GET /api/token: hand the mutation token to our own authenticated page.
+
+        Deliberately NOT a READ_ENDPOINTS entry. Those are `(query) -> dict`
+        wrappers around read-only tools, dispatched uniformly by do_GET; this one
+        reads the already-loaded credentials, needs an Origin gate the other
+        reads must not grow, and needs a header they do not send. Adding
+        per-endpoint metadata to that table to express two exceptions would be
+        more machinery than a branch.
+
+        Why *this* read is Origin-checked when none of the others are: a
+        cross-site GET's response body is unreadable to the attacker's page
+        anyway (same-origin policy blocks reading it, and we answer no
+        preflight), so the other reads need no such check. But this response *is*
+        the secret rather than merely being protected by one, and "the browser
+        will refuse to show it to them" is a weaker guarantee than "we never sent
+        it". A no-cors fetch, a stray extension, a mis-set proxy: all of those
+        end with the token on the wire for a request we could simply have
+        refused. So it fails closed, reusing the same origin_ok the mutation path
+        uses.
+
+        Headers: `Cache-Control: no-store` from _send_json, plus `Pragma:
+        no-cache` because this process answers HTTP/1.0 (BaseHTTPRequestHandler's
+        default `protocol_version`) and an HTTP/1.0-only intermediary — the SSH
+        tunnel is transparent, but people put reverse proxies in front of things
+        — may honour only Pragma. No `Vary: Authorization` is needed on top: a
+        response with no-store must not be stored at all, so there is no cache
+        entry for a second user's credentials to hit. No `X-Content-Type-Options`
+        either; the payload is JSON consumed by fetch(), never navigated to as a
+        document, so there is no sniffing outcome to prevent.
+
+        Nothing here logs the token: log_message writes only the client address
+        and the request line ("GET /api/token"), and the 500 path in do_GET is
+        the one error path in this file that reports no exception text, precisely
+        because this is the only handler whose locals hold the secret.
+        """
+        if not origin_ok(self.headers):
+            # Named, like the mutation path's refusal, so an operator who bound
+            # to a routable address can see why their page cannot save.
+            origin = (self.headers.get("Origin") or "").strip()
+            detail = f" (Origin {origin!r})" if origin else ""
+            self._send_json(403, {"ok": False,
+                                  "error": f"cross-origin request refused{detail}"})
+            return
+        self._send_json(200, {"ok": True, "token": self.credentials["WEBUI_TOKEN"]},
+                        extra_headers=(("Pragma", "no-cache"),))
 
     def _enqueue(self) -> None:
         """POST /api/jobs: validate, then write a job file. Nothing else, ever."""
@@ -794,6 +851,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path.startswith("/api/"):
+            if parsed.path == "/api/token":
+                try:
+                    self._send_token()
+                except CLIENT_GONE as exc:
+                    self._note_client_gone("answering the token API", exc)
+                except Exception:
+                    # No `{exc}` here, unlike every other 500 in this file: the
+                    # only secret this handler touches is the token, and an
+                    # exception string is the one place it could escape into a
+                    # response body or a log line.
+                    self._send_json_safely(
+                        500, {"ok": False, "error": "internal error"})
+                return
             if parsed.path == "/api/jobs" or parsed.path.startswith("/api/jobs/"):
                 try:
                     self._send_jobs(parsed.path)

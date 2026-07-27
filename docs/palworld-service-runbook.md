@@ -648,10 +648,23 @@ sudo $EDITOR /etc/palworld/webui.env             # or rotate: new password/token
 sudo systemctl restart palworld-config-webui.service
 ```
 
-Then **reload the browser tab**. The token lives in `sessionStorage`, so an open
-tab keeps sending the old one and every Save button answers `403`. Rotate both
-values together if you are rotating at all; the password alone still leaves a
-token an old tab can use.
+Then **reload the browser tab**. The token is cached in `sessionStorage` for the
+life of the tab, so an open tab keeps sending the old one — the first Save answers
+`403`, discards the cached value, and a second click re-fetches from
+`GET /api/token`, so a retry usually recovers without a reload.
+
+Rotate the password and the token **together**. `WEBUI_TOKEN` is a CSRF token, not
+a second factor: any caller with Basic auth can fetch it from `GET /api/token`
+(that is how the editor gets it), so rotating the token alone protects nothing if
+the password leaked, and rotating the password alone is what actually revokes
+access.
+
+If you are scripting the API rather than clicking, you never need to read the
+token out of the file:
+
+```bash
+curl -sS -u admin:"$WEBUI_PASSWORD" http://127.0.0.1:8088/api/token
+```
 
 To regenerate from scratch, remove the file and re-run
 `palwarden-webui --init-credentials` as root, then restore its ownership and mode
@@ -665,11 +678,17 @@ recreate.
 Three usual causes, in order of likelihood:
 
 ```text
-missing or invalid X-Palwarden-Token   -> WEBUI_TOKEN changed, or a stale tab; reload
+missing or invalid X-Palwarden-Token   -> WEBUI_TOKEN changed under a stale tab; click
+                                          again (the page re-fetches) or reload
 cross-origin request refused           -> the UI was reached on a non-loopback address
 job queue directory ... not writable   -> /var/lib/palworld/jobs is not owned by the
                                           web UI's service account (it must be, 0700)
 ```
+
+A `403` from `GET /api/token` itself is always the second of these: the endpoint
+refuses any request whose `Sec-Fetch-Site` is not `same-origin` or whose `Origin`
+is not loopback, because that response carries the token. Reach the UI through the
+SSH tunnel (`http://127.0.0.1:<port>/`), not a routable address or hostname.
 
 The queue directory being owned by the service account rather than root is
 deliberate: the unprivileged server is the process that writes job files. The

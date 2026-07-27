@@ -173,9 +173,15 @@ helpers cannot authenticate.
 - **`WEBUI_PASSWORD` is printed once, at generation, and is not recoverable.**
   To rotate it (or `WEBUI_TOKEN`), edit `/etc/palworld/webui.env` as root,
   `systemctl restart palworld-config-webui.service`, and reload the browser tab —
-  the token is held in `sessionStorage`, so an open tab keeps using the old one.
+  the token is cached in `sessionStorage`, so an open tab keeps using the old one.
+  Rotate both values together: see
+  [`docs/palworld-service-runbook.md`](docs/palworld-service-runbook.md) §14.
 - Mutating API requests need `WEBUI_TOKEN` in the **`X-Palwarden-Token`** header
-  in addition to Basic auth; Basic alone is refused with `403` by design. See
+  in addition to Basic auth; Basic alone in the header is refused with `403` by
+  design. That header is a **CSRF defence, not a second factor**: any
+  Basic-authenticated caller — the UI, or your script — can fetch the value from
+  `GET /api/token`, so whoever holds `WEBUI_PASSWORD` can mutate. Nobody is ever
+  prompted to type a token. See
   [`docs/tools.md`](docs/tools.md#web-ui-control-plane).
 - **Web UI access is not a boundary against the server's own secrets.** The
   editors preload the live config, so anyone who can log in can read

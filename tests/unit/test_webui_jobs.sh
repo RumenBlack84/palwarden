@@ -158,6 +158,20 @@ assert_eq "${#BACKUP_ID}" "32" "the response carries a 32-hex job id"
 # the queue directory is created owner-only: job params can carry config values
 assert_eq "$(stat -c %a "$JOBS")" "700" "queue directory is 0700"
 
+# --- the round trip the browser actually performs --------------------------
+# The Engine editor no longer prompts for the token: it GETs /api/token with the
+# Basic session it already has, then POSTs with it. This is the end-to-end
+# assertion that the two halves fit — a token fetched from the API is accepted by
+# the mutation path, with nothing typed in by a human anywhere.
+fetched_tok="$(body -u "$CREDS" -H 'Accept: application/json' "$U/api/token" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')"
+assert_eq "$fetched_tok" "tok-for-tests" "GET /api/token yields the real token"
+roundtrip="$(code -u "$CREDS" -H "X-Palwarden-Token: $fetched_tok" \
+  -H 'Content-Type: application/json' -H 'Sec-Fetch-Site: same-origin' \
+  -d '{"action":"backup"}' "$U/api/jobs")"
+assert_eq "$roundtrip" "202" \
+  "a token fetched from GET /api/token enqueues a job (fetch-then-post round trip)"
+
 # --- cross-origin requests are refused even with both factors --------------
 assert_eq "$(code -u "$CREDS" -H "$TOKHDR" -H 'Sec-Fetch-Site: cross-site' -X POST \
   -H 'Content-Type: application/json' -d '{"action":"backup"}' "$U/api/jobs")" "403" \
@@ -428,6 +442,10 @@ assert_file_not_contains "$EDITOR" "'engine_apply'" \
 assert_file_contains "$EDITOR" "X-Palwarden-Token" "the editor sends the token header"
 assert_file_contains "$EDITOR" "sessionStorage.getItem" "the token is read from sessionStorage"
 assert_file_not_contains "$EDITOR" "localStorage" "the token never lands in localStorage"
+# the token comes from the API, with the operator prompt kept only as a fallback
+assert_file_contains "$EDITOR" "'/api/token'" "the editor fetches the token from /api/token"
+assert_file_contains "$EDITOR" "window.prompt" \
+  "the prompt fallback survives, for a server without /api/token"
 assert_file_not_contains "$EDITOR" "document.cookie" "the token is never put in a cookie"
 assert_file_not_contains "$EDITOR" "Authorization: Bearer" \
   "the token does not try to share the Basic auth header"
@@ -611,6 +629,94 @@ elif [ -n "${CI:-}" ]; then
   fail "node is required in CI to execute the editor's collectSettings()"
 else
   echo "  (skipping the node checks of collectSettings(): node not found)" >&2
+fi
+
+# --- exercise the real token() under node ------------------------------------
+# The greps above prove /api/token and window.prompt both appear in the file; they
+# cannot prove which one runs when. Run the page's own token() against a stubbed
+# fetch and assert the happy path never prompts, the fallback still does, and a
+# 401 refuses to prompt for a token that could not help.
+if command -v node >/dev/null 2>&1; then
+  TOK_JS="$WORK/token.js"
+  {
+    grep '^const TOKEN_KEY' "$EDITOR"
+    grep '^function errText' "$EDITOR"
+    awk '/^async function token\(\)\{/{f=1} f{print} f && /^}/{exit}' "$EDITOR"
+  } > "$TOK_JS"
+  cat >> "$TOK_JS" <<'EOF'
+
+let failures = 0;
+function check(desc, cond) { if (!cond) { failures++; console.log("FAIL: " + desc); } }
+
+// Stubs. `log` is the page's job-log writer; we only need it not to throw.
+const logged = [];
+function log(line) { logged.push(line); }
+let store = {};
+global.sessionStorage = {
+  getItem(k) { return Object.prototype.hasOwnProperty.call(store, k) ? store[k] : null; },
+  setItem(k, v) { store[k] = String(v); },
+  removeItem(k) { delete store[k]; },
+};
+let fetches = 0, prompts = 0, promptAnswer = null, responder = null;
+global.fetch = async (url, opts) => { fetches++; return responder(url, opts); };
+global.window = { prompt: () => { prompts++; return promptAnswer; } };
+function reset(r) { store = {}; fetches = 0; prompts = 0; promptAnswer = null; responder = r; }
+function json(status, body) {
+  return { status: status, ok: status >= 200 && status < 300, json: async () => body };
+}
+
+(async () => {
+  // 1. happy path: fetched, cached, and NOT prompted for
+  reset((url) => { check("fetches /api/token", url === "/api/token"); return json(200, {ok: true, token: "T-from-api"}); });
+  check("returns the fetched token", (await token()) === "T-from-api");
+  check("the happy path never prompts", prompts === 0);
+  check("the fetched token is cached in sessionStorage", store[TOKEN_KEY] === "T-from-api");
+
+  // 2. a cached token costs no request
+  reset(() => { throw new Error("must not fetch"); });
+  store[TOKEN_KEY] = "T-cached";
+  check("a cached token is reused", (await token()) === "T-cached");
+  check("a cached token issues no request", fetches === 0);
+
+  // 3. fallback: the endpoint is missing (an older server) -> prompt
+  reset(() => json(404, {ok: false, error: "unknown endpoint"}));
+  promptAnswer = "T-typed";
+  check("a 404 falls back to the prompt", (await token()) === "T-typed");
+  check("the fallback prompted exactly once", prompts === 1);
+  check("the typed token is cached too", store[TOKEN_KEY] === "T-typed");
+
+  // 3b. and for a hard network failure as well
+  reset(() => { throw new Error("network down"); });
+  promptAnswer = "T-typed-2";
+  check("a network failure falls back to the prompt", (await token()) === "T-typed-2");
+
+  // 3c. a cancelled prompt is an error, not an empty token on the wire
+  reset(() => json(404, {ok: false}));
+  promptAnswer = null;
+  let cancelled = null;
+  try { await token(); } catch (e) { cancelled = e; }
+  check("a cancelled prompt throws", cancelled !== null);
+  check("no token is cached after a cancelled prompt", !(TOKEN_KEY in store));
+
+  // 4. a 401 is the Basic session, not the token: refuse, do not prompt
+  reset(() => json(401, {ok: false, error: "authentication required"}));
+  promptAnswer = "T-would-not-help";
+  let err = null;
+  try { await token(); } catch (e) { err = e; }
+  check("a 401 throws", err !== null);
+  check("a 401 does NOT prompt for a token", prompts === 0);
+  check("the 401 message says to sign in again", /reload/i.test(String(err && err.message)));
+  check("nothing is cached after a 401", !(TOKEN_KEY in store));
+
+  console.log(failures === 0 ? "OK" : "FAIL");
+})();
+EOF
+  tok_out="$(node "$TOK_JS" 2>&1)"
+  assert_eq "$tok_out" "OK" "token() extracted from the editor fetches, caches, and only prompts as a fallback"
+elif [ -n "${CI:-}" ]; then
+  fail "node is required in CI to execute the editor's token()"
+else
+  echo "  (skipping the node checks of token(): node not found)" >&2
 fi
 
 # ...and the exact wire shape the page builds is accepted by the real validators,

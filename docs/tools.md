@@ -142,9 +142,23 @@ it for you). With no arguments it prints help and exits — the service uses
 
 Read endpoints (Basic auth is enough): `/api/health`, `/api/fps`, `/api/events`,
 `/api/service-events`, `/api/engine`, `/api/config` (passwords redacted),
-`/api/backups`, `/api/snapshots`, `/api/jobs`, `/api/jobs/<id>`. A failing tool
-answers `200` with `{"ok": false, "error": ...}` rather than a `500`, so one
-broken tool cannot blank the dashboard.
+`/api/backups`, `/api/snapshots`, `/api/jobs`, `/api/jobs/<id>`, `/api/token`. A
+failing tool answers `200` with `{"ok": false, "error": ...}` rather than a `500`,
+so one broken tool cannot blank the dashboard.
+
+`GET /api/token` returns `{"ok": true, "token": "..."}` — the `WEBUI_TOKEN` value
+needed to mutate. The Engine.ini editor fetches it on first Save (cached in
+`sessionStorage` for the tab, with a `window.prompt` fallback if the endpoint is
+missing), so **the operator is never asked to type a token**. Scripts can do the
+same: Basic auth is all it takes to obtain the token, so there is no second secret
+to provision. It is the one read that is *also* Origin-checked — `403` unless
+`Sec-Fetch-Site` is `same-origin` (or absent) and any `Origin` is loopback —
+because the response is itself the secret; it answers `Cache-Control: no-store`
+plus `Pragma: no-cache`, and the value never reaches a log line.
+
+Consequently **Basic auth alone is sufficient to mutate**: the token is a CSRF
+token, not a second factor (see [`architecture.md`](architecture.md) and the
+design spec's "Authentication and hardening"). Guard `WEBUI_PASSWORD` accordingly.
 
 Mutating: `POST /api/jobs` with `{"action": ..., "params": {...}}` → `202
 {"id": ...}`. It validates the request and writes a job file; **it never executes
@@ -157,6 +171,10 @@ failure · `409` a disruptive job is already queued or running (the body carries
 `blocked_by` with its `id`/`action`/`state`) · `500` internal.
 
 ```bash
+# the token can be read out of webui.env, or simply fetched with Basic auth
+WEBUI_TOKEN="$(curl -sS -u admin:"$WEBUI_PASSWORD" \
+  http://127.0.0.1:8088/api/token | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')"
+
 curl -sS -u admin:"$WEBUI_PASSWORD" -H "X-Palwarden-Token: $WEBUI_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"action":"backup"}' http://127.0.0.1:8088/api/jobs

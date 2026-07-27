@@ -366,7 +366,16 @@ function download(name,text){ const a=document.createElement('a'); a.href=URL.cr
 // --- control plane ----------------------------------------------------------
 // Mutations need HTTP Basic (the browser already holds it for this page) *plus*
 // the token in X-Palwarden-Token. The custom header is the CSRF defence: a
-// cross-origin page cannot set it without a preflight the server never grants.
+// cross-origin page cannot set it without a preflight the server never grants —
+// and that property does not depend on how *this* page learns the value, so the
+// token is fetched from GET /api/token (Basic-authenticated, Origin-checked)
+// rather than typed in by the operator.
+//
+// The consequence, accepted deliberately: Basic auth alone is now enough to
+// mutate, because anyone who can load this page can also fetch the token. It was
+// never a second human factor — both secrets sit in the same webui.env and go to
+// the same person.
+//
 // The token lives in sessionStorage only — never in persistent local storage,
 // never in a cookie, never in a URL, and never logged.
 const TOKEN_KEY='palwarden-token';
@@ -388,13 +397,43 @@ const POLL_MAX_ATTEMPTS=450;
 const POLL_MAX_STATUS_FAILURES=10;
 const TERMINAL=['succeeded','failed'];
 
-function token(){
-  let t=sessionStorage.getItem(TOKEN_KEY);
-  if(!t){
-    t=window.prompt('palwarden API token (from /etc/palworld/webui.env). Kept in this tab only.');
-    if(t){ sessionStorage.setItem(TOKEN_KEY, t); }
+// Resolves to the token, or throws with something the operator can act on.
+// Cached in sessionStorage so repeat Saves cost no extra request; the cache is
+// cleared on a 403 (see postJob) so a rotated token self-heals on the next click.
+async function token(){
+  const cached=sessionStorage.getItem(TOKEN_KEY);
+  if(cached) return cached;
+  let unauthenticated=false;
+  try {
+    const res=await fetch('/api/token', {headers:{'Accept':'application/json'}});
+    // A 401 means the Basic session is gone, which no token can fix: the very
+    // next POST would 401 too. Prompting here would take a secret off the
+    // operator and then fail anyway, so say what actually needs doing instead.
+    if(res.status===401){ unauthenticated=true; throw new Error('HTTP 401'); }
+    if(!res.ok) throw new Error('HTTP '+res.status);
+    const json=await res.json();
+    if(!json || json.ok===false || !json.token){
+      throw new Error((json && json.error) ? json.error : 'the response carried no token');
+    }
+    const t=String(json.token);
+    sessionStorage.setItem(TOKEN_KEY, t);
+    return t;
+  } catch(e) {
+    if(unauthenticated){
+      throw new Error('not signed in any more (GET /api/token answered 401) — '+
+        'reload this page and re-enter the web UI credentials');
+    }
+    // Fallback, kept on purpose: a server without /api/token (an older palwarden,
+    // or a deployment that dropped the endpoint) would otherwise leave this page
+    // with no way to mutate at all. The operator can still read the value out of
+    // webui.env by hand.
+    const why=errText(e);
+    log('could not fetch the API token ('+why+'); asking for it instead');
+    const typed=window.prompt('palwarden could not supply the API token ('+why+'). '+
+      'Enter WEBUI_TOKEN from /etc/palworld/webui.env. Kept in this tab only.');
+    if(typed){ sessionStorage.setItem(TOKEN_KEY, typed); return typed; }
+    throw new Error('no API token available: '+why);
   }
-  return t || '';
 }
 function errText(e){ return String((e && e.message) || e); }
 function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
@@ -436,9 +475,10 @@ function setBusy(busy){
 }
 
 async function postJob(action, params){
+  const tok=await token();
   const res=await fetch('/api/jobs', {
     method:'POST',
-    headers:{'Content-Type':'application/json','Accept':'application/json','X-Palwarden-Token':token()},
+    headers:{'Content-Type':'application/json','Accept':'application/json','X-Palwarden-Token':tok},
     body: JSON.stringify({action: action, params: params}),
   });
   let json=null;
@@ -447,7 +487,14 @@ async function postJob(action, params){
   let msg=(json && json.error) ? json.error : ('HTTP '+res.status);
   const b=json && json.blocked_by;
   if(b) msg += ' [blocked by '+b.action+' '+b.id+' ('+b.state+')]';
-  if(res.status===403) msg += ' — check the API token (clear it with sessionStorage.removeItem("'+TOKEN_KEY+'") to be re-prompted)';
+  if(res.status===403){
+    // Either the cached token is stale (WEBUI_TOKEN was rotated under an open
+    // tab) or the request was cross-origin. Dropping the cache is right in the
+    // first case and harmless in the second — it only costs one GET /api/token
+    // on the next click — so the operator's retry can just work.
+    sessionStorage.removeItem(TOKEN_KEY);
+    msg += ' — the API token was refused; it has been discarded, so retrying re-fetches it';
+  }
   throw new Error(msg);
 }
 
