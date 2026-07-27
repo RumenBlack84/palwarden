@@ -167,11 +167,11 @@
   </div>
 </div>
 <script>
-// The API token is only needed for mutating calls (increment 2). It is kept in
-// sessionStorage so a cross-origin page cannot read it; reads rely on the Basic
-// auth the browser already performed for this page.
-function token() { return sessionStorage.getItem("palwarden-token") || ""; }
-
+// This dashboard is read-only: every fetch below is a GET, which needs nothing
+// beyond the Basic auth the browser already performed for this page. Mutations
+// are the Engine.ini editor's job, and so is the X-Palwarden-Token header they
+// require — it holds the token in sessionStorage (per-tab, unreadable by any
+// cross-origin page), which is why nothing here has to know about it.
 async function get(path) {
   const res = await fetch(path, { headers: { "Accept": "application/json" } });
   if (!res.ok) throw new Error(path + " -> HTTP " + res.status);

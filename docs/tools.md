@@ -8,6 +8,7 @@ files, talk to the REST API, and touch `palworld`-owned files).
 - [Lifecycle](#lifecycle)
 - [REST API helpers](#rest-api-helpers)
 - [Configuration](#configuration)
+- [Web UI control plane](#web-ui-control-plane)
 - [Telemetry & reporting](#telemetry--reporting)
 - [Watchers](#watchers)
 - [Status](#status)
@@ -119,21 +120,90 @@ pretty copies, `engine.env`, a **redacted** `settings.env`, engine status, FPS
 report (text+json), 24h events, service status, API metrics, buildid, and a
 `manifest.json`. Records a quiet event marker unless `--no-mark`.
 
+---
+
+## Web UI control plane
+
+Two processes with a deliberate privilege split: `palwarden-webui` parses HTTP
+and has no privilege, `palwarden-jobd` has root and no network input. Both must
+be running or queued actions never execute. See
+[`architecture.md`](architecture.md) for the boundary and
+[`palworld-service-runbook.md`](palworld-service-runbook.md) §14 for recovery.
+
 ### `palwarden-webui`
 `/usr/local/sbin/palwarden-webui {--serve|--init-credentials}`
 
-Serves the web UI and a read-only JSON API on `127.0.0.1:8088`. **Every path
-requires HTTP Basic auth**, including the vendored editors, using credentials in
-`/etc/palworld/webui.env` (`--init-credentials` generates them once, as root;
-`install.sh` and the container entrypoint call it for you).
+Serves the web UI and the JSON API on `127.0.0.1:8088`. **Every path requires
+HTTP Basic auth**, including the vendored editor, using credentials in
+`/etc/palworld/webui.env` (`--init-credentials` generates them once, as root, and
+never overwrites an existing file; `install.sh` and the container entrypoint call
+it for you). With no arguments it prints help and exits — the service uses
+`--serve`.
 
-Read endpoints: `/api/health`, `/api/fps`, `/api/events`, `/api/service-events`,
-`/api/engine`, `/api/config` (passwords redacted), `/api/backups`,
-`/api/snapshots`. Mutating endpoints answer `501` until the job worker lands.
+Read endpoints (Basic auth is enough): `/api/health`, `/api/fps`, `/api/events`,
+`/api/service-events`, `/api/engine`, `/api/config` (passwords redacted),
+`/api/backups`, `/api/snapshots`, `/api/jobs`, `/api/jobs/<id>`. A failing tool
+answers `200` with `{"ok": false, "error": ...}` rather than a `500`, so one
+broken tool cannot blank the dashboard.
+
+Mutating: `POST /api/jobs` with `{"action": ..., "params": {...}}` → `202
+{"id": ...}`. It validates the request and writes a job file; **it never executes
+anything**. On top of Basic auth a mutation needs the `WEBUI_TOKEN` value in the
+**`X-Palwarden-Token`** header (not `Authorization: Bearer` — Basic already
+occupies that header) and a loopback `Origin`/`Sec-Fetch-Site`. Disruptive
+actions additionally need `"confirm": true` in the body. Status codes: `401`
+bad/missing Basic · `403` missing/bad token or refused Origin · `400` validation
+failure · `409` a disruptive job is already queued or running (the body carries
+`blocked_by` with its `id`/`action`/`state`) · `500` internal.
+
+```bash
+curl -sS -u admin:"$WEBUI_PASSWORD" -H "X-Palwarden-Token: $WEBUI_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"backup"}' http://127.0.0.1:8088/api/jobs
+```
 
 Runs unprivileged and refuses to start as root. Basic auth over plain HTTP is
 safe here only because the listener is loopback-bound; reach it through an SSH
 tunnel (`ssh -L 8088:127.0.0.1:8088 <host>`), never expose it directly.
+
+> **Not a boundary:** the editors preload the live config over
+> `GET /current/PalWorldSettings.ini`, so anyone who can log into the UI can read
+> `AdminPassword` in cleartext. `/api/config` redacts it, but that is
+> defence-in-depth for diffs, logs and screenshots only.
+
+### `palwarden-jobd`
+`/usr/local/sbin/palwarden-jobd [--once|--reap]`
+
+The root worker. Polls `/var/lib/palworld/jobs` (default; `PALWARDEN_JOBS_DIR`),
+claims the oldest `queued` job, **re-validates its action and every parameter
+against a hardcoded allowlist**, and runs a fixed argv template — nothing is ever
+passed to a shell. The queue is written by the unprivileged web UI and therefore
+treated as untrusted input; an unrecognised action, an unknown parameter name or
+an out-of-range value fails the job with the reason recorded on it.
+
+| Mode | Does |
+|------|------|
+| *(default)* | Reap orphans, then poll forever (`PALWARDEN_JOBD_INTERVAL`, default 2s), pruning finished jobs after 7 days. This is what the service runs. |
+| `--reap` | Mark every job left `running` by a crashed worker as `failed`, then exit. |
+| `--once` | Reap, run at most one queued job, prune, exit. |
+
+All three modes take the **same exclusive `flock` on
+`/run/palwarden-jobd.lock`** and hold it for the life of the process, so only one
+worker can ever run: `--once`/`--reap` by hand while the service is up exits `1`
+with `another palwarden-jobd holds ...` instead of racing it or failing a job the
+live worker legitimately owns. Must run as root (it cannot even open the lock
+otherwise).
+
+Actions: `config_apply`, `engine_apply`, `config_pretty`, `snapshot_create`,
+`backup`, `mark`, `engine_save` (file-only) and `graceful_restart`,
+`graceful_stop`, `update_check`, `update_apply`, `engine_rollback`, `api_save`,
+`engine_save_apply_restart` (disruptive, `confirm: true` required). Composite
+actions stop at the first failure — a failed save or apply never reaches the
+restart. Output is captured combined and capped.
+
+Platform wiring: `palwarden-jobd.service` on bare metal, the `jobd` s6 service in
+the container (both run it as root; see
+[`../docker/README.md`](../docker/README.md)).
 
 ---
 
@@ -288,7 +358,7 @@ Installed to `/etc/systemd/system`. Enable only what you need.
 | Unit | Type | Schedule | Runs |
 |------|------|----------|------|
 | `palworld.service` | service | — | The dedicated server (`PalServer.sh`). |
-| `palworld-config-webui.service` | service | — | Local-only static config editor on `127.0.0.1:8088` (hardened: `ProtectSystem=strict`, etc.). |
+| `palworld-config-webui.service` | service | — | `palwarden-webui --serve` on `127.0.0.1:8088`: the dashboard, the config editors and the JSON API, unprivileged (hardened: `ProtectSystem=strict`, etc.). |
 | `palwarden-jobd.service` | service | — | Root worker that executes the jobs the web UI queues. Lightly sandboxed — `ProtectSystem=true` only, since it must keep writing `/etc/palworld`, the game config under `/opt/palworld` and `/var/lib/palworld`; enable it alongside `palworld-config-webui.service` or queued jobs never run. |
 | `palworld-fps-sample.timer` | timer | every 15s (after boot+1m) | `palworld-fps sample --retention-days 7` under a lock. |
 | `palworld-fps-daily-report.timer` | timer | 09:00 daily | `palworld-health-report discord --window 24h`. |

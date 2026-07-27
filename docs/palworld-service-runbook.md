@@ -572,6 +572,110 @@ backup helper/timers beyond the core note
 
 Those are operational tooling around the service, not the core Palworld service itself.
 
+## 14. Recovering the web UI control plane
+
+The one exception to section 13: this is a recovery procedure, and it is needed at
+a bad moment. Reference for the commands themselves is in
+[`tools.md`](tools.md#web-ui-control-plane); the privilege split is in
+[`architecture.md`](architecture.md).
+
+The control plane is two units. `palworld-config-webui.service` runs
+`palwarden-webui --serve` unprivileged and can only *queue* jobs;
+`palwarden-jobd.service` runs as root and executes them. If either is down the UI
+looks healthy and nothing happens.
+
+Status and logs:
+
+```bash
+systemctl status palworld-config-webui.service palwarden-jobd.service --no-pager -l
+journalctl -u palwarden-jobd.service -n 100 --no-pager
+systemctl restart palwarden-jobd.service
+```
+
+In the container, the same two are s6 services (`config-webui`, `jobd`):
+
+```bash
+docker compose exec palwarden s6-svstat /run/service/jobd
+docker compose exec palwarden s6-svc -r /run/service/jobd
+docker compose logs palwarden
+```
+
+### A job the UI still shows as `running`
+
+Only a worker that died mid-job leaves a job in `running`. `palwarden-jobd` reaps
+those when it *starts*, so the normal fix is simply to restart it:
+
+```bash
+sudo systemctl restart palwarden-jobd.service
+```
+
+If the service is stopped and you want the queue cleared without starting the
+loop:
+
+```bash
+sudo palwarden-jobd --reap    # mark orphaned running jobs failed, then exit
+sudo palwarden-jobd --once    # reap, run one queued job, prune, exit
+```
+
+Both must run as root, and both take the **same exclusive lock**
+(`/run/palwarden-jobd.lock`) the service holds. So while the service is up they
+refuse rather than race:
+
+```text
+another palwarden-jobd holds /run/palwarden-jobd.lock; exiting
+```
+
+That refusal is the correct outcome — `--reap` cannot tell a live worker's job
+from a crashed one, and marking a running 20-minute `update_apply` as failed would
+be worse than doing nothing. Stop the service first if you really mean to reap by
+hand.
+
+A stuck disruptive job also blocks new ones: `POST /api/jobs` answers `409` with a
+`blocked_by` object naming the offending job's `id`, `action` and `state`. Inspect
+it with `GET /api/jobs/<id>` (or read
+`/var/lib/palworld/jobs/<id>.json`) before clearing it.
+
+### Lost or rotating web UI credentials
+
+`palwarden-webui --init-credentials` prints `WEBUI_USER`, `WEBUI_PASSWORD` and
+`WEBUI_TOKEN` **once**, at creation, and never again; it also refuses to overwrite
+an existing `/etc/palworld/webui.env`. There is no recovery — read the file, or
+replace the values:
+
+```bash
+sudo cat /etc/palworld/webui.env                 # they are stored in cleartext here
+sudo $EDITOR /etc/palworld/webui.env             # or rotate: new password/token
+sudo systemctl restart palworld-config-webui.service
+```
+
+Then **reload the browser tab**. The token lives in `sessionStorage`, so an open
+tab keeps sending the old one and every Save button answers `403`. Rotate both
+values together if you are rotating at all; the password alone still leaves a
+token an old tab can use.
+
+To regenerate from scratch, remove the file and re-run
+`palwarden-webui --init-credentials` as root, then restore its ownership and mode
+(`root:<service group>`, `0640`) as `install.sh` does. In the container, set
+`WEBUI_USER`/`WEBUI_PASSWORD`/`WEBUI_TOKEN` in `.env` and recreate the container —
+`/etc/palworld` is not a volume, so unset values are regenerated on every
+recreate.
+
+### Every button returns 403 / no job is ever queued
+
+Three usual causes, in order of likelihood:
+
+```text
+missing or invalid X-Palwarden-Token   -> WEBUI_TOKEN changed, or a stale tab; reload
+cross-origin request refused           -> the UI was reached on a non-loopback address
+job queue directory ... not writable   -> /var/lib/palworld/jobs is not owned by the
+                                          web UI's service account (it must be, 0700)
+```
+
+The queue directory being owned by the service account rather than root is
+deliberate: the unprivileged server is the process that writes job files. The
+writability check runs once at startup, so fix the ownership *and* restart
+`palworld-config-webui.service`.
+
 ## Short version
 
 The core service is simply:

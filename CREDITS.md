@@ -26,10 +26,21 @@ is passed off as ours.
 - **License:** **MIT** — retained verbatim at
   [`webui/LICENSE.upstream-mit`](webui/LICENSE.upstream-mit)
   (© 2025 Palworld Dedicated Server Config Creator Contributors).
-- **How we use it:** `webui/PalWorldSettingsEditor.html` (and the companion
-  Engine.ini editor) are the basis for our in-browser config editors. MIT permits
-  us to adapt them freely and combine them into this AGPL project; we keep their
-  copyright + permission notice for the parts derived from their work.
+- **How we use it:** `webui/PalWorldSettingsEditor.html` is the vendored upstream
+  editor and the only genuinely third-party file under `webui/`. It is kept
+  byte-identical so upstream syncs stay trivial and the attribution stays clean.
+  MIT permits us to adapt it freely and combine it into this AGPL project; we keep
+  their copyright + permission notice for the parts derived from their work.
+- **Narrowed derivation:** `webui/EngineIniPerformanceEditor.html` was once
+  described here as a companion to that editor. It is **first-party, AGPL-3.0**,
+  and carries our SPDX header: the curated Engine.ini levers, the `engine.env`
+  generation, and the control-plane integration (`palworld-engine-config`,
+  `current/Engine.ini`, the Save / Save-and-apply jobs) have no upstream
+  counterpart. What *is* derived from the MIT upstream is the page shell and the
+  enable-checkbox-per-setting form idiom, which is why the file's header points
+  back here and `webui/LICENSE.upstream-mit` still applies to that much.
+- **Not derived:** `webui/palwarden.html` (the control-plane dashboard) is
+  first-party, AGPL-3.0, written from scratch.
 
 ## Trademark
 

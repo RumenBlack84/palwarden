@@ -89,6 +89,52 @@ Restart detection is observational on purpose: systemd's `NRestarts` resets with
 the unit and s6 keeps no counter, so sampling state + main PID is the only measure
 that means the same thing on bare metal and in the container.
 
+**8. Web UI control plane** — the same operator commands, reachable from a
+browser on `127.0.0.1:8088`, split across a privilege boundary that is a *file*,
+not a socket:
+
+```
+   browser ──Basic auth──► palworld-config-webui.service
+   (SSH tunnel)            palwarden-webui --serve   (user: palworld)
+                             · serves the dashboard + editors + GET /api/*
+                             · POST /api/jobs: validate, then write a job file
+                             ▼
+                           /var/lib/palworld/jobs/<id>.json   (0700, owned by palworld)
+                             ▼
+                           palwarden-jobd.service      (root)
+                             · re-validates action + params against its own
+                               allowlist — the queue is untrusted input
+                             · runs a fixed argv template, one job at a time
+                               under flock /run/palwarden-jobd.lock
+                             · records state, exit code and output on the job
+```
+
+The property that matters: **the process that parses HTTP has no privilege, and
+the process with privilege has no network input.** `palwarden-webui` refuses to
+start as root and can do nothing worse than write a job file. `palwarden-jobd`
+never trusts what it reads, so a bug in the HTTP handler — or a hand-edited job
+file — cannot reach anything outside the allowlist. Both halves must be enabled;
+with `jobd` down, jobs queue and never run.
+
+Authentication is Basic on every path from `/etc/palworld/webui.env`, plus
+`WEBUI_TOKEN` in `X-Palwarden-Token` and an `Origin`/`Sec-Fetch-Site` check on
+mutations, and `confirm: true` for disruptive actions. Details and the recovery
+procedures are in [`tools.md`](tools.md#web-ui-control-plane) and
+[`palworld-service-runbook.md`](palworld-service-runbook.md) §14.
+
+Two things this split deliberately does *not* do:
+
+- It does not hide the server's own secrets from a UI user. The editors preload
+  the live `PalWorldSettings.ini` via `GET /current/PalWorldSettings.ini`, so
+  anyone who can log in reads `AdminPassword` in cleartext. `/api/config` redacts
+  `AdminPassword`/`ServerPassword`, but that is defence-in-depth for diffs, logs
+  and screenshots — not a boundary. What the separate `webui.env` credentials buy
+  is the reverse direction: an in-game admin who knows `ADMIN_PASSWORD` does not
+  thereby get shell-level control of the host.
+- It does not make the queue directory root-owned. It is owned by the
+  unprivileged web user on purpose, because that user is the one writing job
+  files; root only reads and updates them. Root ownership breaks every button.
+
 ## Data / state directories
 
 | Location | Owner | Purpose |
@@ -100,13 +146,18 @@ that means the same thing on bare metal and in the container.
 | `/opt/palworld/config-snapshots` | `palworld` | Labeled config+state snapshots. |
 | `/etc/palworld` | mixed | `settings.env`, `notify.env`, `engine.env`, templates. |
 | `/var/lib/palworld` | root/palworld | `metrics.sqlite3`, `public-info.env`, `service-events.json` (last observed service state). |
+| `/var/lib/palworld/jobs` | `palworld` (0700) | Control-plane job queue: `<id>.json` per job. Written by the web UI, executed by `palwarden-jobd`. |
 | `/var/log/palworld` | palworld | `server.log`. |
 | `/run/palworld-*.lock` | — | `flock` files preventing overlapping timer runs. |
+| `/run/palwarden-jobd.lock` | root | `palwarden-jobd`'s exclusive lock — one worker, one job at a time. |
 
 ## Concurrency & safety
 
 - Timer-driven jobs that can collide with each other or with the server take a
   `flock` (`fps-sample`, `update`, `memory-watch`).
+- `palwarden-jobd` takes its lock in **every** mode — the daemon loop, `--once`
+  and `--reap` alike — so a hand-run one-shot can never race the service or
+  mistake a live job for an orphan.
 - Every config mutation writes a timestamped backup first; `engine-config` and
   `config-snapshot` add rollback paths.
 - `needrestart` is configured so unattended `apt` upgrades **report** but never

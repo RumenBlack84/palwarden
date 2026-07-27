@@ -13,14 +13,16 @@ against a real server — see [`../tests/`](../tests/) for the suites and
 ## Process model
 
 `s6-overlay` is PID 1 (as root) and supervises the services below. Workloads run
-unprivileged as `steam` (uid/gid 1000) — except the memory watchdog, which runs
-as root because restarting the server's s6 service requires it. Which services
-run is decided at start by the entrypoint from `PALWARDEN_MODE` + config:
+unprivileged as `steam` (uid/gid 1000) — except the memory watchdog, the update
+checker and the job worker, which run as root because cycling the server's s6
+service requires it. Which services run is decided at start by the entrypoint
+from `PALWARDEN_MODE` + config:
 
 | Service | embedded | external | Runs as | Needs |
 |---------|:---:|:---:|:---:|-------|
 | `palworld-server` | ✅ | — | steam | game volume |
 | `config-webui` | ✅ | — | steam | — |
+| `jobd` (job worker) | ✅ | — | root | — |
 | `fps-sample` (telemetry) | ✅ | ✅ | steam | `ADMIN_PASSWORD` + reachable REST API |
 | `memory-watch` (watchdog) | ✅ | — | root | — |
 | `daily-report` | ✅ | ✅ | steam | `DISCORD_WEBHOOK` |
@@ -74,6 +76,22 @@ Two related quirks worth knowing:
 An earlier version of palwarden left these files immutable (`chattr +i`). That is
 gone: it was unnecessary, needed `CAP_LINUX_IMMUTABLE` plus e2fsprogs, and an
 immutable file blocks `docker compose down -v`.
+
+### The web UI's privilege split
+
+`config-webui` parses HTTP but has no privilege; `jobd` has root but no network
+input. The web UI can only *write* a job file into `/var/lib/palworld/jobs`;
+`jobd` re-validates it against its own allowlist and runs it. Both are enabled
+together in embedded mode — with `jobd` down, queued actions simply never run.
+See [`../docs/architecture.md`](../docs/architecture.md) for the boundary and
+[`../docs/palworld-service-runbook.md`](../docs/palworld-service-runbook.md) for
+recovery.
+
+```bash
+docker compose exec palwarden s6-svstat /run/service/jobd   # state + uptime
+docker compose exec palwarden s6-svc -r /run/service/jobd   # restart it
+docker compose logs palwarden                               # its stderr lands here
+```
 
 ### Host-ism shims
 
@@ -136,7 +154,12 @@ The config web UI is published to `127.0.0.1:8088` and **requires Basic auth on 
 docker compose exec palwarden cat /etc/palworld/webui.env
 ```
 
-**Credential persistence**: `/etc/palworld` is not a volume, so credentials regenerate when the container is recreated (e.g. `docker compose up --build`). Set `WEBUI_USER` / `WEBUI_PASSWORD` in `.env` if you want stable credentials across container rebuilds.
+There are two secrets in that file. `WEBUI_PASSWORD` gets you the page;
+`WEBUI_TOKEN` is the second factor every *mutating* request must send in the
+`X-Palwarden-Token` header (the editor's Save buttons prompt for it once per
+tab). Basic auth alone is refused with `403` on mutations by design.
+
+**Credential persistence**: `/etc/palworld` is not a volume, so credentials regenerate when the container is recreated (e.g. `docker compose up --build`). Set `WEBUI_USER` / `WEBUI_PASSWORD` / `WEBUI_TOKEN` in `.env` if you want stable credentials across container rebuilds — **all three**. Pinning only the password leaves the token regenerating, which loads a working page on which every button 403s.
 
 ## Quick start — external (monitor an existing server)
 
@@ -170,13 +193,19 @@ Bind mounts work too; match host ownership to `steam` (uid/gid **1000**).
   published to `127.0.0.1` only.
 - Secrets are rendered at runtime from env; `.env`, `settings.env`, `notify.env`
   are git-ignored and never in the image.
-- Workloads run non-root (`steam`); s6 is PID 1 root only to supervise.
+- Workloads run non-root (`steam`); s6 is PID 1 root only to supervise, plus the
+  three services the table above marks root.
+- Web UI access is **not** a security boundary against reading `ADMIN_PASSWORD`:
+  the editors preload the live `PalWorldSettings.ini` over `GET /current/...`, so
+  anyone who can log into the UI can read it in cleartext. See the security note
+  in [`../docs/architecture.md`](../docs/architecture.md).
 
 ## Configuration reference
 
 `.env` (see [`.env.example`](.env.example)): `COMPOSE_PROFILES`,
 `PALWARDEN_MODE`, `UPDATE_ON_START`, `PALWORLD_GAME_PORT`, `WEBUI_PORT`,
-`ADMIN_PASSWORD`, `DISCORD_WEBHOOK`, `FPS_SAMPLE_INTERVAL`, `FPS_RETENTION_DAYS`,
+`ADMIN_PASSWORD`, `DISCORD_WEBHOOK`, `WEBUI_USER`, `WEBUI_PASSWORD`,
+`WEBUI_TOKEN`, `FPS_SAMPLE_INTERVAL`, `FPS_RETENTION_DAYS`,
 `PALWORLD_TARGET_HOST`, `PALWORLD_REST_PORT`.
 
 ## Image internals
