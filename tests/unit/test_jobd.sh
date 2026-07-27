@@ -31,12 +31,38 @@ EOF
 }
 stub_tools
 
+# Drop-privilege stubs: both spellings log the prefix they were invoked with and
+# then exec the real command, so an action that drops privilege still records its
+# own argv in the same log. `id -un` rather than steam/palworld: the suite must
+# not depend on either service account existing on the machine running it.
+DROP_USER="$(id -un)"
+cat > "$WORK/bin/sudo" <<EOF
+#!/usr/bin/env bash
+echo "sudo \$*" >> "$WORK/argv.log"
+shift 2   # drop the -u <user> pair
+exec "\$@"
+EOF
+cat > "$WORK/bin/s6-setuidgid" <<EOF
+#!/usr/bin/env bash
+echo "s6-setuidgid \$*" >> "$WORK/argv.log"
+shift     # drop <user>
+exec "\$@"
+EOF
+chmod +x "$WORK/bin/sudo" "$WORK/bin/s6-setuidgid"
+
 # ENGINE_ENV/BACKUP_DIR/LOCK all live under $WORK: the worker now takes its
 # flock in every mode, so the default /run path would fail for a non-root test.
+#
+# PALWORLD_DROP_PRIV="" by default (the ${VAR-default} escape hatch, so no
+# dropping at all): the argv assertions throughout this suite are about the
+# tool's own command line, and the dedicated drop-privilege blocks at the end
+# override it to pin the prefix explicitly.
 jobd() {
   PALWARDEN_JOBS_DIR="$WORK/jobs" PYTHONPATH="$LIB" \
   PALWARDEN_SBIN_DIR="$WORK/bin" PALWORLD_ENGINE_ENV="${ENGINE_ENV_OVERRIDE:-$WORK/etc/engine.env}" \
   PALWORLD_BACKUP_DIR="$WORK/backups" PALWARDEN_JOBD_LOCK="$WORK/jobd.lock" \
+  PALWORLD_DROP_PRIV="${DROP_PRIV_OVERRIDE-}" PALWARDEN_CONTAINER="${CONTAINER_OVERRIDE-}" \
+  PATH="$WORK/bin:$PATH" \
     python3 "$JOBD" "$@"
 }
 enqueue() {  # enqueue <action> <json-params>
@@ -426,5 +452,96 @@ print("done")
 EOF
 )"
 assert_eq "$roundtrip" "done" "every recognised param key round-trips for every action"
+
+# --- privilege dropping: exactly the file-only actions, in both branches ------
+# Root running these leaves root-owned artefacts in trees the service account
+# owns. The concrete regression is SQLite's WAL side files: palworld-fps opens the
+# metrics DB with journal_mode=WAL, so a root `mark` can leave metrics.sqlite3-wal
+# owned by root, after which EVERY unprivileged fps-sample fails permanently
+# ("attempt to write a readonly database"). Everything else in the table must
+# keep root — restarting the server, SteamCMD, writing /etc/palworld/engine.env.
+: > "$WORK/argv.log"
+id="$(enqueue mark '{"text": "dropped"}')"
+DROP_PRIV_OVERRIDE="sudo -u $DROP_USER" jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "succeeded" "mark succeeds with the bare-metal drop prefix"
+assert_file_contains "$WORK/argv.log" "sudo -u $DROP_USER $WORK/bin/palworld-fps mark" \
+  "bare metal drops privilege with sudo -u before the tool"
+assert_file_contains "$WORK/argv.log" "palworld-fps mark --category manual -- dropped" \
+  "the tool's own argv is unchanged by the prefix"
+
+: > "$WORK/argv.log"
+id="$(enqueue mark '{"text": "dropped"}')"
+CONTAINER_OVERRIDE=1 PALWORLD_USER="$DROP_USER" jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "succeeded" "mark succeeds with the container drop prefix"
+assert_file_contains "$WORK/argv.log" "s6-setuidgid $DROP_USER $WORK/bin/palworld-fps mark" \
+  "the container uses s6-setuidgid, because its sudo is a passthrough shim"
+assert_file_not_contains "$WORK/argv.log" "sudo" "no sudo in the container branch"
+
+# A root action keeps root in both branches.
+: > "$WORK/argv.log"
+id="$(enqueue update_check '{"confirm": true}')"
+DROP_PRIV_OVERRIDE="sudo -u $DROP_USER" jobd --once >/dev/null 2>&1
+assert_file_contains "$WORK/argv.log" "palworld-update --check" "update_check still runs"
+assert_file_not_contains "$WORK/argv.log" "sudo" "update_check is not run unprivileged"
+
+# ...and the full table, so a new action cannot quietly join or leave the set.
+# Asserts on build_commands rather than a run, which is the only way to cover
+# every action (several are disruptive and would restart a real server).
+prefixes="$(
+  PALWARDEN_JOBS_DIR="$WORK/jobs" PYTHONPATH="$LIB" PALWARDEN_SBIN_DIR="$WORK/bin" \
+  PALWORLD_ENGINE_ENV="$WORK/etc/engine.env" PALWORLD_BACKUP_DIR="$WORK/backups" \
+  PALWARDEN_JOBD_LOCK="$WORK/jobd.lock" \
+  python3 - "$JOBD" <<'EOF'
+import importlib.machinery, importlib.util, os, sys
+
+loader = importlib.machinery.SourceFileLoader("jobd_under_test", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+mod = importlib.util.module_from_spec(spec)
+sys.modules[loader.name] = mod
+loader.exec_module(mod)
+
+SAMPLES = {
+    "confirm": True, "wait": 30, "message": "maintenance", "label": "before-tuning",
+    "text": "tuned tick rate", "dry_run": True,
+    "settings": {"NET_SERVER_MAX_TICK_RATE": "60"},
+    "backup": "Engine.ini.20260710T182037Z",
+}
+# The only actions whose entire effect is writing files in service-account-owned
+# trees. Everything else needs root; adding to this list is a security decision.
+EXPECT = {"mark", "snapshot_create", "config_pretty"}
+
+def prefixes_for(env):
+    os.environ.pop("PALWARDEN_CONTAINER", None)
+    os.environ.pop("PALWORLD_DROP_PRIV", None)
+    os.environ.update(env)
+    dropped = set()
+    for action in mod.ACTIONS:
+        params, err = mod.validate_params(action, {k: SAMPLES[k] for k in mod.recognised_params(action)})
+        assert err is None, (action, err)
+        for argv in mod.build_commands(action, params):
+            if argv[:len(prefix)] == prefix:
+                dropped.add(action)
+            else:
+                assert not any(t in argv for t in ("sudo", "s6-setuidgid")), (action, argv)
+    return dropped
+
+prefix = ["s6-setuidgid", "tester"]
+got = prefixes_for({"PALWARDEN_CONTAINER": "1", "PALWORLD_USER": "tester"})
+print("container", "ok" if got == EXPECT else f"MISMATCH {sorted(got)}")
+
+prefix = ["sudo", "-u", "tester"]
+got = prefixes_for({"PALWORLD_DROP_PRIV": "sudo -u tester"})
+print("baremetal", "ok" if got == EXPECT else f"MISMATCH {sorted(got)}")
+
+# An explicit empty PALWORLD_DROP_PRIV disables dropping (${VAR-default}), rather
+# than falling back to the default the way ${VAR:-default} would.
+prefix = ["sudo", "-u", "palworld"]
+got = prefixes_for({"PALWORLD_DROP_PRIV": ""})
+print("empty-override", "ok" if got == set() else f"MISMATCH {sorted(got)}")
+EOF
+)"
+assert_eq "$prefixes" "container ok
+baremetal ok
+empty-override ok" "drop-priv applies to exactly mark/snapshot_create/config_pretty in both branches"
 
 assert_report

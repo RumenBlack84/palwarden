@@ -12,16 +12,34 @@ Type=simple
 ExecStart=/usr/local/sbin/palwarden-jobd
 Restart=on-failure
 RestartSec=5
-# No ProtectSystem=/ProtectHome= sandbox: the worker legitimately writes
-# /etc/palworld/engine.env, the game's config directory under /opt/palworld and
-# the job queue plus telemetry DB under /var/lib/palworld. A strict sandbox
-# would turn every one of those into a job that fails at the last step.
-# NoNewPrivileges is likewise omitted: palworld-update drops to the service
-# account with sudo (PALWORLD_DROP_PRIV), which needs a setuid exec.
+# Hardening is chosen against the exact set of writes this worker performs:
+# /etc/palworld/engine.env, the game's config directory under /opt/palworld, the
+# job queue plus telemetry DB under /var/lib/palworld, and its own flock at
+# /run/palwarden-jobd.lock.
+ProtectSystem=true
+ProtectKernelModules=true
+LockPersonality=true
+# ProtectSystem=true (not =strict, not =full) is the strongest setting compatible
+# with that list: it makes /usr and /boot read-only, which the worker never
+# writes, while leaving /etc, /opt, /var and /run writable. =full would make /etc
+# read-only and break engine_save; =strict would make all of the above read-only
+# and turn every action into a job that fails at its last step.
+# ProtectKernelModules and LockPersonality cost nothing here: nothing in the job
+# chain loads a kernel module or calls personality(2) — SteamCMD's 32-bit binaries
+# are executed directly, not via a linux32 personality wrapper.
+#
+# Deliberately still absent:
+#  * ProtectHome= — SteamCMD (update_apply) writes the service account's
+#    ~/.steam, and PALWORLD_DROP_PRIV runs it from this unit's process tree.
+#  * NoNewPrivileges= — palworld-update drops to the service account with sudo
+#    (PALWORLD_DROP_PRIV), as does jobd itself for the unprivileged actions
+#    (mark, snapshot_create, config_pretty). Both need a setuid exec.
+#  * PrivateTmp=/PrivateDevices=/ProtectKernelTunables= — untested against the
+#    full job chain (game restarts, SteamCMD); not added on speculation.
 #
 # The worker serialises itself with an exclusive flock on
-# /run/palwarden-jobd.lock, which it creates itself; with /run writable (no
-# sandbox above) nothing else is required for that.
+# /run/palwarden-jobd.lock, which it creates itself; /run stays writable under
+# ProtectSystem=true, so no RuntimeDirectory= is required for that.
 
 [Install]
 WantedBy=multi-user.target

@@ -137,6 +137,12 @@ assert_eq "$out" "ok" "invalid-UTF-8 job file is ignored, not fatal"
 # answers "unknown job" for work it queued itself. Cannot be tested by actually
 # changing uid unprivileged, so assert the syscall happens with the *existing*
 # owner (the same result root gets).
+#
+# Read this as a DELETION TRIPWIRE, not a behavioural test: it proves the call is
+# made, not that it is made with the right uid. Running unprivileged, the only
+# uid available is our own, so a _preserve_owner that chowned to the *wrong* uid
+# would pass here too. The observable properties live in the symlink/FIFO blocks
+# below, which is where the actual security behaviour is pinned down.
 reset
 out="$(py '
 import os
@@ -152,5 +158,149 @@ assert calls == [(st.st_uid, st.st_gid)], (calls, st.st_uid, st.st_gid)
 assert j.read_job(job["id"])["state"] == "running"
 print("ok")')"
 assert_eq "$out" "ok" "update preserves the job file's owner"
+
+# --- the queue directory is hostile: root must not be redirected out of it ----
+# The unprivileged web user OWNS this directory, so it can plant a symlink, a
+# hardlink or a FIFO at any name the root worker is about to touch. Each block
+# below was a live local-root escalation before the O_EXCL/O_NOFOLLOW guards.
+
+# 1. a symlink at the temp name must not redirect root's write.
+# The temp name now carries a random suffix, so an attacker cannot *find* it —
+# but the security property is the O_CREAT|O_EXCL|O_NOFOLLOW open, not the
+# unguessable name. Pin the random part so the collision is reproducible and the
+# kernel's refusal is what we observe.
+reset
+out="$(py '
+import os, secrets, pathlib
+import palwarden_jobs as j
+real = secrets.token_hex
+secrets.token_hex = lambda n: "deadbeef" if n == 4 else real(n)
+victim = j.JOBS_DIR.parent / "victim"
+victim.parent.mkdir(parents=True, exist_ok=True)
+victim.write_text("SECRET")
+job = j.create_job("backup", {})
+path = j.job_path(job["id"])
+tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.deadbeef")
+os.symlink(victim, tmp)
+try:
+    j.update_job(job["id"], state="running")
+    print("FOLLOWED")
+except OSError as exc:
+    print("refused" if victim.read_text() == "SECRET" else "CLOBBERED")
+' 2>&1)"
+assert_eq "$out" "refused" "a symlink at the temp name is refused, not followed"
+
+# 2. a symlink at <id>.json must not get its TARGET chowned.
+# _preserve_owner used a following os.stat, so root read the uid off the target
+# and then fchowned that inode: "enqueue any job, get /etc/shadow chowned to me".
+# Observable without changing uid because the fix skips the syscall entirely.
+reset
+out="$(py '
+import os
+import palwarden_jobs as j
+job = j.create_job("backup", {})
+path = j.job_path(job["id"])
+target = j.JOBS_DIR.parent / "target"
+target.write_text("{}")
+path.unlink()
+os.symlink(target, path)
+calls = []
+real = os.fchown
+os.fchown = lambda fd, uid, gid: calls.append((uid, gid)) or real(fd, uid, gid)
+fd = os.open(target, os.O_RDONLY)
+try:
+    j._preserve_owner(fd, path)
+finally:
+    os.close(fd)
+print("no-chown" if calls == [] else "CHOWNED %r" % (calls,))')"
+assert_eq "$out" "no-chown" "_preserve_owner does not chown a symlink's target"
+
+# 3. the read path refuses a job file that is not a regular file.
+# Without O_NOFOLLOW root read_text()s whatever the link points at and treats it
+# as a job; without O_NONBLOCK+S_ISREG a FIFO blocks the read forever, which
+# stalls the worker's entire poll loop (not a disclosure, a permanent stop).
+reset
+out="$(py '
+import os, json
+import palwarden_jobs as j
+job = j.create_job("backup", {})
+path = j.job_path(job["id"])
+decoy = j.JOBS_DIR.parent / "decoy.json"
+decoy.write_text(json.dumps(dict(j.read_job(job["id"]), action="graceful_stop")))
+path.unlink(); os.symlink(decoy, path)
+assert j.read_job(job["id"]) is None, "read followed the symlink"
+assert j.list_jobs() == [], j.list_jobs()
+assert j.has_pending() is False
+print("ok")')"
+assert_eq "$out" "ok" "a symlinked job file reads as absent, not as its target"
+
+reset
+# The FIFO check runs under a hard timeout: the pre-fix failure mode is a HANG
+# (the worker's poll loop never returns), which without an alarm would stall the
+# whole suite instead of failing it.
+out="$(py '
+import os, signal
+import palwarden_jobs as j
+job = j.create_job("backup", {})
+path = j.job_path(job["id"])
+path.unlink(); os.mkfifo(path)
+signal.alarm(5)
+print("refused" if j.read_job(job["id"]) is None else "PARSED")
+signal.alarm(0)' 2>&1)"
+assert_eq "$out" "refused" "a FIFO job file is refused without blocking"
+
+# ...and the S_ISREG check specifically, on the primitive rather than through
+# read_job. read_job maps every refusal to None, so it cannot distinguish "we
+# refused this on sight" from "the read happened to fail anyway" — a FIFO with no
+# writer yields EAGAIN and a directory yields EISDIR, so dropping the check would
+# leave read_job returning None either way and the assertion above green. What
+# must not happen is root getting as far as *reading* a non-regular file it was
+# handed (a FIFO with a writer attached feeds it whatever job it likes), so assert
+# on the refusal itself.
+reset
+out="$(py '
+import os
+import palwarden_jobs as j
+job = j.create_job("backup", {})
+path = j.job_path(job["id"])
+results = []
+for kind, make in (("fifo", os.mkfifo), ("dir", os.mkdir)):
+    p = path.with_name(f"{kind}{path.name}")
+    make(p)
+    try:
+        j._read_job_text(p)
+        results.append(f"{kind}:READ")
+    except ValueError as exc:
+        results.append(f"{kind}:refused" if "regular file" in str(exc) else f"{kind}:{exc}")
+    except OSError as exc:
+        results.append(f"{kind}:oserror-{exc.errno}")
+print(" ".join(results))')"
+assert_eq "$out" "fifo:refused dir:refused" "the read primitive refuses non-regular files on sight"
+
+# 4. an owner outside the allowed set is refused on both paths.
+# The real scenario needs three accounts (the web user chmods the queue 0777, a
+# third account drops a file in, or hardlinks one owned by someone else) and root
+# to observe it, so neither is available in an unprivileged suite. What IS
+# testable — and what the previous version got wrong by not having it at all — is
+# that the validation is *wired into both paths*: stub the allowed set to one that
+# excludes our own uid and both the read and the chown must decline.
+reset
+out="$(py '
+import os
+import palwarden_jobs as j
+job = j.create_job("backup", {})
+path = j.job_path(job["id"])
+j._allowed_owner_uids = lambda: {31337}
+calls = []
+real = os.fchown
+os.fchown = lambda fd, uid, gid: calls.append((uid, gid)) or real(fd, uid, gid)
+assert j.read_job(job["id"]) is None, "read accepted a disallowed owner"
+fd = os.open(path, os.O_RDONLY)
+try:
+    j._preserve_owner(fd, path)
+finally:
+    os.close(fd)
+print("refused" if calls == [] else "CHOWNED %r" % (calls,))' 2>/dev/null)"
+assert_eq "$out" "refused" "a job file owned by neither root nor the queue owner is refused"
 
 assert_report

@@ -102,6 +102,12 @@ COPY docker/s6-rc.d/ /etc/s6-overlay/s6-rc.d/
 # Make our scripts executable, and pre-create the server/save/state trees owned
 # by `steam` so freshly-mounted named volumes inherit the right ownership (see
 # runbook §11 — we never recursively chown a mounted volume at runtime).
+# Both name prefixes are globbed: `palworld-*` alone missed `palwarden-jobd`,
+# whose executable bit then depended entirely on the git mode of the copied file.
+# config-snapshots must exist owned by steam for the same reason config-backups
+# does: jobd runs snapshot_create as steam (see drop_priv_prefix), so a directory
+# root created on first use would be unwritable for every snapshot after it —
+# and bare metal already gets this from install.sh.
 RUN chmod +x \
         /usr/local/bin/palwarden-entrypoint \
         /usr/local/bin/palwarden-run-periodic \
@@ -118,11 +124,13 @@ RUN chmod +x \
         /etc/s6-overlay/s6-rc.d/public-info-watch/run \
         /etc/s6-overlay/s6-rc.d/service-events/run \
         /etc/s6-overlay/s6-rc.d/jobd/run \
-    && (chmod +x /usr/local/sbin/palworld-* /usr/local/bin/palworld-config-parser 2>/dev/null || true) \
+    && (chmod +x /usr/local/sbin/palworld-* /usr/local/sbin/palwarden-* \
+        /usr/local/bin/palworld-config-parser 2>/dev/null || true) \
     && install -d -o steam -g steam \
         /opt/palworld/server/Pal/Saved/Config/LinuxServer \
         /opt/palworld/tools \
         /opt/palworld/config-backups \
+        /opt/palworld/config-snapshots \
         /var/lib/palworld \
         /var/log/palworld
 

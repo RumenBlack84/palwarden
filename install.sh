@@ -111,6 +111,12 @@ if getent passwd "$SVC_USER" >/dev/null 2>&1; then
   owner_args=(-o "$SVC_USER" -g "$SVC_GROUP")
 else
   echo "    note: user '$SVC_USER' not found; runtime dirs left root-owned. Create it and chown as needed."
+  # Not merely inconvenient for one of them: /var/lib/palworld/jobs is 0700 and
+  # the web UI runs as $SVC_USER, so root ownership means it cannot create a
+  # single job file — every button in the UI fails with no way to retry.
+  echo "          in particular /var/lib/palworld/jobs must be owned by '$SVC_USER':"
+  echo "          it is 0700 and the web UI writes jobs into it, so while it is"
+  echo "          root-owned the UI cannot queue ANY action (every request fails)."
 fi
 for d in /var/lib/palworld /var/log/palworld \
          /opt/palworld/backups /opt/palworld/config-backups /opt/palworld/config-snapshots; do
