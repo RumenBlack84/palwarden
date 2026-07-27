@@ -428,8 +428,21 @@ Add `--restore` to `sbin/palworld-restore`, stopping at the first failure:
 
    So: `open_archive_fd` the named archive, copy it through that descriptor into a
    scratch file under a **root-owned, root-only** directory (`PALWARDEN_RESTORE_SCRATCH`,
-   default `/var/lib/palworld/restore-scratch`, mode 0700 root-owned — created by
-   the installer and entrypoint in Task 8), then validate and extract **only** from
+   default **`/opt/palworld/restore-scratch`**, mode 0700 root-owned — created by
+   the installer and entrypoint in Task 8).
+
+   **The parent matters as much as the directory.** `/var/lib/palworld` is created
+   `0755` owned by the *service account* on both platforms, so a scratch directory
+   under it is inside a tree the untrusted web process can write: it could
+   pre-create the scratch dir itself (`mkdir(exist_ok=True)` succeeds, and `fchmod`
+   does not change ownership), or `rename` root's directory aside and substitute its
+   own at any moment. `/opt/palworld` is the root-owned parent already used for
+   `backups` and `config-snapshots` for exactly this reason. Additionally the tool
+   must **verify** the directory it opened: `fstat` the descriptor and refuse unless
+   `st_uid == 0` and no group/other bits are set, with its own message so the check
+   is mutation-visible. Keep that descriptor open for the whole restore and reach
+   the scratch copy via `dir_fd=` for both validation and extraction, so the
+   validate→extract window is closed even in a hostile directory, then validate and extract **only** from
    the scratch copy, and delete it when done (including on failure).
 
    Also settle ownership here, as one decision rather than two: whether
@@ -550,9 +563,9 @@ rewriting units."
 - [ ] **Step 1: Write the failing test**
 
 Extend `tests/unit/test_jobd.sh` asserting:
-- `backup_import` with a valid `staged` runs `palworld-restore --import -- <name>`; the argv is exact.
-- `backup_restore` requires `confirm: true` (refused without), and with it runs `palworld-restore --restore -- <name>`; `wait` forwards as `--wait` when present and the flag is **absent** when omitted.
-- `backup_delete` requires `confirm: true` and runs `palworld-backups --delete -- <name>`.
+- `backup_import` with a valid `staged` runs `palworld-restore --import <name>`; the argv is exact. **Note:** `--import -- <name>` does **not** parse — argparse rejects it with `expected one argument`. An option that takes a value cannot be separated from it by `--`. Use `--import <name>` (or `--import=<name>`). The `--` terminator convention this repo uses elsewhere applies to *positional* arguments, not to option values.
+- `backup_restore` requires `confirm: true` (refused without), and with it runs `palworld-restore --restore <name>` (**not** `--restore -- <name>`, which does not parse); `wait` forwards as `--wait` when present and the flag is **absent** when omitted.
+- `backup_delete` requires `confirm: true` and runs `palworld-backups --delete <name>` (same reasoning: `--` cannot separate an option from its value).
 - Hostile values for `staged`/`backup` (separators, traversal, a name off-pattern, a shell metacharacter) are refused and **never reach argv** — assert the argv log is empty.
 - `backup_schedule_save` writes the four keys; an unknown key is refused **by name**; each key is refused outside its range; the file is re-read to confirm it parses.
 - **`validate_backup` still works for `engine_rollback`** — the new save-archive validator did not overload it. Assert both an `Engine.ini.<stamp>` name accepted for `engine_rollback` and a `palworld-save-*` name refused for it.
@@ -722,8 +735,8 @@ RUN_INTEGRATION=1 bash tests/integration/test_docker.sh
 
 - Timer + unit, root, `Restart=on-failure`, no sandbox directive that blocks writes to `/opt/palworld/backups`, `/var/lib/palworld` or the game tree. Match `palwarden-jobd.service`'s hardening choices and its comment style. Read the sibling units first; note they use `network-online.target`.
 - s6 `longrun` as root via `palwarden-run-periodic "${BACKUP_TICK_SECONDS:-900}" backup-auto palworld-backups --if-due --prune`, `timeout-kill` consistent with siblings. **Commit the `run` script mode 755** — a sibling shipped 644 and depended entirely on the Dockerfile's `chmod`.
-- Entrypoint: create `/var/lib/palworld/uploads` (web user, 0700) as a **mount-point child only**, never a recursive chown of a volume; render `/etc/palworld/backup.env` from `BACKUP_*` env if absent; `enable_service backup-auto`. Note the existing limitation that `config-webui`/`jobd` are embedded-only and follow whatever pattern is already there.
-- `install.sh`: create the staging dir service-account-owned 0700 and the schedule file; add both new units to what it installs; extend the existing `try-restart` block.
+- Entrypoint: create `/var/lib/palworld/uploads` (web user, 0700) **and `/opt/palworld/restore-scratch` (root:root, 0700)** as **mount-point children only**, never a recursive chown of a volume. The scratch directory must be root-owned *and* have a root-owned parent — see Task 3 step 0; render `/etc/palworld/backup.env` from `BACKUP_*` env if absent; `enable_service backup-auto`. Note the existing limitation that `config-webui`/`jobd` are embedded-only and follow whatever pattern is already there.
+- `install.sh`: create the staging dir service-account-owned 0700, the scratch dir root:root 0700 under `/opt/palworld`, and the schedule file; add both new units to what it installs; extend the existing `try-restart` block.
 - Dockerfile: add the new `run` to the explicit `chmod +x` list; add the staging dir to `install -d`.
 - Docs: `docs/tools.md` entries for both new tools and the three endpoints; the panel and its privilege split in `architecture.md`; runbook procedures for **recovering from a failed restore** (where the replaced tree and safety archive are) and for schedule/retention; README orientation.
 
