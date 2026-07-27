@@ -261,6 +261,17 @@ def read_job(job_id: str) -> dict | None:
     except. It also covers _read_job_text's security refusals: a planted symlink
     or FIFO is "not a job" rather than an error every caller must handle, so a
     hostile entry cannot fail a state update it has no business being part of.
+
+    The id inside the file must match the name it was read from. Every writer
+    re-derives the path from `job["id"]` (see _write), so a file called
+    `aaaa….json` that contains `"id": "bbbb…"` is not a job at `aaaa…` — it is a
+    redirection. Returning it anyway wedged the whole queue: claim_next picked it
+    up from list_jobs and then raised KeyError from update_job (the file at
+    `bbbb….json` does not exist), and poll_once calls claim_next *outside* its own
+    try, so the KeyError escaped to main's loop guard — a traceback every
+    PALWARDEN_JOBD_INTERVAL seconds, forever, with no other job ever draining. If
+    `bbbb…` does exist, the same action re-runs indefinitely instead. Refusing it
+    here also stops GET /api/jobs listing ids that GET /api/jobs/<id> then 404s.
     """
     try:
         path = job_path(job_id)
@@ -270,7 +281,11 @@ def read_job(job_id: str) -> dict | None:
         data = json.loads(_read_job_text(path))
     except (OSError, ValueError):
         return None
-    return data if isinstance(data, dict) else None
+    if not isinstance(data, dict):
+        return None
+    if data.get("id") != job_id:
+        return None
+    return data
 
 
 def list_jobs(limit: int = 50) -> list[dict]:

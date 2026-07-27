@@ -6,12 +6,40 @@ source /usr/local/lib/palworld-notify 2>/dev/null || true
 # Notifications are optional: no-op when the helper isn't installed, rather than
 # aborting on "command not found".
 declare -F palworld_notify >/dev/null || palworld_notify() { :; }
+
+# The service account is read from the environment with bare-metal-preserving
+# defaults, like every other script here. Both names were hardcoded to
+# "palworld", which does not exist in the container (the account there is
+# `steam`): install's owner flag then failed with "invalid user 'palworld'" before
+# tar ever ran, so jobd's `backup` action could never succeed there. Same bug the
+# branch already fixed in palworld-config-snapshot.
+PALWORLD_USER="${PALWORLD_USER-palworld}"
+PALWORLD_GROUP="${PALWORLD_GROUP-palworld}"
+# Overridable so the unit tests can exercise this without touching /opt.
+# PALWARDEN_SAVE_BACKUP_DIR is deliberately the *same* variable palwarden-webui
+# reads for /api/backups (PALWORLD_BACKUP_DIR already means *config* backups
+# elsewhere in this repo), so one override moves the writer and the lister together.
+BACKUP_DIR="${PALWARDEN_SAVE_BACKUP_DIR-/opt/palworld/backups}"
+SAVED_DIR="${PALWORLD_SAVED_DIR-${PALWORLD_INSTALL_DIR:-/opt/palworld/server}/Pal/Saved}"
+
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
-dest=/opt/palworld/backups/palworld-save-${stamp}.tar.gz
+dest="${BACKUP_DIR}/palworld-save-${stamp}.tar.gz"
 palworld_notify start "backup started."
-if install -d -o palworld -g palworld -m 0755 /opt/palworld/backups \
-  && tar -C /opt/palworld/server/Pal/Saved -czf "$dest" SaveGames Config 2>/dev/null; then
-  chown palworld:palworld "$dest"
+# root-owned 0755, NOT handed to the service account: this script runs as root
+# (jobd's `backup` action, or a timer) and writes a path derived from the current
+# UTC second — entirely predictable. If a less-privileged account owned this
+# directory it could plant a symlink at that name and have root's tar, and the
+# chown below, follow it out of the tree. Only root writes backups; the web UI
+# only lists them, which 0755 allows. See sbin/palworld-config-snapshot's note.
+if install -d -m 0755 "$BACKUP_DIR" \
+  && tar -C "$SAVED_DIR" -czf "$dest" SaveGames Config 2>/dev/null; then
+  # Inside a root-owned directory nothing can substitute this name, so handing the
+  # archive itself to the service account is safe — it lets the operator manage
+  # and rotate backups without sudo. Never fatal: a backup owned by root still
+  # beats no backup, but an unresolvable account must not be silent either (the
+  # lesson of palworld-config-snapshot's swallowed LookupError).
+  chown "$PALWORLD_USER:$PALWORLD_GROUP" "$dest" \
+    || echo "Warning: cannot set owner $PALWORLD_USER:$PALWORLD_GROUP on $dest; leaving it as is" >&2
   size=$(du -h "$dest" | cut -f1)
   palworld_notify success "backup completed: \`$(basename "$dest")\` (${size})."
   echo "$dest"

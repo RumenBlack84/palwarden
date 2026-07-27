@@ -104,11 +104,18 @@ COPY docker/s6-rc.d/ /etc/s6-overlay/s6-rc.d/
 # runbook §11 — we never recursively chown a mounted volume at runtime).
 # Both name prefixes are globbed: `palworld-*` alone missed `palwarden-jobd`,
 # whose executable bit then depended entirely on the git mode of the copied file.
-# config-snapshots must exist owned by steam for the same reason config-backups
-# does: the web UI lists and prunes snapshots unprivileged, and the tool hands
-# each finished snapshot to PALWORLD_USER itself, so a directory root created on
-# first use would leave the tree unreachable from that side. This also just makes
-# the image match bare metal, where install.sh already creates it steam-owned.
+# Two ownership groups, on purpose (install.sh makes the same split):
+#   * steam-owned — trees an unprivileged process must write: the game's config
+#     dir, the web root, and config-backups (palworld-engine-config's rollback
+#     sources, which the web UI is expected to be able to manage).
+#   * root-owned — config-snapshots and backups. Only root ever writes those
+#     (jobd's snapshot_create/backup actions, or a hand-run command); the web UI
+#     only *lists* them, which 0755 already allows, and nothing prunes them. They
+#     were steam-owned, which let a less-privileged process rename a directory
+#     root had just created and redirect root's writes and chowns through a
+#     symlink — see the note in sbin/palworld-config-snapshot.
+# backups was missing from this list entirely, so /api/backups was permanently
+# empty in the container until the first backup ran.
 RUN chmod +x \
         /usr/local/bin/palwarden-entrypoint \
         /usr/local/bin/palwarden-run-periodic \
@@ -131,9 +138,11 @@ RUN chmod +x \
         /opt/palworld/server/Pal/Saved/Config/LinuxServer \
         /opt/palworld/tools \
         /opt/palworld/config-backups \
-        /opt/palworld/config-snapshots \
         /var/lib/palworld \
-        /var/log/palworld
+        /var/log/palworld \
+    && install -d -o root -g root -m 0755 \
+        /opt/palworld/config-snapshots \
+        /opt/palworld/backups
 
 WORKDIR /opt/palworld/server
 

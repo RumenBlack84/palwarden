@@ -130,6 +130,46 @@ assert j.has_pending() is False
 print("ok")')"
 assert_eq "$out" "ok" "invalid-UTF-8 job file is ignored, not fatal"
 
+# --- a job file whose `id` disagrees with its filename is not a job ---------
+# Third corruption mode, and the nastiest: the file parses fine, so read_job
+# returned it — but every writer re-derives the path from job["id"] (see _write),
+# so update_job then wrote to a *different* name. claim_next picked such a file out
+# of list_jobs and raised KeyError from update_job, which wedged the queue: nothing
+# else ever drained. It also made GET /api/jobs list ids that GET /api/jobs/<id>
+# would 404. Refused at the read, so all four consequences go at once.
+reset
+out="$(py '
+import json
+import palwarden_jobs as j
+job = j.create_job("backup", {})
+path = j.job_path(job["id"])
+other = "b" * 32
+path.write_text(json.dumps(dict(job, id=other)))
+assert j.read_job(job["id"]) is None, "read_job accepted a mismatched id"
+assert j.list_jobs() == [], j.list_jobs()
+assert j.has_pending() is False
+# The consequence that actually mattered: claim_next must not raise on it.
+assert j.claim_next() is None
+print("ok")')"
+assert_eq "$out" "ok" "a job file whose id disagrees with its filename is refused, and claim_next does not raise"
+
+# ...and the mismatch must not block the jobs behind it. This is the wedge: the
+# bad file sorted into the same list as good ones, and the raise happened before
+# any of them ran.
+reset
+out="$(py '
+import json, time
+import palwarden_jobs as j
+bad = j.create_job("backup", {})
+j.job_path(bad["id"]).write_text(json.dumps(dict(bad, id="c" * 32)))
+time.sleep(0.01)
+good = j.create_job("config_pretty", {})
+claimed = j.claim_next()
+assert claimed is not None and claimed["id"] == good["id"], claimed
+assert claimed["state"] == "running", claimed
+print("ok")')"
+assert_eq "$out" "ok" "a mismatched job file does not stop the queue behind it from draining"
+
 # --- an update keeps the creator's ownership -------------------------------
 # The web process creates the file and must keep being able to read it; the root
 # worker rewrites the same job on every state change, and the atomic replace

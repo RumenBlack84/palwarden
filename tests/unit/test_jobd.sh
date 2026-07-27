@@ -107,6 +107,65 @@ id="$(enqueue engine_save '{"settings": {"NET_SERVER_MAX_TICK_RATE": "9999"}}')"
 jobd --once >/dev/null 2>&1
 assert_eq "$(state_of "$id")" "failed" "out-of-range tick rate rejected"
 
+# --- write_engine_env creates its temp O_EXCL|O_NOFOLLOW under a unique name ---
+# engine_save is confirm-free, and write_engine_env used a FIXED "engine.env.tmp"
+# opened without O_EXCL/O_NOFOLLOW, then chmod'd and re-read *by path*. /etc/palworld
+# is root:root 0755 so nothing can plant there today — but this was the last
+# check-then-use-by-path write in the worker, the exact pattern closed everywhere
+# else, so it is pinned rather than left to the next person to rediscover.
+#
+# Observable without root: plant a symlink at the temp name the writer would have
+# used and assert (a) that the fixed name is not what it uses at all, and (b) that
+# a link *at whatever name it does use* is refused rather than followed.
+if [ -e "$WORK/etc/engine.env.tmp" ]; then fail "a fixed-name temp file exists"; else pass; fi
+
+printf 'DO-NOT-CLOBBER\n' > "$WORK/victim-env"
+ln -sfn "$WORK/victim-env" "$WORK/etc/engine.env.tmp"
+id="$(enqueue engine_save '{"settings": {"NET_SERVER_MAX_TICK_RATE": "61"}}')"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "succeeded" "engine_save is unaffected by a link at the old fixed temp name"
+assert_file_contains "$WORK/victim-env" "DO-NOT-CLOBBER" "the pre-planted fixed-name temp was never written through"
+assert_file_contains "$WORK/etc/engine.env" "NET_SERVER_MAX_TICK_RATE=61" "and the real write still landed"
+rm -f "$WORK/etc/engine.env.tmp"
+
+# ...and the kernel refusal itself: pin the random suffix so a symlink can occupy
+# the exact name the writer is about to use, and assert it fails the job instead of
+# writing through the link. (Same shape as the temp-name block in
+# test_jobs_store.sh, which pins secrets.token_hex for the same reason.)
+printf 'DO-NOT-CLOBBER\n' > "$WORK/victim-env2"
+excl="$(
+  PALWARDEN_JOBS_DIR="$WORK/jobs" PYTHONPATH="$LIB" PALWARDEN_SBIN_DIR="$WORK/bin" \
+  PALWORLD_ENGINE_ENV="$WORK/etc/engine.env" PALWORLD_BACKUP_DIR="$WORK/backups" \
+  PALWARDEN_JOBD_LOCK="$WORK/jobd.lock" \
+  python3 - "$JOBD" "$WORK/etc/engine.env" "$WORK/victim-env2" <<'EOF'
+import importlib.machinery, importlib.util, os, secrets, sys
+from pathlib import Path
+
+loader = importlib.machinery.SourceFileLoader("jobd_under_test", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+mod = importlib.util.module_from_spec(spec)
+sys.modules[loader.name] = mod
+loader.exec_module(mod)
+
+env_path, victim = Path(sys.argv[2]), Path(sys.argv[3])
+real = secrets.token_hex
+mod_secrets = sys.modules[mod.__name__].secrets
+mod_secrets.token_hex = lambda n: "deadbeef" if n == 4 else real(n)
+tmp = env_path.with_name(f"{env_path.name}.tmp.{os.getpid()}.deadbeef")
+os.symlink(victim, tmp)
+try:
+    mod.write_engine_env({"NET_SERVER_MAX_TICK_RATE": "62"})
+    print("FOLLOWED")
+except OSError:
+    print("refused" if victim.read_text().strip() == "DO-NOT-CLOBBER" else "CLOBBERED")
+finally:
+    if tmp.is_symlink():
+        tmp.unlink()
+EOF
+)"
+assert_eq "$excl" "refused" "a symlink at the temp name it does use is refused, not followed"
+assert_file_contains "$WORK/victim-env2" "DO-NOT-CLOBBER" "the victim of that attempt is intact"
+
 # --- the composite action runs its steps in order and stops on failure ----
 : > "$WORK/argv.log"
 id="$(enqueue engine_save_apply_restart '{"settings": {"NET_SERVER_MAX_TICK_RATE": "60"}, "wait": 30, "confirm": true}')"
@@ -154,6 +213,59 @@ j.update_job(sys.argv[1], state='running')" "$id"
 jobd --reap >/dev/null 2>&1
 assert_eq "$(state_of "$id")" "failed" "orphaned running job marked failed"
 assert_contains "$(output_of "$id")" "did not finish" "explains the orphaning"
+
+# --- a job file whose id disagrees with its filename must not wedge the queue ---
+# The demonstrated wedge: claim_next raised KeyError on such a file, and poll_once
+# called claim_next *outside* its own try, so the raise escaped to main's loop —
+# a traceback every PALWARDEN_JOBD_INTERVAL seconds forever and no other job ever
+# draining. Two independent fixes, both asserted: palwarden_jobs.read_job refuses
+# the file (test_jobs_store.sh), and claim_next now sits inside poll_once's guard.
+: > "$WORK/argv.log"
+bad_id="$(enqueue backup '{}')"
+PALWARDEN_JOBS_DIR="$WORK/jobs" PYTHONPATH="$LIB" python3 -c "
+import sys, json, palwarden_jobs as j
+p = j.job_path(sys.argv[1]); d = json.loads(p.read_text())
+d['id'] = 'd' * 32              # disagrees with the file it lives in
+p.write_text(json.dumps(d))" "$bad_id"
+good_id="$(enqueue config_pretty '{}')"
+jobd --once >"$WORK/wedge.out" 2>"$WORK/wedge.err"
+rc=$?
+assert_eq "$rc" "0" "--once exits cleanly with a mismatched job file in the queue"
+assert_file_not_contains "$WORK/wedge.err" "Traceback" "no traceback escapes to the daemon"
+assert_file_not_contains "$WORK/wedge.err" "KeyError" "and specifically no KeyError from claim_next"
+assert_eq "$(state_of "$good_id")" "succeeded" "the job behind the bad file still ran"
+assert_file_contains "$WORK/argv.log" "palworld-config-pretty" "and really ran its tool"
+
+# poll_once must survive a claim_next that raises for *any* reason, not just this
+# one — the structural half of the fix. Stub claim_next to explode and assert
+# poll_once returns rather than propagating.
+survives="$(
+  PALWARDEN_JOBS_DIR="$WORK/jobs" PYTHONPATH="$LIB" PALWARDEN_SBIN_DIR="$WORK/bin" \
+  PALWORLD_ENGINE_ENV="$WORK/etc/engine.env" PALWORLD_BACKUP_DIR="$WORK/backups" \
+  PALWARDEN_JOBD_LOCK="$WORK/jobd.lock" \
+  python3 - "$JOBD" <<'EOF' 2>/dev/null
+import importlib.machinery, importlib.util, sys
+
+loader = importlib.machinery.SourceFileLoader("jobd_under_test", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+mod = importlib.util.module_from_spec(spec)
+sys.modules[loader.name] = mod
+loader.exec_module(mod)
+
+
+def boom():
+    raise KeyError("deadbeef")
+
+
+mod.jobs.claim_next = boom
+try:
+    mod.poll_once()
+    print("survived")
+except BaseException as exc:
+    print("ESCAPED %r" % (exc,))
+EOF
+)"
+assert_eq "$survives" "survived" "poll_once contains a raise from claim_next instead of ending the daemon"
 
 # The failing engine-config stub above is still installed; restore the recorders
 # before the remaining sections.

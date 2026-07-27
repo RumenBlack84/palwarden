@@ -23,6 +23,7 @@ import importlib.machinery
 import importlib.util
 import os
 import re
+import secrets
 import subprocess
 import sys
 import time
@@ -229,6 +230,22 @@ def require_confirm(params: dict) -> None:
 # command ---------------------------------------------------------------
 
 
+class _AlreadyRead:
+    """Text pretending to be a Path, for palworld-engine-config's parse_env.
+
+    parse_env(path) only ever calls `path.read_text(errors=...)`, so handing it
+    this lets write_engine_env verify through a descriptor it opened O_NOFOLLOW
+    instead of re-opening engine.env by name, while still using the *one* env
+    parser rather than a second copy of it.
+    """
+
+    def __init__(self, text: str) -> None:
+        self._text = text
+
+    def read_text(self, *_args, **_kwargs) -> str:
+        return self._text
+
+
 def write_engine_env(settings: dict[str, str]) -> None:
     """Atomically merge already-normalised settings into ENGINE_ENV.
 
@@ -261,12 +278,24 @@ def write_engine_env(settings: dict[str, str]) -> None:
         lines.append(f"{key}={value}")
     text = "\n".join(lines) + "\n"
 
-    tmp = ENGINE_ENV.with_name(ENGINE_ENV.name + ".tmp")
-    fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+    # Unguessable temp name, O_CREAT|O_EXCL|O_NOFOLLOW, and fchmod on the
+    # descriptor rather than chmod on the name — the same shape as
+    # palwarden_jobs._write and palworld-engine-config's write_new_nofollow.
+    # /etc/palworld is root:root 0755 today, so nothing can plant a link at a fixed
+    # "engine.env.tmp" and there is no live escalation here; this closes the
+    # *pattern* rather than an instance. It was the last check-then-use-by-path
+    # write left in a confirm-free action (engine_save is not disruptive), and it
+    # cost nothing to remove: a fixed name would be plantable the moment anything
+    # ever loosened /etc/palworld, and it also collided between two concurrent
+    # writers.
+    tmp = ENGINE_ENV.with_name(f"{ENGINE_ENV.name}.tmp.{os.getpid()}.{secrets.token_hex(4)}")
+    fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o644)
     try:
+        os.fchmod(fd, 0o644)  # belt-and-braces: independent of umask
         with os.fdopen(fd, "w") as fh:
             fh.write(text)
-        os.chmod(tmp, 0o644)  # belt-and-braces: independent of umask
+        # rename(2) replaces a symlink at the destination rather than writing
+        # through it, so the destination needs no separate guard.
         tmp.replace(ENGINE_ENV)
     except BaseException:
         tmp.unlink(missing_ok=True)
@@ -274,8 +303,19 @@ def write_engine_env(settings: dict[str, str]) -> None:
 
     # Confirm the file we just wrote actually parses back to what we wrote —
     # a self-check against a corrupt/truncated write, using the same reader
-    # palworld-engine-config uses (one parser, not a second copy).
-    reparsed = _engine.parse_env(ENGINE_ENV)
+    # palworld-engine-config uses (one parser, not a second copy). Read back
+    # through a descriptor we opened O_NOFOLLOW rather than by path: re-opening
+    # the name is exactly the check-then-use gap the temp write above just closed,
+    # and a symlink swapped in here would make the round-trip check validate some
+    # other file entirely (or pass while engine.env is wrong).
+    verify_fd = os.open(ENGINE_ENV, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(verify_fd, "r") as fh:  # fdopen takes ownership of the fd
+        written = fh.read()
+    # Still exactly palworld-engine-config's parse_env — one parser, not a second
+    # copy — fed the bytes we read from the descriptor. parse_env's only use of its
+    # argument is `.read_text(errors=...)`, so a one-method stand-in is enough to
+    # decouple it from re-opening the name.
+    reparsed = _engine.parse_env(_AlreadyRead(written))
     for key, value in merged.items():
         if reparsed.get(key) != value:
             raise ValueError(f"engine.env write did not round-trip for {key}")
@@ -294,13 +334,24 @@ def write_engine_env(settings: dict[str, str]) -> None:
 # robustFchown() (os_unix.c) chowns both side files to the *database's* owner when
 # it is running as root, precisely so the original owner keeps working — measured,
 # then confirmed in the source. Dropping privilege instead *created* a bare-metal
-# failure: palworld-fps-sample.service has no User=, so it creates
-# /var/lib/palworld/metrics.sqlite3 as root on first use (install.sh does not
-# pre-create it; only the container entrypoint does, which is why the container
-# looked fine), and a `mark` dropped to palworld then dies on every write with
-# "attempt to write a readonly database". Ownership of an action's *outputs* is
-# the individual tool's job, done on the descriptor it wrote — see
-# palworld-config-pretty's fchown and palworld-config-snapshot's chown_tree.
+# failure: palworld-fps-sample.service has no User=, so root created
+# /var/lib/palworld/metrics.sqlite3 on first use and a `mark` dropped to the
+# service account then died on every write with "attempt to write a readonly
+# database" (every connect() runs PRAGMA journal_mode=WAL, which is a write).
+#
+# Half of that condition is now gone: install.sh pre-creates the DB owned by the
+# service account, exactly as the container entrypoint already did, because the
+# *unprivileged* side needed it — palwarden-webui runs as $SVC_USER and its
+# /api/fps, /api/events, /api/service-events and /api/health all open the same DB.
+# A root-created DB degraded three read endpoints on every fresh bare-metal
+# install. The other half stands: palworld-fps-sample.service still has no `User=`,
+# so root remains a legitimate writer, and robustFchown is what keeps the two
+# compatible. Re-introducing drop_priv would still need that unit changed first.
+#
+# Ownership of an action's *outputs* is the individual tool's job, done on the
+# descriptor it wrote — see palworld-config-pretty's fchown. It is deliberately
+# *not* done for snapshots or save backups: those roots are root-owned precisely
+# so root never writes an attacker-nameable path (see palworld-config-snapshot).
 #
 # `params` is a whitelist, not documentation: validate_params refuses any key
 # not listed (plus `confirm`, which every disruptive action takes) and builds the
@@ -582,10 +633,19 @@ def poll_once() -> None:
     # claim_next is an unlocked read-modify-write; that is safe here only
     # because every mode of main() holds the flock, so at most one worker
     # process ever calls it.
-    job = jobs.claim_next()
-    if job is None:
-        return
+    #
+    # It is *inside* the guard, not before it: a raise from claim_next may fail a
+    # job or fail this poll, but must never end the daemon. It was outside, and a
+    # job file whose `id` disagreed with its filename made claim_next raise
+    # KeyError straight past this handler into main's loop — a traceback every
+    # interval and no job ever draining again. palwarden_jobs.read_job now refuses
+    # that file outright, but the structural point stands regardless of which
+    # single bug prompted it.
+    job = None
     try:
+        job = jobs.claim_next()
+        if job is None:
+            return
         run_job(job)
     except Exception:  # noqa: BLE001 - one bad job must not stop the queue
         # A job file that vanished between claim and completion makes
@@ -594,6 +654,10 @@ def poll_once() -> None:
         # fail this job (best effort — the file may genuinely be gone) and go
         # on. KeyboardInterrupt/SystemExit are BaseException and still escape.
         traceback.print_exc()
+        if job is None:
+            # The failure was in claim_next itself, so there is no claimed job to
+            # record it on. Logged and swallowed: the next poll retries.
+            return
         try:
             # Say *something* on the job itself: the traceback only goes to the
             # service log, and a job that flipped to "failed" with no output at

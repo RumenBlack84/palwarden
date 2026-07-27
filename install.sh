@@ -104,6 +104,17 @@ fi
 install_files 0644 /opt/palworld/tools/config-webui "$REPO_DIR"/webui/*
 install_files 0644 /opt/palworld/tools "$REPO_DIR"/docs/config-tools.md "$REPO_DIR"/docs/backlog.md
 
+# 5b. The `current` symlink into the live config directory. palwarden-webui serves
+# it read-only (see allowed_roots there) and both editors fetch through it —
+# EngineIniPerformanceEditor.html does `fetch('current/Engine.ini')` to preload the
+# values it is about to edit. The container's s6 run script creates it at start,
+# but nothing on the systemd path did, so on bare metal the editors silently
+# preloaded nothing. Created here, by root, at install time: the service runs under
+# ProtectSystem=strict without ReadWritePaths for its own web root and does not
+# need to create it at runtime, so it must not be given write access just for this.
+run ln -sfn /opt/palworld/server/Pal/Saved/Config/LinuxServer \
+  /opt/palworld/tools/config-webui/current
+
 # 6. Runtime directories used by the tooling (owned by the service account when
 #    it exists; otherwise left root-owned for the operator to adjust).
 owner_args=()
@@ -118,17 +129,88 @@ else
   echo "          it is 0700 and the web UI writes jobs into it, so while it is"
   echo "          root-owned the UI cannot queue ANY action (every request fails)."
 fi
-for d in /var/lib/palworld /var/log/palworld \
-         /opt/palworld/backups /opt/palworld/config-backups /opt/palworld/config-snapshots; do
+for d in /var/lib/palworld /var/log/palworld /opt/palworld/config-backups; do
   run install -d -m 0755 "${owner_args[@]}" "$d"
+done
+# Snapshot and save-backup roots are deliberately root-owned, unlike the dirs
+# above. Both are written *only* by root (palwarden-jobd's snapshot_create /
+# backup actions, or a hand-run sudo) and only ever listed by the unprivileged
+# web UI, which 0755 already allows. When they were service-account-owned, root
+# wrote predictable, attacker-named paths into a directory a less-privileged
+# process could rename out from under it — see the long note in
+# sbin/palworld-config-snapshot.
+for d in /opt/palworld/backups /opt/palworld/config-snapshots; do
+  run install -d -m 0755 -o root -g root "$d"
 done
 # The control plane's job queue: written only by the unprivileged web UI (hence
 # the service account, not root), read and updated by the root worker
 # palwarden-jobd. 0700 because job files can carry config values.
 run install -d -m 0700 "${owner_args[@]}" /var/lib/palworld/jobs
 
-# 7. Reload systemd so the new/updated units are visible.
-run systemctl daemon-reload
+# The telemetry DB, pre-created service-account-owned — the same thing
+# docker/entrypoint.sh does, and for the same reason. SQLite runs
+# `PRAGMA journal_mode=WAL` on *every* connect(), which is a write, so a
+# root-owned DB is unreadable to the unprivileged side: palworld-fps-sample.service
+# has no User= and so created it as root on first use, after which palwarden-webui
+# (User=$SVC_USER) failed /api/fps, /api/events, /api/service-events and part of
+# /api/health with "attempt to write a readonly database". Never clobbered: an
+# existing DB is live telemetry.
+if [[ ! -e /var/lib/palworld/metrics.sqlite3 ]]; then
+  run install -m 0644 "${owner_args[@]}" /dev/null /var/lib/palworld/metrics.sqlite3
+fi
+
+# 7. Reload systemd so the new/updated units are visible, then refresh the two
+#    control-plane units in place.
+#
+# A re-run of this installer used to stop at daemon-reload, which does not touch a
+# running process. That was actively unsafe for one unit: this release changed
+# palworld-config-webui.service's ExecStart from `python3 -m http.server 8088` — an
+# unauthenticated static server for the config directory — to
+# `palwarden-webui --serve`, which requires Basic auth and a token. So an operator
+# re-ran install.sh, saw "Done", and kept serving the config directory with no
+# authentication at all until the next reboot. And palwarden-jobd is new, so the
+# web UI queued jobs nothing ever executed.
+#
+# try-restart, not restart: it restarts a unit only if it is already running, so
+# this never *starts* something the operator chose not to run. Ditto the enable
+# below, which is gated on the web UI already being enabled — the two halves of the
+# control plane are now a required pair, but neither is enabled by this installer
+# on its own.
+refresh_units() {
+  # /run/systemd/system is the canonical "booted with systemd" test (what Debian's
+  # maintainer scripts use). `systemctl is-system-running` is not: it exits nonzero
+  # for a merely `degraded` system, which is a perfectly restartable one.
+  if [[ ! -d /run/systemd/system ]] || ! command -v systemctl >/dev/null 2>&1; then
+    echo "    note: systemd is not running here; skipped daemon-reload and unit refresh."
+    echo "          run 'systemctl daemon-reload' and restart palworld-config-webui.service"
+    echo "          and palwarden-jobd.service on the target host."
+    return 0
+  fi
+  run systemctl daemon-reload
+  if systemctl is-enabled --quiet palworld-config-webui.service 2>/dev/null \
+     && ! systemctl is-enabled --quiet palwarden-jobd.service 2>/dev/null; then
+    echo "    enabling palwarden-jobd.service (the web UI is enabled and cannot"
+    echo "    execute any queued action without it)"
+    run systemctl enable palwarden-jobd.service
+  fi
+  local unit
+  for unit in palworld-config-webui.service palwarden-jobd.service; do
+    if systemctl is-active --quiet "$unit" 2>/dev/null; then
+      echo "    restarting running unit $unit so it picks up this release"
+    fi
+    run systemctl try-restart "$unit"
+  done
+}
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  # --dry-run must not query the live system either: is-enabled/is-active on the
+  # installing host would decide what gets printed, so state the conditional
+  # actions instead of resolving them.
+  printf 'DRY-RUN: systemctl daemon-reload\n'
+  printf 'DRY-RUN: systemctl enable palwarden-jobd.service (only if palworld-config-webui.service is already enabled)\n'
+  printf 'DRY-RUN: systemctl try-restart palworld-config-webui.service palwarden-jobd.service (running units only)\n'
+else
+  refresh_units
+fi
 
 echo "==> Done."
 echo

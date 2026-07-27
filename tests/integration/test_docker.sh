@@ -239,16 +239,75 @@ assert_eq "$state" "succeeded" "J: the root worker ran the queued job to success
 # and the job's actual effect landed
 assert_rc 0 docker exec pw-it-g sh -c 'ls -d /opt/palworld/config-snapshots/*itest-jobd'
 
-# The worker is root, so the snapshot it just wrote must still end up owned by the
-# service account — the web UI lists and prunes these unprivileged. The tool does
-# that itself, from PALWORLD_USER/PALWORLD_GROUP; those names were hardcoded to
-# "palworld", which does not exist in this image, and the LookupError was swallowed
-# by a bare `except`, so the whole tree stayed root-owned in exactly this scenario.
-# Asserted on the directory AND its contents: the old code chowned the directory
-# first, so a dir-only check would have passed while every file inside was root's.
+# The snapshot root is root-owned and the tool hands out no ownership at all.
+# It used to be the reverse — steam-owned root, and the tool chowned each finished
+# tree to PALWORLD_USER — which made a root-run snapshot_create an arbitrary root
+# write and an arbitrary chown: the directory name is derived from the
+# attacker-chosen label, and the tool holds it open across six subprocesses, so the
+# owner of the root could rename it and drop a symlink in its place. The container
+# is where that ownership is actually decided (Dockerfile `install -d`), so it is
+# asserted here rather than only in the unit suite.
+assert_eq "$(docker exec pw-it-g stat -c '%U %a' /opt/palworld/config-snapshots)" "root 755" \
+  "J: the snapshot root is root-owned 0755, not writable by the web user"
 assert_eq "$(docker exec pw-it-g sh -c 'stat -c %U $(ls -d /opt/palworld/config-snapshots/*itest-jobd)')" \
-  "steam" "J: a root-run snapshot_create leaves the snapshot dir owned by steam"
+  "root" "J: a root-run snapshot_create leaves the snapshot root-owned"
 assert_eq "$(docker exec pw-it-g sh -c 'stat -c %U /opt/palworld/config-snapshots/*itest-jobd/* | sort -u | tr "\n" ","')" \
-  "steam," "J: ...and every file inside it, not just the directory"
+  "root," "J: ...and every file inside it, so nothing was handed to a lesser account"
+# The unprivileged side must still be able to *list* them, which is all it does.
+snap_api="$(docker exec pw-it-g sh -c "curl -s -u '$webui_user:$webui_pass' \
+  http://127.0.0.1:8088/api/snapshots")"
+assert_contains "$snap_api" "itest-jobd" "J: /api/snapshots still lists it as the unprivileged user"
+
+# --- Scenario K: the `backup` action end to end ------------------------------
+# Nothing covered this action anywhere, and it could not possibly have worked in
+# the container: palworld-backup hardcoded `-o palworld -g palworld`, and there is
+# no `palworld` account in this image, so install's owner flag failed with
+# "invalid user" before tar ever ran. The container is the only place that is
+# exercised, so the assertion belongs here.
+#
+# /opt/palworld/backups was also missing from the Dockerfile's `install -d` list,
+# so /api/backups was permanently empty until the first successful backup.
+assert_eq "$(docker exec pw-it-g stat -c '%U %a' /opt/palworld/backups)" "root 755" \
+  "K: the save-backup root exists in the image, root-owned 0755"
+
+# Seed a SaveGames tree: the tool tars exactly SaveGames + Config, and the fake
+# server fixture ships neither (Pal/Saved is gitignored precisely because the tests
+# write into it), so without this the tar would fail for an unrelated reason and
+# hide whatever the action actually does.
+docker exec pw-it-g sh -c 'install -d -o steam -g steam /opt/palworld/server/Pal/Saved/SaveGames/0 \
+  && printf "fake level data\n" > /opt/palworld/server/Pal/Saved/SaveGames/0/Level.sav'
+
+bk_enq="$(docker exec pw-it-g sh -c "curl -s -w '\n%{http_code}' -X POST \
+  -u '$webui_user:$webui_pass' -H 'X-Palwarden-Token: $webui_token' \
+  -H 'Content-Type: application/json' \
+  -d '{\"action\":\"backup\",\"params\":{}}' \
+  http://127.0.0.1:8088/api/jobs")"
+assert_eq "$(printf '%s' "$bk_enq" | tail -1)" "202" "K: a backup job is accepted"
+bk_id="$(printf '%s' "$bk_enq" | grep -oE '[0-9a-f]{32}' | head -1)"
+if [ "${#bk_id}" -eq 32 ]; then pass; else fail "K: enqueue returned no job id (response: $bk_enq)"; fi
+
+bk_state=""; bk_body=""
+for _ in {1..60}; do
+  bk_body="$(docker exec pw-it-g sh -c "curl -s -u '$webui_user:$webui_pass' \
+    http://127.0.0.1:8088/api/jobs/$bk_id")"
+  bk_state="$(printf '%s' "$bk_body" | sed -n 's/.*"state": "\([a-z]*\)".*/\1/p' | head -1)"
+  case "$bk_state" in
+    queued|running|"") sleep 1 ;;
+    *) break ;;
+  esac
+done
+assert_eq "$bk_state" "succeeded" "K: the backup action reaches succeeded through jobd"
+# The specific pre-fix failure, named, so a future regression is unmistakable.
+assert_not_contains "$bk_body" "invalid user" "K: no 'invalid user' from a hardcoded account name"
+# ...and it really produced an archive, not just a zero exit.
+assert_rc 0 docker exec pw-it-g sh -c 'ls /opt/palworld/backups/palworld-save-*.tar.gz'
+assert_rc 0 docker exec pw-it-g sh -c 'tar -tzf /opt/palworld/backups/palworld-save-*.tar.gz | grep -q .'
+# The archive is handed to the service account (safe: the directory is root-owned,
+# so the name cannot be substituted), and the unprivileged /api/backups sees it.
+assert_eq "$(docker exec pw-it-g sh -c 'stat -c %U /opt/palworld/backups/palworld-save-*.tar.gz')" \
+  "steam" "K: the archive owner comes from PALWORLD_USER, which is steam here"
+bk_api="$(docker exec pw-it-g sh -c "curl -s -u '$webui_user:$webui_pass' \
+  http://127.0.0.1:8088/api/backups")"
+assert_contains "$bk_api" "palworld-save-" "K: /api/backups is no longer permanently empty"
 
 assert_report

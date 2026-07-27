@@ -68,6 +68,10 @@ CONFIG_FILE = Path(os.environ.get(
 SAVE_BACKUP_DIR = Path(os.environ.get("PALWARDEN_SAVE_BACKUP_DIR", "/opt/palworld/backups"))
 SNAPSHOT_DIR = Path(os.environ.get("PALWARDEN_SNAPSHOT_DIR", "/opt/palworld/config-snapshots"))
 
+# Keys ep_config replaces with "<redacted>". Read the honest scope of that in
+# ep_config and allowed_roots: it is hygiene for diffs, logs and screenshots, not
+# an access boundary — an authenticated caller can read the same values verbatim
+# from GET /current/PalWorldSettings.ini.
 SECRET_KEYS = {"adminpassword", "serverpassword"}
 # Windows palworld-fps accepts for `report --window`.
 FPS_REPORT_WINDOWS = {"5m", "60m", "24h", "7d"}
@@ -385,6 +389,23 @@ def allowed_roots() -> list[Path]:
 
     The web root contains a deliberate `current` symlink into the live config
     directory, so that directory is allowed too — but nothing else is.
+
+    Be clear about what that means: `GET /current/PalWorldSettings.ini` returns the
+    live file *verbatim*, AdminPassword and ServerPassword included. Serving it is
+    the feature — both editors fetch through `current/` to preload the values they
+    are about to edit, and redacting there would leave them editing blanks — so
+    **web UI access implies admin-password access**. Anyone who can authenticate to
+    this server can read the game's admin password.
+
+    Consequently ep_config's redaction is defence in depth, not a boundary: it
+    keeps the secrets out of the JSON that ends up in diffs, service logs, bug
+    reports and screenshots. It does not withhold them from the caller, and no
+    caller should be granted access on the assumption that it does.
+
+    The separate webui.env credentials exist to limit blast radius in the *other*
+    direction: they are not the game's admin password, so someone who has the
+    in-game admin password (handed out to trusted players, typed into RCON clients,
+    pasted in chat) does not thereby get this HTTP API — which can queue root jobs.
     """
     roots = []
     for candidate in (WEB_ROOT, CONFIG_FILE.parent):
@@ -519,6 +540,12 @@ def ep_config(_query: dict) -> dict:
         key = key.strip()
         value = value.strip()
         if key.lower() in SECRET_KEYS:
+            # Hygiene, not a boundary. The same authenticated caller can read these
+            # two values in cleartext from GET /current/PalWorldSettings.ini, which
+            # allowed_roots serves on purpose so the editors can preload the live
+            # file. What this buys is that the passwords do not travel in the JSON
+            # blob that gets pasted into diffs, tickets and screenshots. See
+            # allowed_roots' docstring for the full statement.
             settings[key] = "<redacted>"
         else:
             settings[key] = value[1:-1] if len(value) >= 2 and value[0] == value[-1] == '"' else value

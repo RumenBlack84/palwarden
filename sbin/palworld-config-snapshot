@@ -9,10 +9,7 @@ import argparse
 import json
 import os
 import re
-import shutil
 import subprocess
-import sys
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -30,40 +27,45 @@ MANIFEST = Path("/opt/palworld/server/steamapps/appmanifest_2394010.acf")
 SECRET_ENV_RE = re.compile(r"^(\s*(?:ADMIN_PASSWORD|SERVER_PASSWORD|PALWORLD_DISCORD_WEBHOOK|DISCORD_WEBHOOK|.*SECRET.*|.*TOKEN.*|.*PASSWORD.*)\s*=).*$", re.I)
 
 
-def chown_tree(snapshot_dir: Path) -> None:
-    """Hand a finished snapshot to the service account, best effort but audibly.
-
-    This normally runs as *root* (jobd's snapshot_create action) into a directory
-    the unprivileged account owns, so the tree it just wrote would otherwise be
-    root-owned and the web UI could not read or prune it. The account name comes
-    from PALWORLD_USER/PALWORLD_GROUP like every other script in this repo: these
-    were hardcoded to "palworld", which raised LookupError in the container (the
-    account there is `steam`) into a bare `except Exception: pass` — so root
-    snapshots landed root-owned and nothing said so. Same treatment as
-    palworld-config-pretty's fchown: never fatal — a snapshot with the wrong owner
-    still beats no snapshot — but never silent either.
-    """
-    user = os.environ.get("PALWORLD_USER", "palworld")
-    group = os.environ.get("PALWORLD_GROUP", "palworld")
-    # One resolution attempt for the whole tree: an unknown account fails
-    # identically for every entry, and warning once per snapshot is the useful
-    # amount rather than once per file.
-    try:
-        shutil.chown(snapshot_dir, user=user, group=group)
-    except LookupError as exc:
-        print(f"Warning: unknown owner {user}:{group} ({exc}); leaving {snapshot_dir} as is",
-              file=sys.stderr)
-        return
-    except OSError as exc:
-        print(f"Warning: cannot set owner {user}:{group} on {snapshot_dir}: {exc}",
-              file=sys.stderr)
-        return
-    for path in snapshot_dir.iterdir():
-        try:
-            shutil.chown(path, user=user, group=group)
-        except (LookupError, OSError) as exc:
-            print(f"Warning: cannot set owner {user}:{group} on {path}: {exc}",
-                  file=sys.stderr)
+# --- SNAPSHOT_ROOT is root-owned, and nothing here writes by path ------------
+# This tool runs as *root* — jobd's `snapshot_create` action, which is not
+# disruptive and so needs no `confirm` — into a directory whose name is derived
+# entirely from an attacker-chosen label, and it holds that directory open across
+# six subprocesses at 30s timeouts each. Seconds of window, not a tight race.
+#
+# It used to be exploitable both ways. install.sh and the Dockerfile created
+# /opt/palworld/config-snapshots owned by the unprivileged *web* account, and this
+# module ended with a `chown_tree()` handing each finished snapshot to that
+# account. Predict the directory name, wait for root's mkdir, rename the directory
+# aside and drop a symlink in its place: root then wrote manifest.json, buildid.txt
+# and every command output *through the link* — arbitrary root write — and the
+# chown followed it too, so aimed at /etc/shadow or a unit file it was a host
+# takeover (chown_tree's per-entry `iterdir()` made it worse: pointed at /etc it
+# chowned every entry). `fs.protected_symlinks` does not help: that sysctl only
+# covers world-writable *sticky* directories, and this one is 0755 — the same
+# reasoning palwarden_jobs._allowed_owner_uids records for the 0700 job queue.
+#
+# Both halves are gone, and the class with them:
+#
+#   1. SNAPSHOT_ROOT is root-owned 0755 on both platforms (install.sh,
+#      docker/Dockerfile) and no ownership is handed out at all — chown_tree is
+#      deleted, not merely unused. Nothing unprivileged has any business writing
+#      here: every creator is root (jobd, or a hand-run `sudo
+#      palworld-config-snapshot create`), the only unprivileged readers are
+#      palwarden-webui's /api/snapshots (`_list_dir`, a stat) and
+#      palworld-health-report's `latest_snapshot` (an iterdir), both of which the
+#      0755 already covers, and nothing prunes snapshots.
+#   2. Even so, the writes no longer *depend* on that ownership. create_snapshot
+#      opens the directory it just made with O_DIRECTORY|O_NOFOLLOW and every write
+#      goes through that descriptor (see write_into), O_CREAT|O_EXCL|O_NOFOLLOW per
+#      file. So the swap cannot redirect anything even where the directory is
+#      writable — a rename after the open leaves the descriptor pointing at the
+#      inode root actually created. Ownership is the boundary; the descriptor is
+#      what makes the code correct without one, and it is what the unit test can
+#      actually reproduce.
+#
+# House patterns this matches: palworld-engine-config's write_new_nofollow,
+# palworld-config-pretty's fchown, palwarden_jobs._write.
 
 
 def now_stamp() -> str:
@@ -89,16 +91,53 @@ def redact_env_text(text: str) -> str:
     return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
 
 
-def copy_or_redact(src: Path, dest: Path, redact: bool = False) -> dict[str, Any]:
-    item: dict[str, Any] = {"source": str(src), "destination": str(dest.name), "exists": src.exists(), "redacted": redact}
+def write_into(dir_fd: int, name: str, data: str) -> os.stat_result:
+    """Create `name` inside `dir_fd` and write `data`; return the fstat of what we wrote.
+
+    The one and only way this module puts a file into a snapshot. Everything about
+    it is relative to the *descriptor* opened on the directory root created, never
+    to a path re-resolved from the root's name:
+
+      * `dir_fd=` means the kernel starts from that inode. A rename of the
+        directory, or a symlink swapped in at its name, cannot redirect the write —
+        the descriptor still refers to the directory root actually made.
+      * `O_CREAT|O_EXCL|O_NOFOLLOW` refuses anything already at `name`, symlink
+        included (reported as EEXIST, never ELOOP — the lesson
+        palworld-engine-config's write_new_nofollow records).
+      * the size and mode recorded in the manifest come from an fstat on that same
+        descriptor, so the manifest describes the file we wrote rather than
+        whatever a later lookup of the name would find.
+
+    `name` must be a bare file name: a snapshot is flat, and a name with a
+    separator would reintroduce path resolution inside the tree.
+    """
+    if "/" in name or name in ("", ".", ".."):
+        raise ValueError(f"snapshot entry must be a bare file name, got {name!r}")
+
+    def opener(path: str, flags: int) -> int:
+        return os.open(path, flags | os.O_NOFOLLOW, 0o644, dir_fd=dir_fd)
+
+    with open(name, "x", opener=opener, encoding="utf-8", errors="replace") as fh:
+        fh.write(data)
+        fh.flush()
+        return os.fstat(fh.fileno())
+
+
+def copy_or_redact(dir_fd: int, src: Path, dest_name: str, redact: bool = False) -> dict[str, Any]:
+    item: dict[str, Any] = {"source": str(src), "destination": dest_name,
+                            "exists": src.exists(), "redacted": redact}
     if not src.exists():
         return item
-    dest.parent.mkdir(parents=True, exist_ok=True)
+    # Read the source by path (it lives in root-owned config directories, not in
+    # the snapshot tree) and write the copy through the descriptor. This replaced
+    # shutil.copy2: copy2 opens the *destination* by path, which is the write the
+    # swap redirected. The mtime copy2 preserved is not reproduced — the manifest
+    # already records where each file came from, and a snapshot's own mtimes being
+    # its creation time is if anything more useful.
+    text = src.read_text(errors="replace")
     if redact:
-        dest.write_text(redact_env_text(src.read_text(errors="replace")))
-    else:
-        shutil.copy2(src, dest)
-    st = dest.stat()
+        text = redact_env_text(text)
+    st = write_into(dir_fd, dest_name, text)
     item.update({"bytes": st.st_size, "mode": oct(st.st_mode & 0o777)})
     return item
 
@@ -111,12 +150,11 @@ def run_command(name: str, cmd: list[str], cwd: Path | None = None, timeout: int
     return {"name": name, "command": cmd, "exit_code": proc.returncode, "output": output}
 
 
-def write_command_output(snapshot_dir: Path, name: str, cmd: list[str], timeout: int = 30) -> dict[str, Any]:
+def write_command_output(dir_fd: int, name: str, cmd: list[str], timeout: int = 30) -> dict[str, Any]:
     result = run_command(name, cmd, timeout=timeout)
-    path = snapshot_dir / name
-    path.write_text(result["output"])
+    st = write_into(dir_fd, name, result["output"])
     result["destination"] = name
-    result["bytes"] = path.stat().st_size
+    result["bytes"] = st.st_size
     return result
 
 
@@ -171,8 +209,31 @@ def create_snapshot(
     while snapshot_dir.exists():
         suffix += 1
         snapshot_dir = output_root / f"{stamp}-{slugify(label)}-{suffix}"
+    # 0755: world-readable so the unprivileged web UI and health report can list
+    # it, but writable only by the (root) creator — see the note above on why
+    # nothing here may be handed to a less-privileged account.
     snapshot_dir.mkdir(parents=True, mode=0o755)
+    # Pin the directory we just created, immediately, and do every write relative to
+    # this descriptor. O_NOFOLLOW so we refuse to pin a symlink that beat us to the
+    # name; O_DIRECTORY so we refuse to pin anything that is not a directory. From
+    # here on the name `snapshot_dir` is only ever *reported* (in the manifest and
+    # on stdout), never re-resolved to write through.
+    dir_fd = os.open(snapshot_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        return _fill_snapshot(dir_fd, snapshot_dir, label, files, commands, metadata, mark)
+    finally:
+        os.close(dir_fd)
 
+
+def _fill_snapshot(
+    dir_fd: int,
+    snapshot_dir: Path,
+    label: str,
+    files: list[tuple[Path, str] | tuple[Path, str, bool]] | None,
+    commands: list[tuple[str, list[str]]] | None,
+    metadata: dict[str, Any] | None,
+    mark: bool,
+) -> Path:
     normalized_files: list[tuple[Path, str, bool]] = []
     for item in files if files is not None else default_files():
         if len(item) == 2:  # type: ignore[arg-type]
@@ -193,19 +254,22 @@ def create_snapshot(
     }
 
     for src, dest_name, redact in normalized_files:
-        manifest["files"].append(copy_or_redact(src, snapshot_dir / dest_name, redact=redact))
+        manifest["files"].append(copy_or_redact(dir_fd, src, dest_name, redact=redact))
 
     for name, cmd in commands if commands is not None else default_commands():
         try:
-            manifest["commands"].append(write_command_output(snapshot_dir, name, cmd))
+            manifest["commands"].append(write_command_output(dir_fd, name, cmd))
         except Exception as exc:
             manifest["commands"].append({"name": name, "command": cmd, "exit_code": None, "error": str(exc), "destination": name})
-            (snapshot_dir / name).write_text(f"ERROR: {exc}\n")
+            try:
+                write_into(dir_fd, name, f"ERROR: {exc}\n")
+            except OSError:
+                # The command already failed and is recorded in the manifest;
+                # failing to write its placeholder must not lose the whole snapshot.
+                pass
 
-    (snapshot_dir / "buildid.txt").write_text(f"{manifest.get('buildid') or 'unknown'}\n")
-    (snapshot_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-
-    chown_tree(snapshot_dir)
+    write_into(dir_fd, "buildid.txt", f"{manifest.get('buildid') or 'unknown'}\n")
+    write_into(dir_fd, "manifest.json", json.dumps(manifest, indent=2, sort_keys=True) + "\n")
 
     if mark:
         subprocess.run(
