@@ -15,6 +15,11 @@
     --pw-fg: #e6e6e6; --pw-fg-muted: #9aa4b2;
     --pw-ok: #7ddc86; --pw-warn: #f0c674; --pw-bad: #f28b82; --pw-idle: #8b93a1;
     --pw-accent: #8ab4f8;
+    /* Translucent blacks, kept here so both pages declare the same vocabulary:
+       the modal scrim and the elevation shadow are separate tokens because they
+       answer different questions and move independently. Used by the Engine.ini
+       editor's dialog/toast today, and by this page's job UI next. */
+    --pw-scrim: rgba(0, 0, 0, .6); --pw-shadow: rgba(0, 0, 0, .45);
     --pw-space-1: 4px; --pw-space-2: 8px; --pw-space-3: 16px; --pw-space-4: 24px;
     --pw-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
     --pw-sans: system-ui, -apple-system, "Segoe UI", sans-serif;

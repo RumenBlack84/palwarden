@@ -22,6 +22,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # node is not optional in CI: test_webui_jobs.sh executes the web UI's own
+      # collectSettings() under it, and fails rather than skips when it is
+      # missing (see the $CI branch there). Pinned so a runner image change
+      # cannot move it silently.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
       - name: Run unit tests
         run: ./tests/run.sh
 
@@ -30,6 +37,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # --integration runs the unit suite too, so this job needs node for the
+      # same reason the unit job does.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
       # ubuntu-latest runners have Docker preinstalled. The integration suite
       # builds the image and runs container scenarios with dummy servers + a
       # fake SteamCMD — it does NOT download the real ~5GB game.

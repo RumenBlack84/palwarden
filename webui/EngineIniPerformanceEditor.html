@@ -19,6 +19,12 @@
       --pw-fg: #e6e6e6; --pw-fg-muted: #9aa4b2;
       --pw-ok: #7ddc86; --pw-warn: #f0c674; --pw-bad: #f28b82; --pw-idle: #8b93a1;
       --pw-accent: #8ab4f8;
+      /* Translucent blacks. Two tokens, not one: --pw-scrim dims the whole
+         viewport behind a modal and --pw-shadow is the colour of an elevation
+         shadow, so they answer to different questions (how unreachable does the
+         page look / how far off the surface does the toast float) and are
+         expected to move independently. */
+      --pw-scrim: rgba(0, 0, 0, .6); --pw-shadow: rgba(0, 0, 0, .45);
       --pw-space-1: 4px; --pw-space-2: 8px; --pw-space-3: 16px; --pw-space-4: 24px;
       --pw-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
       --pw-sans: system-ui, -apple-system, "Segoe UI", sans-serif;
@@ -110,7 +116,7 @@
     .pw-confirm { background: var(--pw-surface); color: var(--pw-fg);
                   border: 1px solid var(--pw-border); border-radius: 8px;
                   padding: var(--pw-space-4); max-width: 34rem; }
-    .pw-confirm::backdrop { background: rgba(0, 0, 0, .6); }
+    .pw-confirm::backdrop { background: var(--pw-scrim); }
     .pw-confirm > h2 { margin: 0 0 var(--pw-space-2); font-size: 1.1rem; }
     .pw-confirm > p { margin: 0 0 var(--pw-space-3); }
 
@@ -120,7 +126,7 @@
                 max-width: 30rem; display: flex; align-items: baseline;
                 gap: var(--pw-space-2); background: var(--pw-surface);
                 border: 1px solid var(--pw-border); border-radius: 6px;
-                padding: var(--pw-space-3); box-shadow: 0 8px 24px rgba(0, 0, 0, .45); }
+                padding: var(--pw-space-3); box-shadow: 0 8px 24px var(--pw-shadow); }
     .pw-toast[hidden] { display: none; }
     .pw-toast > span { word-break: break-word; }
 
@@ -207,7 +213,12 @@
         <button type="button" class="pw-btn" onclick="copy('envOut')">Copy env</button>
         <button type="button" class="pw-btn" onclick="download('engine.env', document.getElementById('envOut').value)">Download engine.env</button>
       </div>
-      <textarea id="envOut" aria-label="Generated engine.env" readonly></textarea>
+      <!-- Editable on purpose: Copy env and Download engine.env both read
+           .value, so an operator can hand-tweak the generated text (add a key
+           the curated list does not cover, drop a line) before taking it out.
+           Editing any managed row regenerates and so discards those tweaks,
+           which is the same behaviour the page has always had. -->
+      <textarea id="envOut" aria-label="Generated engine.env"></textarea>
     </section>
 
     <section class="pw-card pw-card--wide">
@@ -217,7 +228,8 @@
       <div>
         <button type="button" class="pw-btn" onclick="copy('iniOut')">Copy fragment</button>
       </div>
-      <textarea id="iniOut" aria-label="Generated Engine.ini fragment" readonly></textarea>
+      <!-- Editable for the same reason as envOut: Copy fragment reads .value. -->
+      <textarea id="iniOut" aria-label="Generated Engine.ini fragment"></textarea>
     </section>
   </div>
 
@@ -230,7 +242,11 @@ sudo /usr/local/sbin/palworld-graceful-restart</code></pre>
   </section>
 </div>
 
-<dialog class="pw-confirm" id="confirm-dialog" aria-labelledby="confirm-title">
+<!-- aria-describedby points at the body text so the dialog has an accessible
+     description (what exactly is about to happen, and to which keys) and not
+     just a name. -->
+<dialog class="pw-confirm" id="confirm-dialog" aria-labelledby="confirm-title"
+        aria-describedby="confirm-body">
   <h2 id="confirm-title">Save, apply and restart?</h2>
   <p id="confirm-body"></p>
   <div>
@@ -239,6 +255,8 @@ sudo /usr/local/sbin/palworld-graceful-restart</code></pre>
   </div>
 </dialog>
 
+<!-- role starts polite and toast() switches it to "alert" for failures: a
+     disruptive job that errored must interrupt, not wait for the next idle. -->
 <div class="pw-toast" id="toast" role="status" hidden>
   <span class="pw-pill pw-pill--idle" id="toast-state">—</span>
   <span id="toast-message"></span>
@@ -358,6 +376,16 @@ const POLL_INTERVAL_MS=2000;
 // save+apply+restart finishes well inside this. On expiry the UI says so and
 // points at the job id rather than polling forever.
 const POLL_MAX_ATTEMPTS=450;
+// A status GET can fail while the job is perfectly healthy — jobd is a separate
+// process, so a network blip, a reverse-proxy hiccup or a webui restart says
+// nothing about the job. Tolerate a run of consecutive failures (~10 s at the
+// poll interval) before giving up, and reset on any success.
+//
+// Note the disruptive action restarts the *game* server, not this page: the page
+// and /api/jobs are served by palwarden-webui, a separate service that a
+// graceful restart never touches. So the restart itself is not expected to
+// interrupt polling; this budget is for real network trouble.
+const POLL_MAX_STATUS_FAILURES=5;
 const TERMINAL=['succeeded','failed'];
 
 function token(){
@@ -384,10 +412,16 @@ function log(line){
 let toastTimer=null;
 function toast(ok, message){
   const box=el('toast'), state=el('toast-state');
+  // Failures are assertive: a screen-reader user must not first learn that a
+  // restart errored the next time they happen to go idle. Successes stay
+  // polite. The role is set, and the box unhidden, *before* the text is
+  // written: a live region whose content changes while it is still hidden is
+  // not reliably announced.
+  box.setAttribute('role', ok ? 'status' : 'alert');
+  box.hidden=false;
   state.className='pw-pill pw-pill--' + (ok ? 'ok' : 'bad');
   state.textContent = ok ? 'DONE' : 'ERROR';
   el('toast-message').textContent=message;
-  box.hidden=false;
   if(toastTimer){ clearTimeout(toastTimer); toastTimer=null; }
   // Successes clear themselves; errors stay until dismissed.
   if(ok) toastTimer=setTimeout(dismissToast, 8000);
@@ -417,23 +451,42 @@ async function postJob(action, params){
   throw new Error(msg);
 }
 
-// Returns the finished job, or null when the bounded poll expired.
+// Resolves to one of three outcomes, deliberately not to a thrown error: losing
+// sight of a job is not the same event as a job failing, and runJob has to be
+// able to say so.
+//   {outcome:'done', job}                 — the job reached a terminal state
+//   {outcome:'expired'}                   — the bounded poll ran out
+//   {outcome:'unreachable', detail}       — status stopped answering
 async function pollJob(id){
   let last='';
+  let failures=0;
   for(let i=0;i<POLL_MAX_ATTEMPTS;i++){
-    await sleep(POLL_INTERVAL_MS);
-    const res=await fetch('/api/jobs/'+encodeURIComponent(id), {headers:{'Accept':'application/json'}});
-    let json=null;
-    try { json=await res.json(); } catch(e) { json=null; }
-    if(!res.ok || !json || json.ok===false || !json.data){
-      throw new Error((json && json.error) ? json.error : ('job status: HTTP '+res.status));
+    // First status GET goes out immediately: engine_save is a file write that
+    // finishes in milliseconds, and sleeping first left the page showing
+    // "accepted" and nothing else for a whole poll interval.
+    if(i>0) await sleep(POLL_INTERVAL_MS);
+    let job=null;
+    try {
+      const res=await fetch('/api/jobs/'+encodeURIComponent(id), {headers:{'Accept':'application/json'}});
+      let json=null;
+      try { json=await res.json(); } catch(e) { json=null; }
+      if(!res.ok || !json || json.ok===false || !json.data){
+        throw new Error((json && json.error) ? json.error : ('job status: HTTP '+res.status));
+      }
+      job=json.data;
+    } catch(e) {
+      const detail=errText(e);
+      failures++;
+      log('status check failed ('+failures+'/'+POLL_MAX_STATUS_FAILURES+'): '+detail);
+      if(failures>=POLL_MAX_STATUS_FAILURES) return {outcome:'unreachable', detail: detail};
+      continue;
     }
-    const job=json.data;
+    failures=0;
     const state=String(job.state || 'unknown');
     if(state!==last){ log('state: '+state); last=state; }
-    if(TERMINAL.includes(state)) return job;
+    if(TERMINAL.includes(state)) return {outcome:'done', job: job};
   }
-  return null;
+  return {outcome:'expired'};
 }
 
 async function runJob(action, params){
@@ -443,12 +496,21 @@ async function runJob(action, params){
     log('POST /api/jobs ' + action);
     const id=await postJob(action, params);
     log('job '+id+' accepted');
-    const job=await pollJob(id);
-    if(job===null){
+    const res=await pollJob(id);
+    if(res.outcome==='expired'){
       const msg='job '+id+' is still unfinished after '+Math.round(POLL_MAX_ATTEMPTS*POLL_INTERVAL_MS/60000)+
         ' minutes; this page stopped polling. Check /api/jobs/'+id+' or the dashboard.';
       log(msg); toast(false, msg); return;
     }
+    // Careful wording: this is "we lost the status endpoint", NOT "the job
+    // failed". jobd runs independently of this page, so an engine_save_apply_
+    // restart very likely completed — the operator needs the id to go and look.
+    if(res.outcome==='unreachable'){
+      const msg='job status unreachable ('+res.detail+') — the job may still be running. '+
+        action+' is job '+id+'; check /api/jobs/'+id+' or the dashboard for its outcome.';
+      log(msg); toast(false, msg); return;
+    }
+    const job=res.job;
     if(job.output) log(String(job.output));
     if(job.state==='succeeded'){
       log(action+' succeeded'); toast(true, action+' succeeded');
@@ -505,6 +567,12 @@ el('btn-save').addEventListener('click', async ()=>{
 });
 
 el('btn-save-apply').addEventListener('click', async ()=>{
+  // setBusy() only disables the buttons once a job is posted, so two clicks in
+  // the same input frame both get here. showModal() on an already-open dialog
+  // throws InvalidStateError, and it would throw inside confirmDisruptive's
+  // Promise executor — an unhandled rejection in this un-try'd handler. The
+  // first click already owns the dialog, so the second is simply ignored.
+  if(el('confirm-dialog').open) return;
   const settings=settingsOrComplain();
   if(!settings) return;
   const keys=Object.keys(settings).sort().join(', ');

@@ -440,38 +440,74 @@ assert_file_contains "$EDITOR" 'aria-live="polite"' "the job log is announced po
 assert_file_contains "$EDITOR" 'class="pw-log' "job progress goes in a pw-log region"
 assert_file_contains "$EDITOR" 'id="toast"' "outcomes go in a pw-toast"
 
-# structural checks a grep cannot express: no innerHTML on a page that renders
-# server-supplied error/blocked_by/Origin text, only vocabulary tokens, and the
-# two request bodies carrying no param key besides settings/confirm.
-structural="$(python3 - "$EDITOR" <<'PY'
+# structural checks a grep cannot express: no HTML-parsing sink on a page that
+# renders server-supplied error/blocked_by/Origin text, only vocabulary tokens,
+# and the two request bodies carrying no param key besides settings/confirm.
+#
+# Checks 1-3 run over BOTH first-party pages. The dashboard renders the same
+# API's strings (and grows job rendering next), so the reasoning is identical;
+# checking only the editor would let the guard pass while the sibling page grew
+# the exact hole it exists to prevent.
+structural="$(python3 - "$EDITOR" "$REPO/webui/palwarden.html" <<'PY'
 import re, sys
-src = open(sys.argv[1], encoding="utf-8").read()
+
+# Every way a string can become markup instead of text. The 403 reflects the
+# request's Origin back and error/blocked_by are attacker-influenceable, so any
+# one of these turns a hostile server string into script that can read the
+# mutation token out of sessionStorage. innerHTML is listed here too: the ""
+# clearing idiom is allowed below, nothing else is.
+SINKS = (
+    (r"\.innerHTML\s*=\s*([^;\n]*)", "innerHTML"),
+    (r"\.outerHTML\s*=\s*([^;\n]*)", "outerHTML"),
+    (r"\.insertAdjacentHTML\s*\(([^;\n]*)", "insertAdjacentHTML"),
+    (r"\bdocument\.write(?:ln)?\s*\(([^;\n]*)", "document.write"),
+    (r"\.setHTMLUnsafe\s*\(([^;\n]*)", "setHTMLUnsafe"),
+    # A <template> is only useful once its content is cloned into the document,
+    # and its content is markup by construction. Neither page has one; if one is
+    # ever wanted, revisit this guard rather than deleting it.
+    (r"<template\b", "template element"),
+)
+# Raw colour in any notation, not just hex: rgba() slipped past the hex-only
+# version of this check twice in this very file.
+COLOR_PATTERNS = (
+    r"#[0-9a-fA-F]{3,8}\b",
+    r"\b(?:rgb|rgba|hsl|hsla|color)\s*\(",
+)
+
 bad = []
+for path in sys.argv[1:]:
+    name = path.rsplit("/", 1)[-1]
+    src = open(path, encoding="utf-8").read()
 
-# 1. innerHTML is never assigned anything but the empty string.
-for m in re.finditer(r"\.innerHTML\s*=\s*([^;\n]*)", src):
-    if m.group(1).strip() not in ('""', "''"):
-        bad.append("innerHTML assigned %r" % m.group(1).strip())
+    # 1. No HTML-parsing sink. The one exception is clearing a node with "".
+    for pattern, label in SINKS:
+        for m in re.finditer(pattern, src):
+            arg = (m.group(1).strip() if m.groups() else "")
+            if label == "innerHTML" and arg in ('""', "''"):
+                continue
+            bad.append("%s: %s used (%r)" % (name, label, arg or m.group(0)))
 
-# 2. Raw hex colors only inside the :root token block.
-style = re.search(r"<style>(.*?)</style>", src, re.S)
-if not style:
-    bad.append("no <style> block")
-else:
-    css = style.group(1)
-    root = re.search(r":root\s*\{.*?\}", css, re.S)
-    if not root:
-        bad.append("no :root token block")
-    outside = css.replace(root.group(0), "") if root else css
-    for m in re.finditer(r"#[0-9a-fA-F]{3,8}\b", outside):
-        bad.append("raw hex outside :root: %s" % m.group(0))
+    # 2. Raw colours only inside the :root token block.
+    style = re.search(r"<style>(.*?)</style>", src, re.S)
+    if not style:
+        bad.append("%s: no <style> block" % name)
+    else:
+        css = style.group(1)
+        root = re.search(r":root\s*\{.*?\}", css, re.S)
+        if not root:
+            bad.append("%s: no :root token block" % name)
+        outside = css.replace(root.group(0), "") if root else css
+        for pattern in COLOR_PATTERNS:
+            for m in re.finditer(pattern, outside):
+                bad.append("%s: raw colour outside :root: %s" % (name, m.group(0)))
 
-# 3. No inline style attributes.
-if re.search(r"\sstyle=", src):
-    bad.append("inline style attribute")
+    # 3. No inline style attributes.
+    if re.search(r"\sstyle=", src):
+        bad.append("%s: inline style attribute" % name)
 
 # 4. The POSTed params objects mention no key other than settings/confirm, and
-#    no JSON boolean inside settings.
+#    no JSON boolean inside settings. Editor only (argv[1]).
+src = open(sys.argv[1], encoding="utf-8").read()
 calls = re.findall(r"runJob\(\s*'([a-z_]+)'\s*,\s*\{([^}]*)\}", src)
 if len(calls) != 2:
     bad.append("expected exactly 2 runJob call sites, found %d" % len(calls))
@@ -565,6 +601,12 @@ EOF
   cs_out="$(node "$CS_JS" 2>&1)"
   assert_eq "$cs_out" "OK" "collectSettings() extracted from the editor builds an acceptable payload"
 
+elif [ -n "${CI:-}" ]; then
+  # This is the only test that executes the page's own code. Silently skipping it
+  # when a runner image changes would delete the page's behavioural coverage
+  # without anyone noticing, so in CI a missing node is a failure, not a skip.
+  # (.github/workflows/ci.yml installs node explicitly for exactly this.)
+  fail "node is required in CI to execute the editor's collectSettings()"
 else
   echo "  (skipping the node checks of collectSettings(): node not found)" >&2
 fi
