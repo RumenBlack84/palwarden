@@ -5,7 +5,9 @@
 **Goal:** make a world save recoverable from the browser after a total failure —
 create a backup, download it off the host, and later push that file back and
 restore it — without giving the browser-facing process privilege, and without
-letting an uploaded archive escape the tree root unpacks it into.
+letting an uploaded archive escape the tree root unpacks it into. Backups also run
+on a schedule with retention, because a backup that depends on someone remembering
+is a backup that does not exist.
 
 ## Background: what exists today
 
@@ -18,8 +20,18 @@ letting an uploaded archive escape the tree root unpacks it into.
 
 **There is no restore path anywhere in the repo.** `palworld-engine-config
 rollback` restores `Engine.ini` only; nothing restores a world save. There is no
-download and no upload. So the panel needs one new tool, two new `jobd` actions,
-two new HTTP endpoints, and a page.
+download, no upload, and no deletion.
+
+**Backups are also entirely manual.** Every other recurring job has a
+`systemd/*.timer` and an s6 service driven by `palwarden-run-periodic`; backups
+have neither. Retention has precedent (`FPS_RETENTION_DAYS=7`) but nothing applies
+it to archives. So this design adds scheduling to a tool that has only ever run
+when someone asked it to.
+
+The panel therefore needs two new tools (`palworld-restore`, `palworld-backups`),
+four new `jobd` actions (`backup_import`, `backup_restore`, `backup_delete`,
+`backup_schedule_save` — `backup` already exists), three new HTTP endpoints, a
+page, and one periodic service per platform.
 
 `/opt/palworld/backups` is **root-owned 0755** deliberately: it was
 service-account-owned until a review showed that let a less-privileged process
@@ -154,12 +166,19 @@ Added to `palwarden-jobd`'s allowlist, re-validated there as always.
 |---|---|---|
 | `backup` | `palworld-backup` | — (already exists) |
 | `backup_import` | `palworld-restore --import <staged>` | `staged`: a filename (no separators) present in the staging dir and matching the name pattern |
+| `backup_schedule_save` | writes `/etc/palworld/backup.env` | `settings: {<KEY>: <value>}` over the four schedule keys below, each range-checked. No raw file body is ever accepted. |
 
 *Disruptive (require `"confirm": true`):*
 
 | Action | Command | Params |
 |---|---|---|
 | `backup_restore` | `palworld-restore --restore <backup>` | `backup`: matches the name pattern and exists in the backups dir; optional `wait` (0–1800), forwarded to the graceful stop as the player-warning window. Omitted → the stop tool's own default applies, per the convention already set by `graceful_restart`. |
+| `backup_delete` | `palworld-backups --delete <backup>` | `backup`: matches the name pattern and exists in the backups dir |
+
+`backup_delete` is classed **disruptive** even though it stops no service. The
+classification exists to gate irreversible actions behind `confirm: true`, and
+deleting the archive that would have recovered the world is the least reversible
+thing in this design.
 
 `backup_import` is file-only because it touches no running service: it validates a
 staged archive and moves it into the backups directory. `backup_restore` stops the
@@ -200,15 +219,123 @@ Stops at the first failure; a failed step never reaches the next.
    tree into place. Keep the replaced tree (the safety backup is an archive; this
    is a cheap second line) and say where it is.
 
-   **The replaced tree is not pruned automatically** — it is a full copy of a world
-   save, so repeated restores accumulate disk. The job output names the path and
-   says it is the operator's to delete. Automatic pruning is out of scope (below),
-   and silently deleting the previous world in a recovery tool would be the wrong
-   default.
+   **The replaced tree is deleted once the restored server is confirmed up** (step
+   6), not before. Until then it is the fastest possible undo — a rename back into
+   place, no untarring. Keeping it forever would accumulate a full world save per
+   restore, so it is removed on success and the pre-restore archive from step 2
+   remains as the durable safety net.
+
+   **If startup fails, the replaced tree is kept** and its path is named in the job
+   output. That is precisely when it is needed, so deletion is conditional on
+   success, never unconditional cleanup.
 5. **Chown** the restored tree to `PALWORLD_USER`/`PALWORLD_GROUP`, resolved from
    the environment with bare-metal-preserving defaults — never a hardcoded
    `palworld`, which is the bug that made snapshots root-owned in the container.
-6. **Start the server** and report.
+6. **Start the server and confirm it came up** before declaring success. Reuse the
+   readiness check `palworld-graceful-restart` already performs (REST reachable
+   within a startup timeout) rather than inventing a second definition of "up".
+7. **On confirmed startup, delete `Pal/Saved.replaced-<stamp>`.** On failure, keep
+   it, and report both its path and the pre-restore archive's name so the operator
+   has two routes back.
+
+## Deletion and retention
+
+Both remove an archive, so both go through one primitive in one tool — but they
+have deliberately different safety rules, because one is an explicit operator
+decision and the other is a background process.
+
+`sbin/palworld-backups` (new) owns the archive *collection*:
+
+| Invocation | Does |
+|---|---|
+| `--delete <name>` | Remove one archive. Validated name, refuses a symlink, requires a regular file inside the backups dir. |
+| `--prune` | Apply retention. |
+| `--if-due` | Create a backup if the schedule says one is due (calls `palworld-backup`). |
+
+The boundary against `palworld-restore` is clean: `palworld-backups` manages the
+set of archives, `palworld-restore` turns one archive back into a running world.
+`palworld-backup` is unchanged — it still just makes one archive now.
+
+### Retention rules
+
+Age **and** count, with a floor, because either alone fails in a way the other
+covers:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `BACKUP_RETENTION_DAYS` | `14` | Delete archives older than this. |
+| `BACKUP_KEEP_MIN` | `3` | Always keep at least this many newest archives, whatever their age. |
+
+* A host left off for a month must not wake with zero backups — `BACKUP_KEEP_MIN`
+  prevents that, and it is why age alone was rejected.
+* **`--prune` never deletes the last remaining archive**, whatever the settings say.
+  A retention policy that can empty the directory is a data-loss bug.
+* `--prune` operates on age, not on the newest-N alone, so a burst of restores (each
+  taking a pre-restore safety archive) cannot silently push out an older archive
+  that is still inside the retention window.
+* Pre-restore safety archives share the naming pattern and directory, so they are
+  subject to retention like any other archive. That is intended: they are ordinary
+  backups, and exempting them would grow the directory without bound.
+
+**`--delete` has no floor.** An operator who has passed three confirmations may
+delete their only archive; refusing would be overriding a decision they stated
+three times. The UI's final dialog says so explicitly when it is the only one left.
+
+## Scheduled backups
+
+The schedule lives in a **file**, not in a unit, which is what lets one design work
+on both platforms and be settable from the browser.
+
+`/etc/palworld/backup.env`, root-owned 0644 (not secret), written only by root via
+the `backup_schedule_save` action — the same validated-key/value pattern
+`engine_save` already uses for `engine.env`, never a raw body:
+
+```
+BACKUP_ENABLED=true
+BACKUP_INTERVAL_HOURS=24
+BACKUP_RETENTION_DAYS=14
+BACKUP_KEEP_MIN=3
+```
+
+| Key | Type | Range |
+|---|---|---|
+| `BACKUP_ENABLED` | bool | `true`/`false` |
+| `BACKUP_INTERVAL_HOURS` | int | 1–720 |
+| `BACKUP_RETENTION_DAYS` | int | 1–3650 |
+| `BACKUP_KEEP_MIN` | int | 1–100 |
+
+### Why a short tick instead of a schedule in the unit
+
+A periodic service runs `palworld-backups --if-due --prune` on a **fixed short
+tick** (default 15 minutes, `BACKUP_TICK_SECONDS`), and the *tool* decides whether
+a backup is due by comparing `BACKUP_INTERVAL_HOURS` against the newest existing
+archive's timestamp.
+
+The alternative — encoding the interval in a `systemd` `OnCalendar=` and an s6
+sleep — would mean changing the schedule requires rewriting a unit and a
+`daemon-reload` on bare metal, as root, from a web request. That is a far worse
+thing to expose than a validated config file. The tick approach also means:
+
+* changing the interval takes effect on the next tick, with nothing to reload;
+* a host that was powered off does not miss a window — it backs up on the first
+  tick after boot if one is overdue;
+* the "is it due" logic is one testable function rather than two platform-specific
+  schedule expressions.
+
+The cost is a process waking every 15 minutes to do nothing, which is what every
+other periodic job here already does.
+
+### Service wiring
+
+* Bare metal: `systemd/palworld-backup-auto.service` + `.timer`, root, firing on
+  the tick. Enabled by the operator like every other timer.
+* Container: `docker/s6-rc.d/backup-auto/run` using `palwarden-run-periodic`, as
+  root (the backups directory is root-owned). Enabled by the entrypoint when
+  `BACKUP_ENABLED` is true, following the `UPDATE_CHECK` precedent.
+* Both run as **root** and drop nothing: the archive write, the prune, and the
+  chown of the finished archive all need it.
+* `BACKUP_ENABLED=false` makes `--if-due` a no-op, so the service can stay
+  enabled and be turned off from the UI without touching the supervisor.
 
 ## Extraction hardening
 
@@ -236,6 +363,7 @@ unpacks.
 | `/api/backups` | GET | Basic | Existing listing |
 | `/api/backups/<name>/download` | GET | Basic | Stream one archive |
 | `/api/backups/upload` | POST | Basic + token + Origin | Stage an archive |
+| `/api/backup-schedule` | GET | Basic | Current schedule + retention, so the form can show real values |
 
 Status codes follow the existing scheme: `401` missing/bad Basic · `403`
 missing/bad token or bad Origin · `400` validation failure (bad name, oversized,
@@ -248,8 +376,8 @@ A fourth tab, **Backups**, beside Dashboard / Server settings / Engine.ini
 performance, using only the documented component vocabulary.
 
 * A `pw-card` listing archives — name, size, date — from `GET /api/backups`, each
-  row with **Download** (a link to the download endpoint) and **Restore**
-  (`pw-btn--danger`).
+  row with **Download** (a link to the download endpoint), **Restore**
+  (`pw-btn--danger`) and **Delete** (`pw-btn--danger`).
 * **Create backup** — `pw-btn`, enqueues `backup`.
 * **Import** — a file input plus an Upload button. Progress shown while streaming;
   on success the list refreshes and the archive appears as a normal row, which is
@@ -259,6 +387,27 @@ performance, using only the documented component vocabulary.
   It sends `confirm: true`.
 * Job progress in a `pw-log` (`aria-live="polite"`), outcomes in a `pw-toast` —
   errors persist, successes auto-clear.
+* **Delete requires three deliberate confirmations**, because it is the one action
+  in the whole control plane with no undo:
+
+  1. **Delete** on the row — arms the flow, nothing sent.
+  2. First `pw-confirm`: "Delete `<name>`?" naming the archive, its size and its
+     date, with **Cancel** as the default focused control.
+  3. Second `pw-confirm`: final warning that the archive cannot be recovered and
+     that this is not the same as removing it from the server's disk elsewhere.
+     When it is the **only** archive, this dialog says so explicitly. The
+     confirming control is `pw-btn--danger`; **Cancel** remains default-focused.
+  4. Only then is `backup_delete` sent, with `confirm: true`.
+
+  Each dialog traps focus, Esc cancels, and cancelling at any step sends nothing.
+  Neither dialog pre-selects the destructive control, so Enter-mashing cannot
+  delete an archive.
+
+* A **schedule** `pw-card`: an on/off control plus interval, retention days and
+  minimum-kept inputs, populated from `GET /api/backup-schedule` and saved with
+  `backup_schedule_save`. Saving takes effect on the next tick; the card says so
+  rather than implying it is instant. Out-of-range values are refused by the worker
+  with the reason named, and the form shows that message verbatim via `textContent`.
 * `pw-empty` with "No backups yet" for the empty list — the fresh-install case.
 * **Every server-supplied string via `textContent`.** A guard in
   `tests/unit/test_webui_jobs.sh` rejects HTML sinks on both pages and must stay
@@ -304,6 +453,23 @@ performance, using only the documented component vocabulary.
   correct headers; the bytes match the file.
 * Ownership after restore comes from `PALWORLD_USER`/`PALWORLD_GROUP`, asserted
   with a secondary group so a non-root chown is observable.
+* **The replaced tree is deleted on success and kept on failure** — two cases, with
+  a stub server start that succeeds in one and fails in the other. The kept path
+  appears in the job output.
+* **Deletion:** a valid name removes exactly that archive and nothing else; a
+  crafted name, a symlink in the backups dir, and a name outside the pattern are
+  each refused with nothing deleted; `backup_delete` without `confirm: true` is
+  refused.
+* **Retention:** archives older than `BACKUP_RETENTION_DAYS` are removed; the
+  newest `BACKUP_KEEP_MIN` survive regardless of age; `--prune` on a directory of
+  one archive deletes nothing however aggressive the settings; a burst of archives
+  inside the window is not pruned by count.
+* **Due logic** as a pure function: not due before the interval elapses, due after,
+  due immediately when no archive exists, and a no-op when `BACKUP_ENABLED=false`.
+  Asserted without waiting real hours by controlling the archive timestamps.
+* **Schedule save:** each of the four keys accepted at its bounds and refused
+  outside them; an unknown key refused by name; the file is written atomically and
+  re-read to confirm it parses; a failed write leaves the previous schedule intact.
 
 **Integration** (docker): create a backup through the API, download it, delete the
 archive, upload the downloaded bytes back, import, restore, and assert the world
@@ -320,9 +486,10 @@ against a missing check is worse than no test.
 
 * **Arbitrary-layout migration** — a foreign or Windows save. Separate threat
   model, separate design.
-* **Scheduled/automatic pruning** of old backups. The panel lists and restores;
-  retention is unchanged.
-* **Deleting backups from the UI.** Nothing in the recovery story needs it, and it
-  is the one destructive action with no undo.
+* **Restoring only part of a save** — individual player files or a single world
+  out of several. The archive is the unit of recovery.
+* **Off-host or cloud upload of backups.** Download hands the operator the bytes;
+  where they keep them is their business, and a tool that holds cloud credentials
+  is a different threat model.
 * **Encryption or off-host upload.** Download gives the operator the bytes; where
   they keep them is their business.
