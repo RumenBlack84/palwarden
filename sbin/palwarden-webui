@@ -602,6 +602,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.log_message("client gone while %s: %s", what, type(exc).__name__)
 
     def _challenge(self) -> None:
+        # Like _reject: a challenge answers a POST without reading its body, so the
+        # socket must close for the same anti-desync reason.
+        self.close_connection = True
         body = b"authentication required\n"
         self.send_response(401)
         self.send_header("WWW-Authenticate", f'Basic realm="{REALM}"')
@@ -830,7 +833,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not self._authenticated():
             return
         if urllib.parse.urlparse(self.path).path != "/api/jobs":
-            self._send_json(404, {"ok": False, "error": "unknown endpoint"})
+            self._reject(404, "unknown endpoint")
             return
         try:
             self._enqueue()
