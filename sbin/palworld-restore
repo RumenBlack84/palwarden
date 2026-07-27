@@ -1,0 +1,357 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Brian Grant
+"""Promote an uploaded world-save archive into the root-owned backups directory.
+
+Runs as root (via `palwarden-jobd`, or by hand). `--import` is the bridge between
+two directories with deliberately different ownership:
+
+  * `PALWARDEN_UPLOAD_DIR` is written by `palwarden-webui`, which runs
+    unprivileged and is treated as untrusted. Everything in it — names, link
+    types, and the *bytes of a file we are already holding open* — is
+    attacker-influenced.
+  * `PALWARDEN_SAVE_BACKUP_DIR` is root-owned 0755 (see `palworld-backup`), for
+    the same reason `palworld-config-snapshot` is: only root writes there, so a
+    path root creates in it cannot be pre-empted by a planted symlink.
+
+**The order of the two passes is the security property of this file.** The
+obvious order — validate the staged file, then copy it — does not hold, and the
+reason is spelled out in `palwarden_archive.extract_archive`'s docstring: reading
+through one held descriptor guarantees the *name* cannot be swapped, but nothing
+stops the owner of that file rewriting the *inode* in place (`O_WRONLY` without
+`O_TRUNC`, or `pwrite`) between our two reads. Pass 2 would then see bytes pass 1
+never saw. `O_NOFOLLOW` does not help either: it stops a symlink, not a hardlink
+of some file the web user can read.
+
+So this tool **copies first and validates the copy**, where the copy sits in the
+backups directory the web process cannot write. At that point "validated" and
+"persisted" are the same bytes unconditionally — no window to reason about, and
+no dependence on how long a descriptor is held. The pre-validate on the staged
+file stays, but only as an *advisory* pass that produces a good error message and
+avoids copying obvious junk; it is never the authority.
+
+A consequence worth stating: this makes `--restore`'s own re-validation a genuine
+second, independent guarantee rather than the only real one.
+
+`--restore` itself is not implemented here yet; the mode group has room for it.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import secrets
+import sys
+from pathlib import Path
+
+# Mirror how palwarden-jobd locates palwarden_jobs: prepend the bare-metal lib
+# dir and the repo's lib/ so `palwarden_archive` resolves in both the installed
+# layout and a dev checkout (tests set PYTHONPATH instead).
+sys.path.insert(0, "/usr/local/lib")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import palwarden_archive as archive  # noqa: E402
+
+# Written by palwarden-webui as the unprivileged service account.
+UPLOAD_DIR = Path(os.environ.get("PALWARDEN_UPLOAD_DIR", "/var/lib/palworld/uploads"))
+# Deliberately the same variable palworld-backup writes to and palwarden-webui
+# lists for /api/backups (PALWORLD_BACKUP_DIR already means *config* backups in
+# this repo), so one override moves writer, lister and importer together.
+BACKUP_DIR = Path(os.environ.get("PALWARDEN_SAVE_BACKUP_DIR", "/opt/palworld/backups"))
+
+# Ceiling on the *compressed* size of a single upload. This is not the
+# decompression-bomb cap (palwarden_archive owns that, on the uncompressed size);
+# it bounds what one promotion can cost in copy time and disk. A real save
+# archive is tens to hundreds of MiB.
+#
+# Both caps below reuse palwarden_archive's own env-int reader rather than
+# growing a second copy of "positive int or default" with its own bugs. It is
+# named with a leading underscore there, which is the honest cost of not editing
+# that module from this task; the alternative was duplicating the exact helper
+# whose whole purpose is that a malformed override cannot lower a ceiling to zero.
+MAX_UPLOAD_BYTES = archive._env_int("PALWARDEN_IMPORT_MAX_BYTES", 8 * 1024**3)
+# Free space required on the backups filesystem *beyond* the archive itself. A
+# web process that can fill that volume by uploading is a denial of service
+# against palworld-backup, which is the thing the operator will need next. Kept
+# modest so a tight volume can still take an import, and overridable for the
+# operator who knows their own margins.
+FREE_HEADROOM_BYTES = archive._env_int("PALWARDEN_IMPORT_FREE_HEADROOM", 64 * 1024**2)
+
+COPY_CHUNK = 1024 * 1024
+
+
+def _staged_path(staged: str) -> Path:
+    """Resolve a staged upload name inside UPLOAD_DIR, or raise ArchiveError.
+
+    Two checks, in this order, and both before the filesystem is touched at all.
+
+    The separator check comes first and has its own message. `valid_archive_name`
+    would also refuse every name containing `/` (its pattern has no separator in
+    it), so this guard cannot be reached by any input the pattern accepts — it is
+    structurally redundant, which is exactly the shape of check that becomes
+    unfalsifiable and then gets deleted by accident. It survives here because it
+    states the *intent* ("this is a bare name, never a path") at the top of the
+    function where a reader looks for it, and the suite pins its message so a
+    regression that drops it is visible. Same pattern as palwarden-jobd's
+    validate_backup.
+    """
+    if not isinstance(staged, str) or "/" in staged or "\\" in staged:
+        raise archive.ArchiveError(
+            f"staged upload must be a bare file name, got {staged!r}")
+    if not archive.valid_archive_name(staged):
+        raise archive.ArchiveError(
+            f"{staged!r} is not a name palworld-backup could have written; refused")
+    return UPLOAD_DIR / staged
+
+
+def _open_staged(path: Path) -> int:
+    """Open the staged archive for reading, or raise ArchiveError.
+
+    The explicit `is_symlink` refusal is not redundant with `open_archive_fd`'s
+    `O_NOFOLLOW`, which would also refuse this — it is the difference between
+    naming the actual problem and surfacing an ELOOP from a syscall three layers
+    down, in a directory where a symlink is the *expected* attack (the web user
+    owns it and can point at anything root can read). `is_symlink` uses lstat, so
+    it decides on the entry itself rather than following it.
+
+    Everything else about the file — regular vs FIFO vs directory, and the
+    non-blocking open that stops a planted FIFO hanging this root process — is
+    open_archive_fd's job, and is not re-implemented here.
+    """
+    if path.is_symlink():
+        raise archive.ArchiveError(f"staged upload must not be a symlink: {path}")
+    return archive.open_archive_fd(path)
+
+
+def _check_capacity(fd: int) -> int:
+    """Refuse the promotion before copying if it will not fit. Returns the size.
+
+    `statvfs` on the destination directory, not the source: the two can be
+    different filesystems (a container volume for uploads, another for backups),
+    and it is the backups volume that must survive this.
+    """
+    size = os.fstat(fd).st_size
+    if size > MAX_UPLOAD_BYTES:
+        raise archive.ArchiveError(
+            f"staged upload is {size} bytes, over the {MAX_UPLOAD_BYTES}-byte "
+            f"import limit; refused")
+    try:
+        st = os.statvfs(BACKUP_DIR)
+    except OSError as exc:
+        raise archive.ArchiveError(
+            f"cannot check free space on {BACKUP_DIR}: {exc}") from exc
+    # f_bavail, not f_bfree: the blocks available to *this* caller after any
+    # reserved-block margin.
+    available = st.f_bavail * st.f_frsize
+    needed = size + FREE_HEADROOM_BYTES
+    if available < needed:
+        raise archive.ArchiveError(
+            f"{BACKUP_DIR} has {available} bytes free space, need {needed} "
+            f"({size} for the archive plus {FREE_HEADROOM_BYTES} headroom); refused")
+    return size
+
+
+def _pre_validate(fd: int, path: Path) -> dict:
+    """Advisory validation of the staged bytes. Raises ArchiveError.
+
+    Advisory, and only advisory: whatever this pass sees can be replaced before
+    the copy below reads the same inode. Its value is that an obviously bad
+    upload is refused without spending a copy on it, and that the operator's
+    error message names the member rather than appearing after a successful-looking
+    copy.
+
+    Runs on a `dup` of the descriptor we already hold rather than re-opening
+    `path`, so the advisory pass at least cannot be pointed at a *different file*
+    than the one being promoted. `dup` shares the file offset, hence the explicit
+    rewind in `_copy_fd_to_temp`.
+
+    This reaches for palwarden_archive's `_validate_fileobj` because its public
+    entry point takes a path and opens it itself; there is no descriptor-shaped
+    public door, and `/proc/self/fd/N` is a symlink so `open_archive_fd` refuses
+    it by design. Re-opening the name here was the alternative and is precisely
+    what this file exists not to do.
+    """
+    fh = os.fdopen(os.dup(fd), "rb")
+    with fh:
+        return archive._validate_fileobj(
+            fh, path, archive.MAX_MEMBERS, archive.MAX_UNCOMPRESSED_BYTES)
+
+
+def _temp_path(name: str) -> Path:
+    """An unguessable temp name for the in-progress copy, inside BACKUP_DIR.
+
+    Dot-prefixed so it reads as scaffolding rather than a backup, and carrying
+    8 bytes of entropy so two concurrent promotions of the same archive cannot
+    collide on it. The entropy is not a security control here — BACKUP_DIR is
+    root-owned, so nothing unprivileged can plant at a predictable name in it —
+    which is why O_EXCL below is what actually refuses an occupied name.
+    """
+    return BACKUP_DIR / f".{name}.import.{secrets.token_hex(8)}"
+
+
+def _copy_fd_to_temp(fd: int, tmp_path: Path, cap: int) -> int:
+    """Copy from `fd` into a freshly created `tmp_path`. Returns bytes copied.
+
+    Never re-opens the source by name: the bytes come from the descriptor
+    `_open_staged` returned, which is why this takes an fd and not a path.
+
+    The destination is `O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW` at 0644. O_EXCL is
+    what makes an occupied temp name a refusal instead of a silent overwrite;
+    O_NOFOLLOW is defence in depth behind it (O_EXCL already fails on a symlink,
+    even a dangling one) and costs nothing. `fchmod` on the descriptor makes the
+    mode independent of the caller's umask — the web UI has to be able to list
+    and the operator to download what lands here.
+
+    The copy is an explicit bounded loop rather than `shutil.copyfileobj`: the
+    cap has to be enforced *while* copying, not from the `fstat` size taken
+    earlier, because the web process can grow the staged file after that stat.
+    copyfileobj cannot express that without a wrapper file object, which is more
+    indirection than the six lines it would save.
+
+    Cleanup of a partial copy lives *here*, not in the caller, because here is
+    the only place that knows whether the temp file was created at all. A caller
+    that unlinked `tmp_path` on any failure would delete the file whose existence
+    O_EXCL just refused to overwrite — which is not ours to remove, and turns a
+    clean refusal into destruction of whatever was in the way.
+    """
+    # The advisory pass read to EOF through a dup'd (offset-sharing) descriptor,
+    # so rewind before copying.
+    os.lseek(fd, 0, os.SEEK_SET)
+    # Failing here means nothing was created, so there is nothing to clean up —
+    # and in particular whatever is already at `tmp_path` stays exactly as it is.
+    try:
+        dst_fd = os.open(tmp_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o644)
+    except OSError as exc:
+        raise archive.ArchiveError(
+            f"cannot create the import temp file {tmp_path}: {exc}") from exc
+    copied = 0
+    try:
+        try:
+            os.fchmod(dst_fd, 0o644)
+            dst = os.fdopen(dst_fd, "wb")  # fdopen takes ownership of the fd
+        except BaseException:
+            os.close(dst_fd)
+            raise
+        with dst:
+            while True:
+                chunk = os.read(fd, COPY_CHUNK)
+                if not chunk:
+                    break
+                copied += len(chunk)
+                if copied > cap:
+                    raise archive.ArchiveError(
+                        f"staged upload exceeded the {cap}-byte import limit while "
+                        f"copying; refused")
+                dst.write(chunk)
+    except BaseException:
+        _unlink_quietly(tmp_path)
+        raise
+    return copied
+
+
+def _unlink_quietly(path: Path) -> None:
+    """Remove a path we created, tolerating its absence. Used on the failure path.
+
+    A refused promotion must leave *nothing* in the backups directory: the web UI
+    lists that directory verbatim, and `--restore` will read from it, so a
+    half-copied or rejected archive left behind would be offered to the operator
+    as if it were a real backup.
+    """
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        # Report it rather than masking the original refusal with a second error.
+        print(f"palworld-restore: warning: cannot remove {path}: {exc}", file=sys.stderr)
+
+
+def import_staged(staged: str) -> Path:
+    """Promote `staged` from UPLOAD_DIR into BACKUP_DIR. Raises ArchiveError.
+
+    Returns the promoted path. The staged file is removed only on success; a
+    refusal leaves it in place so the operator can inspect or retry it rather
+    than watching a bad upload vanish with no artefact.
+    """
+    path = _staged_path(staged)
+    # 0755 root-owned, exactly as palworld-backup creates it — needed here too so
+    # a first-ever import into a fresh volume works, and so statvfs has something
+    # to stat.
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True, mode=0o755)
+    fd = _open_staged(path)
+    try:
+        _check_capacity(fd)
+        _pre_validate(fd, path)  # advisory only; see the docstring
+        tmp = _temp_path(path.name)
+        # Outside the try below on purpose: _copy_fd_to_temp cleans up its own
+        # partial output, and if it failed to *create* the temp at all (O_EXCL on
+        # something already at that name) then that file is not ours to remove.
+        _copy_fd_to_temp(fd, tmp, MAX_UPLOAD_BYTES)
+        try:
+            # THE authoritative check. `tmp` is in a directory the web process
+            # cannot write, so from here "what was validated" and "what is on
+            # disk" are the same bytes, with no window in between.
+            archive.validate_archive(tmp)
+            # The destination name is built from `path.name`, which
+            # valid_archive_name has already proved is a bare
+            # `palworld-save-<stamp>.tar.gz` — never from anything else the
+            # client supplied, and never from a name read back off disk.
+            final = BACKUP_DIR / path.name
+            # link()+unlink(), not rename(): rename silently replaces the
+            # destination, and clobbering an existing backup is the one mistake
+            # a restore tool must not make. link() fails EEXIST atomically, with
+            # no check-then-use gap between "does it exist" and "put it there".
+            try:
+                os.link(tmp, final)
+            except FileExistsError as exc:
+                raise archive.ArchiveError(
+                    f"{final} already exists; refusing to overwrite an existing "
+                    f"backup") from exc
+            except OSError as exc:
+                raise archive.ArchiveError(
+                    f"cannot place the imported archive at {final}: {exc}") from exc
+        except BaseException:
+            _unlink_quietly(tmp)
+            raise
+        # The archive is now at its final name; the temp link is surplus.
+        _unlink_quietly(tmp)
+    finally:
+        os.close(fd)
+    # Only now is the upload disposable. Not fatal if it cannot be removed: the
+    # backup is safely promoted, and a stuck staging file is an operator nuisance
+    # rather than a reason to report failure.
+    try:
+        os.unlink(path)
+    except OSError as exc:
+        print(f"palworld-restore: warning: promoted {final} but cannot remove "
+              f"the staged copy {path}: {exc}", file=sys.stderr)
+    return final
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="palworld-restore",
+        description="Import and restore Palworld world-save archives.")
+    # A group, not a bare flag: --restore joins it next, and the two must never
+    # be given together. `required` keeps a bare invocation an error rather than
+    # a silent no-op, while leaving --help at exit 0.
+    mode = ap.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--import", dest="import_name", metavar="ARCHIVE",
+                      help="promote an uploaded archive from the staging "
+                           "directory into the backups directory")
+    args = ap.parse_args(argv)
+
+    try:
+        print(import_staged(args.import_name))
+    except archive.ArchiveError as exc:
+        print(f"palworld-restore: {exc}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        # An unexpected filesystem error is still an operator-facing message, not
+        # a traceback out of a root process.
+        print(f"palworld-restore: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
