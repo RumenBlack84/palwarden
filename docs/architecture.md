@@ -141,13 +141,23 @@ Two things this split deliberately does *not* do:
 |----------|-------|---------|
 | `/opt/palworld/server` | `palworld` | Game install + `Pal/Saved` (config, saves). Not in this repo. |
 | `/opt/palworld/tools` | `palworld` | Web UI + reference docs (installed here). |
-| `/opt/palworld/backups` | `palworld` | World save tarballs from `palworld-backup`. |
+| `/opt/palworld/backups` | `root` (0755) | World save tarballs from `palworld-backup`. Root-owned deliberately — see the note below. |
 | `/opt/palworld/config-backups` | `palworld` | Timestamped `PalWorldSettings.ini` / `Engine.ini` backups. |
-| `/opt/palworld/config-snapshots` | `palworld` | Labeled config+state snapshots. |
+| `/opt/palworld/config-snapshots` | `root` (0755) | Labeled config+state snapshots. Root-owned deliberately — see the note below. |
 | `/etc/palworld` | mixed | `settings.env`, `notify.env`, `engine.env`, templates. |
 | `/var/lib/palworld` | root/palworld | `metrics.sqlite3`, `public-info.env`, `service-events.json` (last observed service state). |
 | `/var/lib/palworld/jobs` | `palworld` (0700) | Control-plane job queue: `<id>.json` per job. Written by the web UI, executed by `palwarden-jobd`. |
 | `/var/log/palworld` | palworld | `server.log`. |
+
+**Why `backups` and `config-snapshots` are root-owned.** Only root ever writes
+them — `palwarden-jobd`'s `backup` and `snapshot_create` actions, the timers, or a
+hand-run command. The web UI only *lists* them, which `0755` already permits, and
+nothing prunes them. When they were service-account-owned, the unprivileged web
+process could rename a directory root had just created and drop a symlink in its
+place, redirecting root's writes — and its `chown` — anywhere on the filesystem.
+`config-backups` stays service-account-owned because `palworld-engine-config
+rollback` reads from it and the web UI is expected to manage it; it is safe there
+because every use validates the name and opens it `O_NOFOLLOW`.
 | `/run/palworld-*.lock` | — | `flock` files preventing overlapping timer runs. |
 | `/run/palwarden-jobd.lock` | root | `palwarden-jobd`'s exclusive lock — one worker, one job at a time. |
 

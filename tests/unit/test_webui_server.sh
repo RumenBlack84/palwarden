@@ -142,7 +142,14 @@ REAL_ROOT="$DIR/../../webui"
 assert_rc 0 test -f "$REAL_ROOT/palwarden.html"
 assert_file_contains "$REAL_ROOT/palwarden.html" 'id="palwarden-dashboard"' "has the dashboard root element"
 assert_file_contains "$REAL_ROOT/palwarden.html" "/api/health" "fetches health"
-assert_file_contains "$REAL_ROOT/palwarden.html" "sessionStorage" "keeps the token in sessionStorage"
+# The token assertion belongs on the page that actually sends it. The dashboard is
+# read-only (GET /api/jobs takes Basic alone), so it holds no token at all; this
+# assertion used to sit here and only passed because a since-deleted helper
+# mentioned sessionStorage. Asserting on real code, not on a comment:
+assert_rc 0 grep -qE 'sessionStorage\.getItem\(' "$REAL_ROOT/EngineIniPerformanceEditor.html" \
+  "the editor reads its token from sessionStorage"
+assert_file_not_contains "$REAL_ROOT/EngineIniPerformanceEditor.html" "localStorage" \
+  "the token never goes in persistent storage"
 # the shared component vocabulary from the design spec, so later pages can reuse it
 assert_file_contains "$REAL_ROOT/palwarden.html" "--pw-bg" "declares the design tokens"
 assert_file_contains "$REAL_ROOT/palwarden.html" "pw-card" "uses the card component"
