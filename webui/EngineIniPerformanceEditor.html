@@ -1,97 +1,250 @@
 <!doctype html>
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Brian Grant -->
+<!-- Derived in part from the MIT-licensed upstream Palworld settings editor
+     (page shell and form idiom only); see CREDITS.md and
+     webui/LICENSE.upstream-mit. The curated Engine.ini levers, engine.env
+     generation and the palwarden control-plane integration are first-party. -->
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Palworld Engine.ini Performance Editor</title>
+  <title>palwarden — Engine.ini performance</title>
   <style>
-    :root { color-scheme: dark; --bg:#0f172a; --panel:#111827; --muted:#94a3b8; --text:#e5e7eb; --accent:#60a5fa; --warn:#fbbf24; --good:#22c55e; --bad:#ef4444; }
-    body { margin:0; font-family: system-ui, -apple-system, Segoe UI, sans-serif; background:linear-gradient(135deg,#0f172a,#1e1b4b); color:var(--text); }
-    header { padding: 28px 32px 12px; }
-    h1 { margin:0 0 8px; font-size: 2rem; }
-    h2 { margin-top:0; color:#bfdbfe; }
-    main { display:grid; grid-template-columns: minmax(360px, 1fr) minmax(420px, 1fr); gap:20px; padding: 0 32px 32px; }
-    section { background: rgba(17,24,39,.92); border:1px solid rgba(148,163,184,.25); border-radius:16px; padding:18px; box-shadow: 0 20px 60px rgba(0,0,0,.25); }
-    .full { grid-column:1 / -1; }
-    .setting { border-top:1px solid rgba(148,163,184,.18); padding:14px 0; display:grid; grid-template-columns: 1fr 180px 80px; gap:12px; align-items:center; }
-    .setting:first-of-type { border-top:0; }
-    label { font-weight:650; }
-    .desc { color:var(--muted); font-size:.9rem; margin-top:3px; }
-    input, select, textarea, button { font:inherit; border-radius:10px; border:1px solid rgba(148,163,184,.35); background:#020617; color:var(--text); padding:10px; }
-    input[type="checkbox"] { width:24px; height:24px; accent-color:var(--accent); }
-    textarea { width:100%; min-height:360px; box-sizing:border-box; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:.9rem; }
-    .buttons { display:flex; flex-wrap:wrap; gap:10px; margin:12px 0; }
-    button { cursor:pointer; background:#1d4ed8; border-color:#3b82f6; font-weight:700; }
-    button.secondary { background:#334155; border-color:#64748b; }
-    button.warn { background:#92400e; border-color:#f59e0b; }
-    .note { color:var(--muted); line-height:1.45; }
-    code { background:#020617; border:1px solid rgba(148,163,184,.2); padding:2px 5px; border-radius:6px; }
-    .pill { display:inline-block; background:#172554; color:#bfdbfe; padding:4px 8px; border-radius:999px; margin:2px; font-size:.85rem; }
-    @media(max-width: 1000px) { main { grid-template-columns:1fr; padding: 0 16px 16px; } header{padding:20px 16px 8px;} }
+    /* Design tokens — the only place raw colors appear. Shared vocabulary with
+       webui/palwarden.html; see the design spec, "Component vocabulary". */
+    :root {
+      color-scheme: dark;
+      --pw-bg: #14161a; --pw-surface: #1c1f25; --pw-border: #2b2f37;
+      --pw-fg: #e6e6e6; --pw-fg-muted: #9aa4b2;
+      --pw-ok: #7ddc86; --pw-warn: #f0c674; --pw-bad: #f28b82; --pw-idle: #8b93a1;
+      --pw-accent: #8ab4f8;
+      --pw-space-1: 4px; --pw-space-2: 8px; --pw-space-3: 16px; --pw-space-4: 24px;
+      --pw-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+      --pw-sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body { font: 14px/1.5 var(--pw-sans); margin: 0;
+           background: var(--pw-bg); color: var(--pw-fg); }
+    a { color: var(--pw-accent); }
+    :focus-visible { outline: 2px solid var(--pw-accent); outline-offset: 2px; }
+
+    /* pw-nav: slim header bar with the wordmark and a segmented tab control. */
+    .pw-nav { display: flex; align-items: center; justify-content: space-between;
+              gap: var(--pw-space-3); padding: var(--pw-space-2) var(--pw-space-4);
+              border-bottom: 1px solid var(--pw-border); background: var(--pw-surface);
+              flex-wrap: wrap; }
+    .pw-nav__wordmark { font-family: var(--pw-mono); font-size: 1.1rem;
+                         letter-spacing: .08em; color: var(--pw-fg); }
+    .pw-nav__tabs { display: flex; gap: 2px; background: var(--pw-bg);
+                    border: 1px solid var(--pw-border); border-radius: 8px; padding: 2px; }
+    .pw-tab { font-family: var(--pw-sans); font-size: .82rem; color: var(--pw-fg-muted);
+              text-decoration: none; padding: var(--pw-space-1) var(--pw-space-3);
+              border-radius: 6px; }
+    .pw-tab:hover { color: var(--pw-fg); }
+    .pw-tab[aria-current="page"] { background: var(--pw-surface); color: var(--pw-fg);
+                                    border: 1px solid var(--pw-border); }
+
+    .pw-page { padding: var(--pw-space-4); }
+    .pw-page > h1 { font-family: var(--pw-mono); font-size: 1.8rem; font-weight: 600;
+                    margin: 0 0 var(--pw-space-2); letter-spacing: -.01em; }
+    .pw-page > p { color: var(--pw-fg-muted); margin: 0 0 var(--pw-space-4); }
+
+    /* pw-grid / pw-card: every top-level region is a titled card. A card outside
+       the grid spans the page, which is what the wide regions want. */
+    .pw-grid { display: grid; gap: var(--pw-space-3);
+               grid-template-columns: repeat(6, 1fr); margin-bottom: var(--pw-space-3); }
+    .pw-card { background: var(--pw-surface); border: 1px solid var(--pw-border);
+               border-radius: 6px; padding: var(--pw-space-3);
+               grid-column: span 2; margin-bottom: var(--pw-space-3); }
+    .pw-card--wide { grid-column: span 3; }
+    .pw-card > h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .1em;
+                    color: var(--pw-fg-muted); margin: 0 0 var(--pw-space-2);
+                    font-family: var(--pw-sans); }
+    .pw-card > p { color: var(--pw-fg-muted); margin: 0 0 var(--pw-space-2); }
+    .pw-card code, .pw-card pre { font-family: var(--pw-mono); }
+    .pw-card pre { margin: 0; overflow: auto; }
+
+    /* pw-pill: state badge. Always carries a text label — never color alone. */
+    .pw-pill { display: inline-block; padding: 0 var(--pw-space-2); border-radius: 999px;
+               font-family: var(--pw-mono); font-size: .82rem;
+               border: 1px solid currentColor; }
+    .pw-pill--ok { color: var(--pw-ok); } .pw-pill--warn { color: var(--pw-warn); }
+    .pw-pill--bad { color: var(--pw-bad); } .pw-pill--idle { color: var(--pw-idle); }
+
+    /* pw-btn: action button. pw-btn--danger marks the disruptive one. */
+    .pw-btn { font: inherit; color: var(--pw-fg); background: var(--pw-bg);
+              border: 1px solid var(--pw-border); border-radius: 6px;
+              padding: var(--pw-space-1) var(--pw-space-3); cursor: pointer;
+              margin: 0 var(--pw-space-2) var(--pw-space-2) 0;
+              transition: color .15s ease, border-color .15s ease; }
+    .pw-btn:hover:enabled { color: var(--pw-accent); border-color: var(--pw-accent); }
+    .pw-btn--danger { color: var(--pw-warn); border-color: var(--pw-warn); }
+    .pw-btn[disabled] { color: var(--pw-idle); border-color: var(--pw-border);
+                        cursor: not-allowed; }
+
+    input, select, textarea { font: inherit; font-family: var(--pw-mono);
+      color: var(--pw-fg); background: var(--pw-bg); border: 1px solid var(--pw-border);
+      border-radius: 6px; padding: var(--pw-space-1) var(--pw-space-2); }
+    input[type="checkbox"] { width: 18px; height: 18px; padding: 0;
+                             accent-color: var(--pw-accent); }
+    textarea { width: 100%; min-height: 15rem; font-size: .9rem; }
+
+    /* The managed-settings rows: structural selectors, so no per-widget class. */
+    #settings > div { display: grid; grid-template-columns: 1fr 10rem 2rem;
+                      gap: var(--pw-space-2); align-items: center;
+                      padding: var(--pw-space-2) 0;
+                      border-top: 1px solid var(--pw-border); }
+    #settings > div:first-child { border-top: 0; }
+    #settings label { font-weight: 600; }
+    #settings small { display: block; color: var(--pw-fg-muted); }
+
+    /* pw-log: monospace scroll region for job progress. */
+    .pw-log { margin: 0; white-space: pre-wrap; word-break: break-word;
+              max-height: 14rem; overflow: auto; font-family: var(--pw-mono);
+              color: var(--pw-fg); }
+    .pw-empty { color: var(--pw-fg-muted); font-style: italic; }
+
+    /* pw-confirm: modal confirmation. showModal() supplies the focus trap and
+       Esc-cancels; the ::backdrop keeps the page visibly out of reach. */
+    .pw-confirm { background: var(--pw-surface); color: var(--pw-fg);
+                  border: 1px solid var(--pw-border); border-radius: 8px;
+                  padding: var(--pw-space-4); max-width: 34rem; }
+    .pw-confirm::backdrop { background: rgba(0, 0, 0, .6); }
+    .pw-confirm > h2 { margin: 0 0 var(--pw-space-2); font-size: 1.1rem; }
+    .pw-confirm > p { margin: 0 0 var(--pw-space-3); }
+
+    /* pw-toast: one transient result at a time. The pw-pill inside carries the
+       outcome as text, so the toast itself needs no state variant. */
+    .pw-toast { position: fixed; bottom: var(--pw-space-4); right: var(--pw-space-4);
+                max-width: 30rem; display: flex; align-items: baseline;
+                gap: var(--pw-space-2); background: var(--pw-surface);
+                border: 1px solid var(--pw-border); border-radius: 6px;
+                padding: var(--pw-space-3); box-shadow: 0 8px 24px rgba(0, 0, 0, .45); }
+    .pw-toast[hidden] { display: none; }
+    .pw-toast > span { word-break: break-word; }
+
+    @media (max-width: 900px) {
+      .pw-grid { grid-template-columns: 1fr; }
+      .pw-card, .pw-card--wide { grid-column: span 1; }
+      #settings > div { grid-template-columns: 1fr 6rem 2rem; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      * { transition: none !important; animation: none !important; }
+    }
   </style>
 </head>
 <body>
-<header>
-  <h1>Palworld Engine.ini Performance Editor</h1>
-  <p class="note">Client-side helper for curated Unreal/Palworld performance levers. It does not write to the server directly. Generate <code>engine.env</code>, copy it to <code>/etc/palworld/engine.env</code>, then run <code>sudo /usr/local/sbin/palworld-engine-config apply</code>.</p>
-</header>
-<main>
-  <section>
-    <h2>Presets</h2>
-    <p class="note">Presets only fill values in this browser. Review before applying. Higher tick rates may improve smoothness but can raise CPU/network load.</p>
-    <div class="buttons">
-      <button onclick="preset('conservative')">Conservative 30 TPS</button>
-      <button onclick="preset('balanced')">Balanced 60 TPS</button>
-      <button class="warn" onclick="preset('experimental')">Experimental 90 TPS</button>
-      <button class="secondary" onclick="clearAll()">Clear managed values</button>
-    </div>
-    <div><span class="pill">No direct server writes</span><span class="pill">Backed by /usr/local/sbin/palworld-engine-config</span><span class="pill">Restart required</span></div>
-  </section>
+<nav class="pw-nav">
+  <span class="pw-nav__wordmark">palwarden</span>
+  <div class="pw-nav__tabs">
+    <a class="pw-tab" href="palwarden.html">Dashboard</a>
+    <a class="pw-tab" href="PalWorldSettingsEditor.html">Server settings</a>
+    <a class="pw-tab" href="EngineIniPerformanceEditor.html" aria-current="page">Engine.ini performance</a>
+  </div>
+</nav>
+<div class="pw-page">
+  <h1>Engine.ini performance</h1>
+  <p>Curated Unreal/Palworld performance levers. Values are edited in the browser and
+     written to <code>/etc/palworld/engine.env</code> by the palwarden control plane;
+     <code>palworld-engine-config</code> is what ever touches Engine.ini.</p>
 
-  <section>
-    <h2>Current Engine.ini</h2>
-    <p class="note">Use this to load current managed values from the served read-only symlink.</p>
-    <div class="buttons">
-      <button onclick="loadCurrent()">Load current Engine.ini</button>
-      <button class="secondary" onclick="parseIni(document.getElementById('iniText').value)">Parse pasted INI</button>
-    </div>
-    <textarea id="iniText" placeholder="Paste Engine.ini here, or click Load current Engine.ini..."></textarea>
-  </section>
+  <div class="pw-grid">
+    <section class="pw-card pw-card--wide">
+      <h2>Presets</h2>
+      <p>Presets only fill values in this browser. Review before saving. Higher tick
+         rates may improve smoothness but can raise CPU and network load.</p>
+      <div>
+        <button type="button" class="pw-btn" onclick="preset('conservative')">Conservative 30 TPS</button>
+        <button type="button" class="pw-btn" onclick="preset('balanced')">Balanced 60 TPS</button>
+        <button type="button" class="pw-btn pw-btn--danger" onclick="preset('experimental')">Experimental 90 TPS</button>
+        <button type="button" class="pw-btn" onclick="clearAll()">Clear managed values</button>
+      </div>
+      <p><span class="pw-pill pw-pill--idle">Restart required to take effect</span></p>
+    </section>
 
-  <section class="full">
-    <h2>Managed Performance Settings</h2>
+    <section class="pw-card pw-card--wide">
+      <h2>Current Engine.ini</h2>
+      <p>Loads the live file through the read-only <code>current/</code> mount and fills
+         the managed rows from it.</p>
+      <div>
+        <button type="button" class="pw-btn" onclick="loadCurrent()">Load current Engine.ini</button>
+        <button type="button" class="pw-btn" onclick="parseIni(document.getElementById('iniText').value)">Parse pasted INI</button>
+      </div>
+      <textarea id="iniText" aria-label="Engine.ini source" placeholder="Paste Engine.ini here, or click Load current Engine.ini..."></textarea>
+    </section>
+  </div>
+
+  <section class="pw-card">
+    <h2>Managed performance settings</h2>
+    <p>The right-hand checkbox marks a key as managed; only managed rows are sent.</p>
     <div id="settings"></div>
   </section>
 
-  <section>
-    <h2>Generated engine.env</h2>
-    <p class="note">Only enabled rows are emitted. This is the recommended path for applying changes safely with backup and Discord diff.</p>
-    <div class="buttons">
-      <button onclick="generateEnv()">Generate engine.env</button>
-      <button class="secondary" onclick="copy('envOut')">Copy env</button>
-      <button class="secondary" onclick="download('engine.env', document.getElementById('envOut').value)">Download engine.env</button>
+  <section class="pw-card">
+    <h2>Apply via palwarden</h2>
+    <p><strong>Save</strong> writes the managed values into
+       <code>/etc/palworld/engine.env</code> and nothing else — no file under Engine.ini
+       changes and the server is untouched, so it is safe at any time.
+       <strong>Save and apply</strong> additionally runs
+       <code>palworld-engine-config apply</code> and then gracefully restarts the server,
+       warning players first. Applying without restarting is deliberately not offered:
+       Engine.ini only takes effect on restart, so it would leave the file and the
+       running server disagreeing.</p>
+    <div>
+      <button type="button" class="pw-btn" id="btn-save">Save</button>
+      <button type="button" class="pw-btn pw-btn--danger" id="btn-save-apply">Save and apply (restarts the server)</button>
     </div>
-    <textarea id="envOut"></textarea>
+    <pre class="pw-log pw-empty" id="joblog" aria-live="polite">No job started from this page yet.</pre>
   </section>
 
-  <section>
-    <h2>Generated Engine.ini fragment</h2>
-    <p class="note">Reference only. Prefer engine.env + apply script so backups, validation, ownership, pretty copy, and Discord notification happen consistently.</p>
-    <div class="buttons">
-      <button onclick="generateIni()">Generate INI fragment</button>
-      <button class="secondary" onclick="copy('iniOut')">Copy fragment</button>
-    </div>
-    <textarea id="iniOut"></textarea>
-  </section>
+  <div class="pw-grid">
+    <section class="pw-card pw-card--wide">
+      <h2>Generated engine.env</h2>
+      <p>What Save sends, in the file format <code>palworld-engine-config</code> reads.
+         Copy it out only if you would rather install it by hand.</p>
+      <div>
+        <button type="button" class="pw-btn" onclick="copy('envOut')">Copy env</button>
+        <button type="button" class="pw-btn" onclick="download('engine.env', document.getElementById('envOut').value)">Download engine.env</button>
+      </div>
+      <textarea id="envOut" aria-label="Generated engine.env" readonly></textarea>
+    </section>
 
-  <section class="full">
-    <h2>Apply commands</h2>
+    <section class="pw-card pw-card--wide">
+      <h2>Generated Engine.ini fragment</h2>
+      <p>Reference only. Prefer engine.env plus apply, so backups, validation,
+         ownership, the pretty copy and the Discord diff all happen consistently.</p>
+      <div>
+        <button type="button" class="pw-btn" onclick="copy('iniOut')">Copy fragment</button>
+      </div>
+      <textarea id="iniOut" aria-label="Generated Engine.ini fragment" readonly></textarea>
+    </section>
+  </div>
+
+  <section class="pw-card">
+    <h2>Manual apply (bare metal, or when the control plane is unavailable)</h2>
     <pre><code>sudo install -m 0644 -o root -g root engine.env /etc/palworld/engine.env
 sudo /usr/local/sbin/palworld-engine-config apply --dry-run
 sudo /usr/local/sbin/palworld-engine-config apply
 sudo /usr/local/sbin/palworld-graceful-restart</code></pre>
   </section>
-</main>
+</div>
+
+<dialog class="pw-confirm" id="confirm-dialog" aria-labelledby="confirm-title">
+  <h2 id="confirm-title">Save, apply and restart?</h2>
+  <p id="confirm-body"></p>
+  <div>
+    <button type="button" class="pw-btn" id="confirm-cancel" autofocus>Cancel</button>
+    <button type="button" class="pw-btn pw-btn--danger" id="confirm-ok">Save, apply and restart</button>
+  </div>
+</dialog>
+
+<div class="pw-toast" id="toast" role="status" hidden>
+  <span class="pw-pill pw-pill--idle" id="toast-state">—</span>
+  <span id="toast-message"></span>
+  <button type="button" class="pw-btn" id="toast-dismiss">Dismiss</button>
+</div>
+
 <script>
 const SETTINGS = [
   {env:'NET_SERVER_MAX_TICK_RATE', section:'/Script/OnlineSubsystemUtils.IpNetDriver', key:'NetServerMaxTickRate', type:'number', min:15, max:120, step:1, desc:'Dedicated server network tick cap. 30 is conservative; 60 is a common balanced target.'},
@@ -112,15 +265,27 @@ const SETTINGS = [
 ];
 function el(id){return document.getElementById(id)}
 function render(){
-  const root=el('settings'); root.innerHTML='';
+  const root=el('settings'); root.textContent='';
   SETTINGS.forEach(s=>{
-    const row=document.createElement('div'); row.className='setting';
-    const label=document.createElement('div'); label.innerHTML=`<label for="${s.env}">${s.key}</label><div class="desc">[${s.section}]<br>${s.desc}<br><code>${s.env}</code></div>`;
+    const row=document.createElement('div');
+    // Built node by node with textContent: the descriptions are local constants
+    // today, but this page also renders server-supplied job output, and one
+    // innerHTML habit in the file is one too many.
+    const cell=document.createElement('div');
+    const label=document.createElement('label'); label.htmlFor=s.env; label.textContent=s.key;
+    const desc=document.createElement('small');
+    const sec=document.createElement('span'); sec.textContent='['+s.section+']';
+    const txt=document.createElement('span'); txt.textContent=s.desc;
+    const env=document.createElement('code'); env.textContent=s.env;
+    desc.append(sec, document.createElement('br'), txt, document.createElement('br'), env);
+    cell.append(label, desc);
     const input=document.createElement('input'); input.id=s.env; input.dataset.env=s.env;
     if(s.type==='bool'){ input.type='checkbox'; input.value='1'; } else { input.type='number'; input.min=s.min; input.max=s.max; input.step=s.step; input.placeholder='unmanaged'; }
     input.addEventListener('input', ()=>{ el(s.env+'_enable').checked=true; generateEnv(); generateIni(); });
-    const en=document.createElement('input'); en.type='checkbox'; en.id=s.env+'_enable'; en.title='Manage this key'; en.addEventListener('change', ()=>{generateEnv(); generateIni();});
-    row.append(label,input,en); root.append(row);
+    const en=document.createElement('input'); en.type='checkbox'; en.id=s.env+'_enable';
+    en.title='Manage this key'; en.setAttribute('aria-label', 'Manage '+s.env);
+    en.addEventListener('change', ()=>{generateEnv(); generateIni();});
+    row.append(cell,input,en); root.append(row);
   });
   generateEnv(); generateIni();
 }
@@ -132,13 +297,229 @@ function preset(name){ clearAll();
   if(name==='experimental'){ setv('NET_SERVER_MAX_TICK_RATE',90); setv('MAX_CLIENT_RATE',150000); setv('MAX_INTERNET_CLIENT_RATE',150000); setv('CONNECTION_TIMEOUT',60); setv('TOTAL_NET_BANDWIDTH',750000); setv('MAX_DYNAMIC_BANDWIDTH',150000); setv('MIN_DYNAMIC_BANDWIDTH',50000); setv('ASYNC_LOADING_THREAD_ENABLED',true); setv('EVENT_DRIVEN_LOADER_ENABLED',true); setv('USE_BACKGROUND_LEVEL_STREAMING',true); setv('LEVEL_STREAMING_ACTORS_UPDATE_TIME_LIMIT',8); setv('LEVEL_STREAMING_COMPONENTS_REGISTRATION_GRANULARITY',20); setv('ALLOW_ASYNC_TICK_DISPATCH',1); setv('ALLOW_ASYNC_TICK_CLEANUP',1); }
   generateEnv(); generateIni();
 }
-function currentValue(s){ const input=el(s.env); if(!el(s.env+'_enable').checked) return null; return s.type==='bool' ? (input.checked ? 'true' : 'false') : input.value; }
-function generateEnv(){ let lines=['# Palworld Engine.ini performance overrides','# Generated by Engine.ini Performance Editor']; SETTINGS.forEach(s=>{ const v=currentValue(s); if(v!==null && v!=='') lines.push(`${s.env}=${v}`); }); el('envOut').value=lines.join('\n')+'\n'; }
-function generateIni(){ const by={}; SETTINGS.forEach(s=>{ const v=currentValue(s); if(v!==null && v!==''){ (by[s.section] ||= []).push(`${s.key}=${s.type==='bool' ? (v==='true'?'1':'0') : v}`); }}); let lines=[]; Object.keys(by).forEach(sec=>{ lines.push(`[${sec}]`, ...by[sec], ''); }); el('iniOut').value=lines.join('\n'); }
+
+// --- form state -> the settings object the control plane accepts -------------
+// One source of truth for "what the user has set": generateEnv, generateIni and
+// the two job buttons all read this, so the file preview and the POSTed payload
+// can never disagree.
+//
+// Booleans are emitted as "1"/"0" strings, never JSON true/false: the job
+// validator rejects bool outright (bool is an int subclass in Python, so
+// accepting it would silently store True as "1"), and every value here is a
+// string so JSON.stringify cannot produce one by accident. Unmanaged rows and
+// blank numbers are omitted entirely — engine_save *merges* into the existing
+// engine.env, so sending only what the user set leaves the rest managed.
+function collectSettings(){
+  const out={};
+  SETTINGS.forEach(s=>{
+    const enable=el(s.env+'_enable');
+    if(!enable || !enable.checked) return;
+    if(s.type==='bool'){ out[s.env]=el(s.env).checked ? '1' : '0'; return; }
+    const raw=String(el(s.env).value).trim();
+    if(raw==='') return;
+    out[s.env]=raw;
+  });
+  return out;
+}
+function generateEnv(){
+  const settings=collectSettings();
+  const lines=['# Palworld Engine.ini performance overrides','# Generated by the Engine.ini performance editor'];
+  SETTINGS.forEach(s=>{ if(s.env in settings) lines.push(s.env+'='+settings[s.env]); });
+  el('envOut').value=lines.join('\n')+'\n';
+}
+function generateIni(){
+  const settings=collectSettings(); const by={};
+  SETTINGS.forEach(s=>{ if(s.env in settings) (by[s.section] ||= []).push(s.key+'='+settings[s.env]); });
+  const lines=[]; Object.keys(by).forEach(sec=>{ lines.push('['+sec+']', ...by[sec], ''); });
+  el('iniOut').value=lines.join('\n');
+}
 function parseIni(txt){ let section=''; const values={}; txt.split(/\r?\n/).forEach(line=>{ const m=line.match(/^\s*\[([^\]]+)\]/); if(m){section=m[1].trim(); return;} const eq=line.indexOf('='); if(eq<0) return; const key=line.slice(0,eq).trim(), val=line.slice(eq+1).trim(); SETTINGS.forEach(s=>{ if(s.section===section && s.key===key) values[s.env]=val; }); }); clearAll(); Object.entries(values).forEach(([env,val])=>{ const s=SETTINGS.find(x=>x.env===env); if(!s) return; el(env+'_enable').checked=true; if(s.type==='bool') el(env).checked = ['1','true','yes','on'].includes(String(val).toLowerCase()); else el(env).value=val; }); generateEnv(); generateIni(); }
-async function loadCurrent(){ const resp=await fetch('current/Engine.ini?ts='+Date.now()); if(!resp.ok) throw new Error('HTTP '+resp.status); const txt=await resp.text(); el('iniText').value=txt; parseIni(txt); }
+async function loadCurrent(){
+  try {
+    const resp=await fetch('current/Engine.ini?ts='+Date.now());
+    if(!resp.ok) throw new Error('HTTP '+resp.status);
+    const txt=await resp.text(); el('iniText').value=txt; parseIni(txt);
+    log('loaded current Engine.ini ('+txt.length+' bytes)');
+  } catch(e) { const msg=errText(e); log('could not load current Engine.ini: '+msg); toast(false, msg); }
+}
 async function copy(id){ await navigator.clipboard.writeText(el(id).value); }
 function download(name,text){ const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([text],{type:'text/plain'})); a.download=name; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),1000); }
+
+// --- control plane ----------------------------------------------------------
+// Mutations need HTTP Basic (the browser already holds it for this page) *plus*
+// the token in X-Palwarden-Token. The custom header is the CSRF defence: a
+// cross-origin page cannot set it without a preflight the server never grants.
+// The token lives in sessionStorage only — never in persistent local storage,
+// never in a cookie, never in a URL, and never logged.
+const TOKEN_KEY='palwarden-token';
+const POLL_INTERVAL_MS=2000;
+// ~15 minutes. graceful-restart's own default warns players for 300 s (15 s on
+// an empty server) before stopping, then waits for REST readiness, so a healthy
+// save+apply+restart finishes well inside this. On expiry the UI says so and
+// points at the job id rather than polling forever.
+const POLL_MAX_ATTEMPTS=450;
+const TERMINAL=['succeeded','failed'];
+
+function token(){
+  let t=sessionStorage.getItem(TOKEN_KEY);
+  if(!t){
+    t=window.prompt('palwarden API token (from /etc/palworld/webui.env). Kept in this tab only.');
+    if(t){ sessionStorage.setItem(TOKEN_KEY, t); }
+  }
+  return t || '';
+}
+function errText(e){ return String((e && e.message) || e); }
+function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
+
+// Every string below is server-influenceable — the 403 reflects the request's
+// Origin back, and error/blocked_by come from the API — so it only ever reaches
+// the DOM through textContent.
+function log(line){
+  const pre=el('joblog');
+  const atBottom=pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 4;
+  if(pre.classList.contains('pw-empty')){ pre.textContent=''; pre.classList.remove('pw-empty'); }
+  pre.textContent += line + '\n';
+  if(atBottom) pre.scrollTop = pre.scrollHeight;
+}
+let toastTimer=null;
+function toast(ok, message){
+  const box=el('toast'), state=el('toast-state');
+  state.className='pw-pill pw-pill--' + (ok ? 'ok' : 'bad');
+  state.textContent = ok ? 'DONE' : 'ERROR';
+  el('toast-message').textContent=message;
+  box.hidden=false;
+  if(toastTimer){ clearTimeout(toastTimer); toastTimer=null; }
+  // Successes clear themselves; errors stay until dismissed.
+  if(ok) toastTimer=setTimeout(dismissToast, 8000);
+}
+function dismissToast(){ el('toast').hidden=true; if(toastTimer){ clearTimeout(toastTimer); toastTimer=null; } }
+
+// Both buttons are disabled for the whole life of a job and re-enabled in a
+// finally block, so a network failure or an expired poll cannot leave the page
+// permanently dead.
+function setBusy(busy){
+  ['btn-save','btn-save-apply'].forEach(id=>{ el(id).disabled=busy; });
+}
+
+async function postJob(action, params){
+  const res=await fetch('/api/jobs', {
+    method:'POST',
+    headers:{'Content-Type':'application/json','Accept':'application/json','X-Palwarden-Token':token()},
+    body: JSON.stringify({action: action, params: params}),
+  });
+  let json=null;
+  try { json=await res.json(); } catch(e) { json=null; }
+  if(res.status===202 && json && json.id) return json.id;
+  let msg=(json && json.error) ? json.error : ('HTTP '+res.status);
+  const b=json && json.blocked_by;
+  if(b) msg += ' [blocked by '+b.action+' '+b.id+' ('+b.state+')]';
+  if(res.status===403) msg += ' — check the API token (clear it with sessionStorage.removeItem("'+TOKEN_KEY+'") to be re-prompted)';
+  throw new Error(msg);
+}
+
+// Returns the finished job, or null when the bounded poll expired.
+async function pollJob(id){
+  let last='';
+  for(let i=0;i<POLL_MAX_ATTEMPTS;i++){
+    await sleep(POLL_INTERVAL_MS);
+    const res=await fetch('/api/jobs/'+encodeURIComponent(id), {headers:{'Accept':'application/json'}});
+    let json=null;
+    try { json=await res.json(); } catch(e) { json=null; }
+    if(!res.ok || !json || json.ok===false || !json.data){
+      throw new Error((json && json.error) ? json.error : ('job status: HTTP '+res.status));
+    }
+    const job=json.data;
+    const state=String(job.state || 'unknown');
+    if(state!==last){ log('state: '+state); last=state; }
+    if(TERMINAL.includes(state)) return job;
+  }
+  return null;
+}
+
+async function runJob(action, params){
+  setBusy(true);
+  dismissToast();
+  try {
+    log('POST /api/jobs ' + action);
+    const id=await postJob(action, params);
+    log('job '+id+' accepted');
+    const job=await pollJob(id);
+    if(job===null){
+      const msg='job '+id+' is still unfinished after '+Math.round(POLL_MAX_ATTEMPTS*POLL_INTERVAL_MS/60000)+
+        ' minutes; this page stopped polling. Check /api/jobs/'+id+' or the dashboard.';
+      log(msg); toast(false, msg); return;
+    }
+    if(job.output) log(String(job.output));
+    if(job.state==='succeeded'){
+      log(action+' succeeded'); toast(true, action+' succeeded');
+    } else {
+      const msg=action+' failed (exit '+String(job.exit_code)+'); see the log above';
+      log(msg); toast(false, msg);
+    }
+  } catch(e) {
+    const msg=errText(e); log('error: '+msg); toast(false, msg);
+  } finally {
+    setBusy(false);
+  }
+}
+
+// showModal() is the platform's own focus trap: the rest of the document goes
+// inert and Esc fires cancel/close, which resolves this as a cancellation.
+function confirmDisruptive(message){
+  return new Promise(resolve=>{
+    const dlg=el('confirm-dialog'), ok=el('confirm-ok'), cancel=el('confirm-cancel');
+    el('confirm-body').textContent=message;
+    let settled=false;
+    function finish(result){
+      if(settled) return;
+      settled=true;
+      ok.removeEventListener('click', onOk);
+      cancel.removeEventListener('click', onCancel);
+      dlg.removeEventListener('close', onClose);
+      resolve(result);
+    }
+    function onOk(){ finish(true); dlg.close(); }
+    function onCancel(){ finish(false); dlg.close(); }
+    function onClose(){ finish(false); }
+    ok.addEventListener('click', onOk);
+    cancel.addEventListener('click', onCancel);
+    dlg.addEventListener('close', onClose);
+    dlg.showModal();
+  });
+}
+
+function settingsOrComplain(){
+  const settings=collectSettings();
+  if(Object.keys(settings).length===0){
+    const msg='nothing to save: tick at least one key as managed and give it a value';
+    log(msg); toast(false, msg); return null;
+  }
+  return settings;
+}
+
+el('btn-save').addEventListener('click', async ()=>{
+  const settings=settingsOrComplain();
+  if(!settings) return;
+  // File-only: writes engine.env and applies nothing, so no confirmation.
+  await runJob('engine_save', {settings: settings});
+});
+
+el('btn-save-apply').addEventListener('click', async ()=>{
+  const settings=settingsOrComplain();
+  if(!settings) return;
+  const keys=Object.keys(settings).sort().join(', ');
+  const okToGo=await confirmDisruptive(
+    'This writes engine.env, runs palworld-engine-config apply, and then gracefully '+
+    'restarts the server: players are warned in-game and the world is saved before it '+
+    'goes down. The warning window is the restart tool’s own default — up to 300 s with '+
+    'players online, 15 s on an empty server (in a container the restart follows the save '+
+    'immediately). Keys: '+keys+'.');
+  if(!okToGo){ log('save and apply cancelled'); return; }
+  await runJob('engine_save_apply_restart', {settings: settings, confirm: true});
+});
+
+el('toast-dismiss').addEventListener('click', dismissToast);
+
 render();
 </script>
 </body>

@@ -399,4 +399,181 @@ for p in pathlib.Path(sys.argv[1]).glob("*.json"):
 print(",".join(sorted(seen)))' "$JOBS")"
 assert_eq "$states" "queued" "the web process only ever queued jobs, never ran one"
 
+# --- the Engine.ini editor is the first browser-side consumer of this API ----
+# Everything above proves the server's half of the contract. This section proves
+# the page actually speaks it: the right two actions, the token header, the
+# confirm gate on the disruptive one, and a payload the validators above accept.
+EDITOR="$REPO/webui/EngineIniPerformanceEditor.html"
+VENDORED="$REPO/webui/PalWorldSettingsEditor.html"
+
+# provenance: first-party header on ours, byte-identical vendored file next to it
+assert_file_contains "$EDITOR" "SPDX-License-Identifier: AGPL-3.0-or-later" \
+  "the Engine editor carries the AGPL identifier"
+assert_file_contains "$EDITOR" "SPDX-FileCopyrightText: 2026 Brian Grant" \
+  "the Engine editor carries our copyright"
+assert_file_contains "$EDITOR" "CREDITS.md" "the Engine editor notes its MIT derivation"
+assert_rc 0 git -C "$REPO" diff --quiet -- webui/PalWorldSettingsEditor.html
+assert_rc 0 test -f "$VENDORED"
+
+# the two controls, and only those two: apply-without-restart is deliberately absent
+assert_file_contains "$EDITOR" 'id="btn-save"' "the editor has a Save control"
+assert_file_contains "$EDITOR" 'id="btn-save-apply"' "the editor has a Save and apply control"
+assert_file_contains "$EDITOR" "'engine_save'" "Save enqueues engine_save"
+assert_file_contains "$EDITOR" "'engine_save_apply_restart'" \
+  "Save and apply enqueues engine_save_apply_restart"
+assert_file_not_contains "$EDITOR" "'engine_apply'" \
+  "apply-without-restart is not offered (Engine.ini only takes effect on restart)"
+
+# mutations carry the token header, from sessionStorage and nowhere else
+assert_file_contains "$EDITOR" "X-Palwarden-Token" "the editor sends the token header"
+assert_file_contains "$EDITOR" "sessionStorage.getItem" "the token is read from sessionStorage"
+assert_file_not_contains "$EDITOR" "localStorage" "the token never lands in localStorage"
+assert_file_not_contains "$EDITOR" "document.cookie" "the token is never put in a cookie"
+assert_file_not_contains "$EDITOR" "Authorization: Bearer" \
+  "the token does not try to share the Basic auth header"
+
+# the disruptive path goes through pw-confirm, with confirm: true in the body
+assert_file_contains "$EDITOR" 'class="pw-confirm"' "the disruptive path has a pw-confirm dialog"
+assert_file_contains "$EDITOR" "showModal" "the confirm dialog is modal (focus-trapped, Esc cancels)"
+assert_file_contains "$EDITOR" "confirm: true" "the disruptive body carries confirm: true"
+assert_file_contains "$EDITOR" 'aria-live="polite"' "the job log is announced politely"
+assert_file_contains "$EDITOR" 'class="pw-log' "job progress goes in a pw-log region"
+assert_file_contains "$EDITOR" 'id="toast"' "outcomes go in a pw-toast"
+
+# structural checks a grep cannot express: no innerHTML on a page that renders
+# server-supplied error/blocked_by/Origin text, only vocabulary tokens, and the
+# two request bodies carrying no param key besides settings/confirm.
+structural="$(python3 - "$EDITOR" <<'PY'
+import re, sys
+src = open(sys.argv[1], encoding="utf-8").read()
+bad = []
+
+# 1. innerHTML is never assigned anything but the empty string.
+for m in re.finditer(r"\.innerHTML\s*=\s*([^;\n]*)", src):
+    if m.group(1).strip() not in ('""', "''"):
+        bad.append("innerHTML assigned %r" % m.group(1).strip())
+
+# 2. Raw hex colors only inside the :root token block.
+style = re.search(r"<style>(.*?)</style>", src, re.S)
+if not style:
+    bad.append("no <style> block")
+else:
+    css = style.group(1)
+    root = re.search(r":root\s*\{.*?\}", css, re.S)
+    if not root:
+        bad.append("no :root token block")
+    outside = css.replace(root.group(0), "") if root else css
+    for m in re.finditer(r"#[0-9a-fA-F]{3,8}\b", outside):
+        bad.append("raw hex outside :root: %s" % m.group(0))
+
+# 3. No inline style attributes.
+if re.search(r"\sstyle=", src):
+    bad.append("inline style attribute")
+
+# 4. The POSTed params objects mention no key other than settings/confirm, and
+#    no JSON boolean inside settings.
+calls = re.findall(r"runJob\(\s*'([a-z_]+)'\s*,\s*\{([^}]*)\}", src)
+if len(calls) != 2:
+    bad.append("expected exactly 2 runJob call sites, found %d" % len(calls))
+for action, params in calls:
+    keys = re.findall(r"([A-Za-z_][A-Za-z0-9_]*)\s*:", params)
+    for key in keys:
+        if key not in ("settings", "confirm"):
+            bad.append("%s passes an unrecognised param key: %s" % (action, key))
+    if action == "engine_save_apply_restart" and "confirm: true" not in params:
+        bad.append("engine_save_apply_restart is missing confirm: true")
+    if action == "engine_save" and "confirm" in keys:
+        bad.append("engine_save should not send confirm")
+    if re.search(r"settings\s*:\s*(true|false)", params):
+        bad.append("%s sends a boolean for settings" % action)
+
+print("OK" if not bad else "; ".join(bad))
+PY
+)"
+assert_eq "$structural" "OK" "the editor's DOM/CSS/payload invariants hold"
+
+# --- exercise the real collectSettings() under node -------------------------
+# A grep proving a button exists is weak; this runs the page's own payload
+# builder against a stubbed form and checks the object the API would receive.
+if command -v node >/dev/null 2>&1; then
+  CS_JS="$WORK/collectSettings.js"
+  awk '/^const SETTINGS = \[/{f=1} f{print} f && /^\];/{exit}' "$EDITOR" > "$CS_JS"
+  awk '/^function collectSettings\(\)\{/{f=1} f{print} f && /^}/{exit}' "$EDITOR" >> "$CS_JS"
+  cat >> "$CS_JS" <<'EOF'
+
+// Stub form state: el(id) returns the input nodes collectSettings reads.
+let STATE = {};
+function el(id){ return STATE[id]; }
+function form(rows){
+  STATE = {};
+  for (const s of SETTINGS) {
+    STATE[s.env + "_enable"] = { checked: false };
+    STATE[s.env] = s.type === "bool" ? { checked: false } : { value: "" };
+  }
+  for (const [env, spec] of Object.entries(rows)) {
+    STATE[env + "_enable"].checked = spec.managed !== false;
+    if ("checked" in spec) STATE[env].checked = spec.checked;
+    if ("value" in spec) STATE[env].value = spec.value;
+  }
+}
+const KNOWN = new Set(SETTINGS.map(s => s.env));
+let failures = 0;
+function check(desc, cond) { if (!cond) { failures++; console.log("FAIL: " + desc); } }
+
+// nothing managed -> empty object (the API refuses an empty settings map, so the
+// page must not post one)
+form({});
+check("no managed rows yields no settings", Object.keys(collectSettings()).length === 0);
+
+// a managed row with a blank value is not sent (it would fail normalize_value)
+form({ NET_SERVER_MAX_TICK_RATE: { value: "" } });
+check("a blank managed number is omitted", Object.keys(collectSettings()).length === 0);
+
+// an unmanaged row is never sent even with a value: engine_save merges, so an
+// untouched key must stay whatever engine.env already says
+form({ NET_SERVER_MAX_TICK_RATE: { managed: false, value: "60" } });
+check("an unmanaged row is omitted", Object.keys(collectSettings()).length === 0);
+
+form({
+  NET_SERVER_MAX_TICK_RATE: { value: " 60 " },
+  LEVEL_STREAMING_ACTORS_UPDATE_TIME_LIMIT: { value: "5.5" },
+  ASYNC_LOADING_THREAD_ENABLED: { checked: true },
+  EVENT_DRIVEN_LOADER_ENABLED: { checked: false },
+});
+const got = collectSettings();
+check("only the managed rows are sent", Object.keys(got).length === 4);
+check("every key is one the worker knows", Object.keys(got).every(k => KNOWN.has(k)));
+check("every value is a string", Object.values(got).every(v => typeof v === "string"));
+check("whitespace is trimmed", got.NET_SERVER_MAX_TICK_RATE === "60");
+check("floats survive", got.LEVEL_STREAMING_ACTORS_UPDATE_TIME_LIMIT === "5.5");
+check("a true bool is 1, not true", got.ASYNC_LOADING_THREAD_ENABLED === "1");
+check("a false bool is 0, not false", got.EVENT_DRIVEN_LOADER_ENABLED === "0");
+
+// the wire form: no JSON booleans anywhere inside settings, and the two bodies
+// carry no param key the worker's whitelist would reject
+const save = JSON.stringify({ action: "engine_save", params: { settings: got } });
+const apply = JSON.stringify({ action: "engine_save_apply_restart", params: { settings: got, confirm: true } });
+check("engine_save body has no boolean setting", !/:(true|false)/.test(JSON.stringify(got)));
+check("engine_save sends only settings",
+      JSON.stringify(Object.keys(JSON.parse(save).params).sort()) === '["settings"]');
+check("engine_save_apply_restart sends only settings and confirm",
+      JSON.stringify(Object.keys(JSON.parse(apply).params).sort()) === '["confirm","settings"]');
+check("confirm is the only boolean in the disruptive body",
+      JSON.parse(apply).params.confirm === true);
+console.log(failures === 0 ? "OK" : "FAIL");
+EOF
+  cs_out="$(node "$CS_JS" 2>&1)"
+  assert_eq "$cs_out" "OK" "collectSettings() extracted from the editor builds an acceptable payload"
+
+else
+  echo "  (skipping the node checks of collectSettings(): node not found)" >&2
+fi
+
+# ...and the exact wire shape the page builds is accepted by the real validators,
+# strings for bools included (a shape check alone would not prove that).
+assert_eq "$(post_json '{"action":"engine_save","params":{"settings":{"NET_SERVER_MAX_TICK_RATE":"60","ASYNC_LOADING_THREAD_ENABLED":"1","LEVEL_STREAMING_ACTORS_UPDATE_TIME_LIMIT":"5.5"}}}')" \
+  "202" "the string-valued payload the page posts is accepted by the API"
+assert_eq "$(post_json '{"action":"engine_save_apply_restart","params":{"settings":{"NET_SERVER_MAX_TICK_RATE":"60"},"confirm":true}}')" \
+  "409" "the disruptive payload the page posts validates (and serialises behind the pending restart)"
+
 assert_report
