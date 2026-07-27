@@ -40,12 +40,16 @@ ARCHIVE_RE = re.compile(r"^palworld-save-[0-9]{8}T[0-9]{6}Z\.tar\.gz$")
 ALLOWED_TOPLEVEL = ("SaveGames", "Config")
 
 
-def _env_int(name: str, default: int) -> int:
+def env_int(name: str, default: int) -> int:
     """A positive int from the environment, falling back to `default`.
 
     Both caps are ceilings, so a malformed or non-positive override must not be
     able to *lower* one to zero (which would refuse every archive) or turn a
     typo into "no limit". A bad value is simply the default.
+
+    Generic enough that other tools reuse it (`palworld-restore`'s upload-size
+    and free-space ceilings), which is why it is public rather than a private
+    helper reached into from outside this module.
     """
     raw = os.environ.get(name)
     if not raw:
@@ -57,13 +61,18 @@ def _env_int(name: str, default: int) -> int:
     return value if value > 0 else default
 
 
+# Kept as an alias, not just renamed: nothing outside this module used the old
+# name, but the alias costs one line and avoids hunting for a straggler import.
+_env_int = env_int
+
+
 # Decompression-bomb ceilings. A save tree is a few thousand files and a few
 # hundred MiB, so these are orders of magnitude of headroom over anything
 # legitimate; they exist so a 20 KiB upload cannot fill the data volume or spin
 # root for hours. Both are enforced while *iterating headers*, before any member
 # is written, so hitting a cap costs nothing.
-MAX_MEMBERS = _env_int("PALWARDEN_ARCHIVE_MAX_MEMBERS", 200000)
-MAX_UNCOMPRESSED_BYTES = _env_int("PALWARDEN_ARCHIVE_MAX_BYTES", 20 * 1024**3)
+MAX_MEMBERS = env_int("PALWARDEN_ARCHIVE_MAX_MEMBERS", 200000)
+MAX_UNCOMPRESSED_BYTES = env_int("PALWARDEN_ARCHIVE_MAX_BYTES", 20 * 1024**3)
 
 
 class ArchiveError(Exception):
@@ -158,7 +167,21 @@ def _check_member(member: tarfile.TarInfo) -> None:
         raise ArchiveError(f"archive member is outside {ALLOWED_TOPLEVEL}: {name!r}")
 
 
-def _validate_fileobj(fh, path, max_members: int, max_bytes: int) -> dict:
+def validate_archive_fileobj(fh, label, *, max_members: int, max_bytes: int) -> dict:
+    """Check every member readable from `fh`, returning {"members", "bytes"}.
+
+    Raises ArchiveError naming the offending member, with `label` (a path or
+    anything else identifying the archive to a human) folded into the message.
+
+    **The caller owns proving `fh` is safe to read.** This function trusts the
+    descriptor it is given completely — it does no symlink, FIFO, or regular-
+    file check of its own. A caller that opens `label` itself with a plain
+    `open(path, "rb")` bypasses every one of `open_archive_fd`'s refusals (the
+    symlink that lets an unprivileged writer choose what root reads, the FIFO
+    that blocks a root process forever) and hands them straight to `tarfile`.
+    The only safe way to obtain `fh` is `os.fdopen(open_archive_fd(path), ...)`,
+    or a `dup` of a descriptor that itself came from there.
+    """
     members = 0
     total = 0
     try:
@@ -170,7 +193,7 @@ def _validate_fileobj(fh, path, max_members: int, max_bytes: int) -> dict:
                 members += 1
                 if members > max_members:
                     raise ArchiveError(
-                        f"archive has more than {max_members} members; refused: {path}")
+                        f"archive has more than {max_members} members; refused: {label}")
                 # Directories and short reads report 0 or (in a crafted header) a
                 # negative size; max() keeps a negative size from crediting back
                 # against the running total.
@@ -178,13 +201,13 @@ def _validate_fileobj(fh, path, max_members: int, max_bytes: int) -> dict:
                 if total > max_bytes:
                     raise ArchiveError(
                         f"archive expands to more than {max_bytes} bytes; "
-                        f"refused: {path}")
+                        f"refused: {label}")
     except ArchiveError:
         raise
     except (tarfile.TarError, OSError, EOFError) as exc:
         # A truncated upload, a corrupt gzip stream or a read error is a clean
         # refusal, not a traceback out of the root worker.
-        raise ArchiveError(f"unreadable archive {path}: {exc}") from exc
+        raise ArchiveError(f"unreadable archive {label}: {exc}") from exc
     return {"members": members, "bytes": total}
 
 
@@ -195,6 +218,11 @@ def validate_archive(path, max_members=MAX_MEMBERS,
     Raises ArchiveError naming the offending member. Reads nothing but headers,
     and writes nothing at all, so it is safe to call on an upload before
     deciding whether to keep it.
+
+    A thin wrapper: it is `open_archive_fd` (the part that refuses a symlink or
+    a FIFO by construction) followed by `validate_archive_fileobj`, kept as one
+    call so a caller with only a path never has to get the fd-safety obligation
+    right themselves.
     """
     fd = open_archive_fd(path)
     try:
@@ -203,7 +231,8 @@ def validate_archive(path, max_members=MAX_MEMBERS,
         os.close(fd)
         raise ArchiveError(f"cannot read archive {path}: {exc}") from exc
     with fh:
-        return _validate_fileobj(fh, path, max_members, max_bytes)
+        return validate_archive_fileobj(
+            fh, path, max_members=max_members, max_bytes=max_bytes)
 
 
 def extract_archive(path, dest_dir, max_members=MAX_MEMBERS,
@@ -243,7 +272,8 @@ def extract_archive(path, dest_dir, max_members=MAX_MEMBERS,
         os.close(fd)
         raise ArchiveError(f"cannot read archive {path}: {exc}") from exc
     with fh:
-        info = _validate_fileobj(fh, path, max_members, max_bytes)
+        info = validate_archive_fileobj(
+            fh, path, max_members=max_members, max_bytes=max_bytes)
         fh.seek(0)
         try:
             with tarfile.open(fileobj=fh, mode="r:gz") as tf:

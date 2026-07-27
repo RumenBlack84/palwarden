@@ -63,18 +63,17 @@ BACKUP_DIR = Path(os.environ.get("PALWARDEN_SAVE_BACKUP_DIR", "/opt/palworld/bac
 # it bounds what one promotion can cost in copy time and disk. A real save
 # archive is tens to hundreds of MiB.
 #
-# Both caps below reuse palwarden_archive's own env-int reader rather than
-# growing a second copy of "positive int or default" with its own bugs. It is
-# named with a leading underscore there, which is the honest cost of not editing
-# that module from this task; the alternative was duplicating the exact helper
-# whose whole purpose is that a malformed override cannot lower a ceiling to zero.
-MAX_UPLOAD_BYTES = archive._env_int("PALWARDEN_IMPORT_MAX_BYTES", 8 * 1024**3)
+# Both caps below reuse palwarden_archive's own public env-int reader rather
+# than growing a second copy of "positive int or default" with its own bugs —
+# the exact helper whose whole purpose is that a malformed override cannot
+# lower a ceiling to zero.
+MAX_UPLOAD_BYTES = archive.env_int("PALWARDEN_IMPORT_MAX_BYTES", 8 * 1024**3)
 # Free space required on the backups filesystem *beyond* the archive itself. A
 # web process that can fill that volume by uploading is a denial of service
 # against palworld-backup, which is the thing the operator will need next. Kept
 # modest so a tight volume can still take an import, and overridable for the
 # operator who knows their own margins.
-FREE_HEADROOM_BYTES = archive._env_int("PALWARDEN_IMPORT_FREE_HEADROOM", 64 * 1024**2)
+FREE_HEADROOM_BYTES = archive.env_int("PALWARDEN_IMPORT_FREE_HEADROOM", 64 * 1024**2)
 
 COPY_CHUNK = 1024 * 1024
 
@@ -164,16 +163,20 @@ def _pre_validate(fd: int, path: Path) -> dict:
     than the one being promoted. `dup` shares the file offset, hence the explicit
     rewind in `_copy_fd_to_temp`.
 
-    This reaches for palwarden_archive's `_validate_fileobj` because its public
-    entry point takes a path and opens it itself; there is no descriptor-shaped
-    public door, and `/proc/self/fd/N` is a symlink so `open_archive_fd` refuses
-    it by design. Re-opening the name here was the alternative and is precisely
-    what this file exists not to do.
+    Calls palwarden_archive's `validate_archive_fileobj` directly rather than
+    `validate_archive`, because that entry point takes a path and opens it
+    itself; there is no other public door taking a descriptor, and
+    `/proc/self/fd/N` is a symlink so `open_archive_fd` refuses it by design.
+    Re-opening the name here was the alternative and is precisely what this
+    file exists not to do. Safe only because `fd` traces back to
+    `open_archive_fd` via `_open_staged` — see that function's docstring on the
+    obligation this now-public helper puts on its caller.
     """
     fh = os.fdopen(os.dup(fd), "rb")
     with fh:
-        return archive._validate_fileobj(
-            fh, path, archive.MAX_MEMBERS, archive.MAX_UNCOMPRESSED_BYTES)
+        return archive.validate_archive_fileobj(
+            fh, path, max_members=archive.MAX_MEMBERS,
+            max_bytes=archive.MAX_UNCOMPRESSED_BYTES)
 
 
 def _temp_path(name: str) -> Path:
@@ -279,13 +282,20 @@ def import_staged(staged: str) -> Path:
     BACKUP_DIR.mkdir(parents=True, exist_ok=True, mode=0o755)
     fd = _open_staged(path)
     try:
-        _check_capacity(fd)
+        size = _check_capacity(fd)
         _pre_validate(fd, path)  # advisory only; see the docstring
         tmp = _temp_path(path.name)
         # Outside the try below on purpose: _copy_fd_to_temp cleans up its own
         # partial output, and if it failed to *create* the temp at all (O_EXCL on
         # something already at that name) then that file is not ours to remove.
-        _copy_fd_to_temp(fd, tmp, MAX_UPLOAD_BYTES)
+        #
+        # Bounded by `size`, the size the free-space decision above was actually
+        # made on, not by MAX_UPLOAD_BYTES: the staging file is web-writable, so
+        # a stat taken before the copy can grow stale, and licensing the copy up
+        # to the (much larger) ceiling would let exactly that growth write past
+        # the space statvfs approved — the same in-place-growth primitive the
+        # capacity check exists to defend against, just moved a few lines later.
+        _copy_fd_to_temp(fd, tmp, min(MAX_UPLOAD_BYTES, size))
         try:
             # THE authoritative check. `tmp` is in a directory the web process
             # cannot write, so from here "what was validated" and "what is on
@@ -312,8 +322,20 @@ def import_staged(staged: str) -> Path:
         except BaseException:
             _unlink_quietly(tmp)
             raise
-        # The archive is now at its final name; the temp link is surplus.
-        _unlink_quietly(tmp)
+        # The archive is now at its final name; the temp link is surplus. Unlike
+        # the failure path above, a failure *here* leaves a second, fully valid
+        # hardlink to the promoted archive sitting in the backups directory
+        # forever — indistinguishable from a real backup to anything that lists
+        # the directory (GET /api/backups included) — so the warning names it
+        # explicitly rather than folding it into _unlink_quietly's generic text.
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            print(f"palworld-restore: warning: promoted {final} but the surplus "
+                  f"temp link {tmp} could not be removed and needs manual "
+                  f"removal: {exc}", file=sys.stderr)
     finally:
         os.close(fd)
     # Only now is the upload disposable. Not fatal if it cannot be removed: the
