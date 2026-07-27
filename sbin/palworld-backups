@@ -1,0 +1,509 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Brian Grant
+"""Own the *collection* of world-save archives: deletion, retention, and the tick.
+
+Runs as root (a systemd timer, an s6 periodic service, or `palwarden-jobd`'s
+backup actions), because the backups directory is root-owned and `palworld-backup`
+needs root to read the world tree and chown what it writes.
+
+The boundary against the neighbouring tools is deliberate and worth stating, since
+all four touch the same directory:
+
+  * `palworld-backup` (singular) makes **one** archive now, and nothing else.
+  * `palworld-backups` (this file) manages the **set** of archives.
+  * `palworld-restore` turns **one** archive back into a running world.
+
+**The two removal paths have deliberately different safety rules.** They are not
+two spellings of one operation, and a future change that "unifies" them breaks one
+of the two:
+
+  * `--prune` **has a floor.** It never deletes the last remaining archive, whatever
+    the settings say — a retention policy that can empty the backups directory is a
+    data-loss bug, not a configuration choice. It also keeps the newest
+    `BACKUP_KEEP_MIN` archives regardless of age, because age alone leaves a host
+    that was powered off for a month with nothing at all.
+  * `--delete` **has no floor.** An operator who reaches it has passed three
+    confirmations in the web UI, the last of which says explicitly when it is the
+    only archive left. Refusing at that point would override a decision they stated
+    three times, so deleting the only archive succeeds.
+
+The schedule lives in a **file** (`PALWORLD_BACKUP_SCHEDULE`), not in a unit, and a
+short fixed tick asks this tool whether a backup is due rather than the supervisor
+deciding. That is what lets one implementation serve systemd and s6, lets the
+interval be changed from the browser with nothing to reload, and lets a host that
+was powered off back up on the first tick after boot instead of missing a window.
+It is also why a typo in that file must never be fatal: an unparseable value warns
+and falls back to the default, because a crash here silently stops backups on the
+one host whose operator was editing the file.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import stat
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# Mirror how palworld-restore and palwarden-jobd locate their shared module:
+# prepend the bare-metal lib dir and the repo's lib/ so `palwarden_archive`
+# resolves both in the installed layout and in a dev checkout. The repo path is
+# inserted second so it wins, which is what lets the suite run against the working
+# tree even on a host with palwarden installed.
+sys.path.insert(0, "/usr/local/lib")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import palwarden_archive as archive  # noqa: E402
+
+# The same variable palworld-backup writes to, palworld-restore imports into, and
+# palwarden-webui lists for /api/backups (PALWORLD_BACKUP_DIR already means *config*
+# backups in this repo), so one override moves writer, lister, importer and this
+# manager together.
+BACKUP_DIR = Path(os.environ.get("PALWARDEN_SAVE_BACKUP_DIR", "/opt/palworld/backups"))
+# Where the operational tools live, located exactly as palwarden-jobd and
+# palworld-restore locate them, so one override moves them together (and so the
+# suite can point at a stub that records its argv).
+SBIN = Path(os.environ.get("PALWARDEN_SBIN_DIR", "/usr/local/sbin"))
+# Root-owned 0644 and not a secret: it is tuning, written only by root via the
+# `backup_schedule_save` job action, never by the web process directly.
+SCHEDULE_FILE = Path(os.environ.get("PALWORLD_BACKUP_SCHEDULE",
+                                    "/etc/palworld/backup.env"))
+
+SECONDS_PER_DAY = 86400
+SECONDS_PER_HOUR = 3600
+
+# The effective schedule when the file is absent, which is the normal state on a
+# host where nobody has opened the panel yet. Ordinary daily backups kept a
+# fortnight, with three always retained.
+DEFAULTS: dict[str, object] = {
+    "BACKUP_ENABLED": True,
+    "BACKUP_INTERVAL_HOURS": 24,
+    "BACKUP_RETENTION_DAYS": 14,
+    "BACKUP_KEEP_MIN": 3,
+}
+
+# Inclusive ranges from the design spec. These bound *typos*, not preferences: 720
+# hours is a month, 3650 days is a decade, and 100 kept archives is more world saves
+# than any volume here holds.
+RANGES: dict[str, tuple[int, int]] = {
+    "BACKUP_INTERVAL_HOURS": (1, 720),
+    "BACKUP_RETENTION_DAYS": (1, 3650),
+    "BACKUP_KEEP_MIN": (1, 100),
+}
+
+TRUE_WORDS = {"1", "true", "yes", "on"}
+FALSE_WORDS = {"0", "false", "no", "off"}
+
+
+def _warn(message: str) -> None:
+    """One prefix for every diagnostic, so a job log line names its source."""
+    print(f"palworld-backups: warning: {message}", file=sys.stderr)
+
+
+def read_schedule() -> dict:
+    """The effective schedule: defaults, overlaid with whatever the file validly says.
+
+    **Never raises.** Every failure mode — a missing file, an unreadable one, a key
+    that is not an integer, a value outside its range, a bool that is not a bool —
+    warns on stderr and leaves that key's default in place. This is the whole reason
+    the schedule is a file rather than a unit: the tick has to keep running. A tool
+    that exited non-zero on a stray character would stop backups on exactly the host
+    whose operator was mid-edit, and the failure would be invisible until the day
+    someone needed a restore.
+
+    Out-of-range values fall back to the **default**, they are not clamped to the
+    nearest bound. `BACKUP_RETENTION_DAYS=3560` where `356` was meant should give 14
+    days and a warning, not a silently accepted decade in which nothing is ever
+    pruned again. The bound is what defines "wrong"; the default is the repair.
+
+    Parsing is the same shape as `palworld-engine-config`'s `parse_env` — comments,
+    blank lines, and surrounding quotes tolerated, unknown keys ignored — because
+    this file is rendered from the same kind of env source.
+    """
+    sched = dict(DEFAULTS)
+    try:
+        text = SCHEDULE_FILE.read_text(errors="replace")
+    except FileNotFoundError:
+        # The normal state before anyone saves a schedule, so not a warning.
+        return sched
+    except OSError as exc:
+        _warn(f"cannot read {SCHEDULE_FILE} ({exc}); using the default schedule")
+        return sched
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        # Only our four keys. The file may be rendered alongside other settings,
+        # and a stray key is not an error worth a warning.
+        if key not in DEFAULTS:
+            continue
+        if key == "BACKUP_ENABLED":
+            low = value.lower()
+            if low in TRUE_WORDS:
+                sched[key] = True
+            elif low in FALSE_WORDS:
+                sched[key] = False
+            else:
+                _warn(f"{key}={value!r} in {SCHEDULE_FILE} is not a boolean; "
+                      f"using the default {DEFAULTS[key]}")
+            continue
+        low, high = RANGES[key]
+        try:
+            number = int(value)
+        except ValueError:
+            _warn(f"{key}={value!r} in {SCHEDULE_FILE} is not an integer; "
+                  f"using the default {DEFAULTS[key]}")
+            continue
+        if not low <= number <= high:
+            _warn(f"{key}={number} in {SCHEDULE_FILE} is outside {low}-{high}; "
+                  f"using the default {DEFAULTS[key]}")
+            continue
+        sched[key] = number
+    return sched
+
+
+def list_archives() -> list[str]:
+    """Archive names in BACKUP_DIR, newest first. Never raises on a missing dir.
+
+    Three filters, and each one earns its place:
+
+      * `valid_archive_name` — only names `palworld-backup` could have written. This
+        is what keeps a prune away from `palworld-restore`'s in-flight
+        `.<name>.import.<hex>` temp file, which lives in this very directory while a
+        promotion is copying and is not an archive yet.
+      * regular files only, `follow_symlinks=False` — a symlink is not an archive we
+        wrote, and its *target* is what a size or age question would otherwise be
+        answered from.
+      * sorted by **name**, descending. The name carries a UTC stamp that sorts
+        lexically, so this is a total order that does not change under a `touch`,
+        a copy, or a clock adjustment — which matters because it is what decides
+        *which* archives `BACKUP_KEEP_MIN` protects.
+    """
+    names: list[str] = []
+    try:
+        with os.scandir(BACKUP_DIR) as entries:
+            for entry in entries:
+                if not archive.valid_archive_name(entry.name):
+                    continue
+                try:
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                except OSError:
+                    continue
+                names.append(entry.name)
+    except FileNotFoundError:
+        # Nothing has ever been backed up on this host. Not an error: --if-due
+        # treats it as "a backup is due", which is exactly right.
+        return []
+    except OSError as exc:
+        _warn(f"cannot list {BACKUP_DIR} ({exc}); treating it as empty")
+        return []
+    names.sort(reverse=True)
+    return names
+
+
+def delete_archive(name: str) -> Path:
+    """Remove one archive by name. Raises ArchiveError on any refusal.
+
+    **No floor, on purpose** — see the module docstring. The operator passed three
+    confirmations, so this will happily leave the directory empty. The prune floor
+    lives in `prune_archives` and must not be copied here.
+
+    Every check is on the *entry*, never on what it points at, and the name is
+    validated before the filesystem is touched at all. The backups directory is
+    root-owned so its entries cannot be substituted, but `palworld-backup` chowns
+    each archive to the service account and `palwarden-webui` runs as that account,
+    so an archive file itself is writable by the untrusted web process today.
+
+    The separator guard and the `is_symlink` refusal are both structurally redundant
+    — `valid_archive_name`'s pattern contains no `/`, and a symlink also fails the
+    `S_ISREG` test below — and both stay anyway, for the reason
+    `palworld-restore._staged_path` gives: they state the intent where a reader looks
+    for it, and they name the *actual* problem instead of surfacing a generic one.
+    That makes each one falsifiable only through its message, so the suite pins the
+    wording of each separately.
+    """
+    if not isinstance(name, str) or "/" in name or "\\" in name:
+        raise archive.ArchiveError(f"a backup must be a bare file name, got {name!r}")
+    if not archive.valid_archive_name(name):
+        raise archive.ArchiveError(
+            f"{name!r} is not a name palworld-backup could have written; refused")
+    path = BACKUP_DIR / name
+    # lstat-based, so it decides on the entry rather than following it.
+    if path.is_symlink():
+        raise archive.ArchiveError(
+            f"refusing to delete {path}: it is a symlink, not an archive this tool "
+            f"wrote")
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError as exc:
+        raise archive.ArchiveError(f"no such backup: {path}") from exc
+    except OSError as exc:
+        raise archive.ArchiveError(f"cannot inspect {path}: {exc}") from exc
+    if not stat.S_ISREG(st.st_mode):
+        raise archive.ArchiveError(
+            f"refusing to delete {path}: it is not a regular file")
+    try:
+        os.unlink(path)
+    except OSError as exc:
+        raise archive.ArchiveError(f"cannot delete {path}: {exc}") from exc
+    return path
+
+
+def prune_archives(retention_days: int, keep_min: int,
+                   now: float | None = None) -> list[str]:
+    """Apply retention. Returns the names deleted, oldest first.
+
+    Deletion is by **age**, not by count: many archives inside the retention window
+    all survive, however many there are. That matters because a burst of restores
+    each takes a pre-restore safety archive, and a count-based rule would let those
+    push out an older archive that is still inside the window. Count enters only as
+    the `keep_min` floor.
+
+    Pre-restore safety archives share the naming pattern and this directory, so they
+    are pruned like any other archive. That is intended: they *are* ordinary
+    backups, and exempting them would grow the directory without bound with no rule
+    that ever removes them.
+
+    Two independent protections, and they are not the same protection twice:
+
+      * `keep_min` protects the newest N **by name**, whatever their age, so a host
+        that was powered off for a month does not wake with zero backups.
+      * The `survivors <= 1` guard protects the **last** archive unconditionally.
+
+    The parameters are explicit rather than read from `read_schedule()` inside, and
+    that is load-bearing rather than tidy: `read_schedule` clamps `keep_min` to at
+    least 1, which makes the never-empty guard unreachable through the CLI — the
+    `names[keep_min:]` slice already excludes the newest archive. A guard whose only
+    defence is *another* guard has no test of its own and is the kind that gets
+    deleted as dead code, so the suite calls this function directly with
+    `keep_min=0`, deliberately bypassing the clamp, to prove the guard holds on its
+    own. It is what has to survive a bug in the clamp. Do not fold these parameters
+    back into a `read_schedule()` call.
+    """
+    if now is None:
+        now = time.time()
+    names = list_archives()  # newest first, by name
+    cutoff = now - retention_days * SECONDS_PER_DAY
+    # The newest keep_min are off the table before age is even considered.
+    candidates = names[keep_min:]
+    survivors = len(names)
+    deleted: list[str] = []
+    # Oldest first, so that if the floor below stops the loop it is the *newest*
+    # archives that are left standing.
+    for name in reversed(candidates):
+        if survivors <= 1:
+            print(f"prune: {name} is the last remaining archive and retention never "
+                  f"empties the backups directory, so it stays regardless of its age")
+            break
+        path = BACKUP_DIR / name
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            # Raced with an operator's own `--delete`, or with another prune.
+            # Nothing to do, and nothing worth a warning.
+            continue
+        except OSError as exc:
+            _warn(f"cannot inspect {path} ({exc}); leaving it in place")
+            continue
+        if st.st_mtime >= cutoff:
+            # Inside the retention window. Not `break`: the iteration order is by
+            # name and the decision is on mtime, and an imported or copied archive
+            # can carry an mtime that disagrees with its name.
+            continue
+        try:
+            os.unlink(path)
+        except OSError as exc:
+            _warn(f"cannot prune {path} ({exc}); leaving it in place")
+            continue
+        deleted.append(name)
+        survivors -= 1
+        age_days = (now - st.st_mtime) / SECONDS_PER_DAY
+        print(f"pruned: {name} ({age_days:.1f} days old, past the "
+              f"{retention_days}-day retention window)")
+    return deleted
+
+
+def newest_archive_mtime() -> float | None:
+    """When the most recent archive was written, or None when there are none.
+
+    The **largest mtime**, deliberately not the mtime of the name that sorts newest.
+    `--prune` asks "which archives are the newest N", an identity question whose
+    stable answer is the name; this asks "when did we last back up", which is a
+    question about time. An archive promoted by `--import` carries an old stamp in
+    its name and a fresh mtime, and for scheduling purposes the honest answer is
+    that something was written to this directory just now.
+    """
+    newest: float | None = None
+    for name in list_archives():
+        try:
+            st = os.lstat(BACKUP_DIR / name)
+        except OSError:
+            continue
+        if newest is None or st.st_mtime > newest:
+            newest = st.st_mtime
+    return newest
+
+
+def backup_due(newest_mtime: float | None, now: float, interval_hours: int) -> bool:
+    """Is a scheduled backup due? Pure, so the suite can cross an interval instantly.
+
+    No clock reading, no filesystem, no config: every input is an argument. That is
+    what lets the decision be tested at the boundary and either side of it without
+    waiting real hours, and it is the only part of the tick whose logic is worth
+    getting exactly right.
+
+    `None` means no archive exists, which is due — the first tick on a fresh or
+    rebuilt host must produce a backup rather than wait an interval first.
+
+    `>=` and not `>`: at exactly the interval the backup is due. A tick that fires
+    on the same cadence as the interval would otherwise skip every other window on
+    the strength of a few milliseconds.
+    """
+    if newest_mtime is None:
+        return True
+    return (now - newest_mtime) >= interval_hours * SECONDS_PER_HOUR
+
+
+def run_if_due(sched: dict) -> int:
+    """Create a backup if the schedule says one is due. Returns an exit code.
+
+    `BACKUP_ENABLED=false` is a no-op here rather than something the supervisor
+    turns off, which is what lets the periodic service stay enabled while the
+    operator switches backups off from the browser — no unit to disable, no
+    `daemon-reload`, and nothing root has to be asked to do from a web request.
+    """
+    if not sched["BACKUP_ENABLED"]:
+        print("if-due: scheduled backups are disabled (BACKUP_ENABLED=false); "
+              "creating nothing.")
+        return 0
+    interval = int(sched["BACKUP_INTERVAL_HOURS"])
+    newest = newest_archive_mtime()
+    now = time.time()
+    if not backup_due(newest, now, interval):
+        age_hours = (now - newest) / SECONDS_PER_HOUR  # newest is not None here
+        print(f"if-due: not due - the newest archive is {age_hours:.1f}h old and the "
+              f"interval is {interval}h.")
+        return 0
+    if newest is None:
+        print(f"if-due: due - no archive exists in {BACKUP_DIR} yet.")
+    else:
+        age_hours = (now - newest) / SECONDS_PER_HOUR
+        print(f"if-due: due - the newest archive is {age_hours:.1f}h old, past the "
+              f"{interval}h interval.")
+    # A fixed argv list and never a shell: nothing operator-supplied reaches this
+    # command, and the rule holds regardless. stdout and stderr are inherited so
+    # palworld-backup's own output (the archive path, any chown warning) lands in
+    # the job log in the order it happened.
+    argv = [str(SBIN / "palworld-backup")]
+    sys.stdout.flush()
+    try:
+        proc = subprocess.run(argv, check=False)
+    except OSError as exc:
+        print(f"palworld-backups: cannot run {argv[0]}: {exc}", file=sys.stderr)
+        return 1
+    if proc.returncode != 0:
+        print(f"palworld-backups: palworld-backup failed (exit "
+              f"{proc.returncode})", file=sys.stderr)
+    return proc.returncode
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="palworld-backups",
+        description="Manage the collection of Palworld world-save archives: "
+                    "delete one, apply retention, or run the scheduled tick.",
+        epilog="--if-due and --prune are designed to be given together, in that "
+               "order, and that is how the periodic service invokes this tool. "
+               "--delete and --show-schedule may not be combined with anything.")
+    ap.add_argument("--delete", metavar="ARCHIVE",
+                    help="remove one archive from the backups directory. Note the "
+                         "argv shape: `--delete <name>`, never `--delete -- <name>` "
+                         "(`--` separates positionals, and argparse would reject a "
+                         "flag whose value it swallowed)")
+    ap.add_argument("--prune", action="store_true",
+                    help="apply retention: delete archives past "
+                         "BACKUP_RETENTION_DAYS, keeping the newest "
+                         "BACKUP_KEEP_MIN and never the last one")
+    ap.add_argument("--if-due", action="store_true", dest="if_due",
+                    help="create a backup if BACKUP_INTERVAL_HOURS has elapsed "
+                         "since the newest one (a no-op when BACKUP_ENABLED is "
+                         "false); composes with --prune")
+    ap.add_argument("--show-schedule", action="store_true", dest="show_schedule",
+                    help="print the effective schedule as JSON and exit")
+    args = ap.parse_args(argv)
+
+    # Hand-rolled rather than `add_mutually_exclusive_group`, and deliberately so:
+    # a strict group over all four would reject `--if-due --prune`, which is the
+    # exact argv the systemd timer and the s6 periodic service run. That would be a
+    # silent no-op on both platforms, discovered only by whoever needed a restore.
+    # So the two tick modes compose and the two operator modes stay exclusive with
+    # everything. Do not "tidy" this into a single group.
+    solo = [("--delete", args.delete is not None),
+            ("--show-schedule", args.show_schedule)]
+    tick = [("--if-due", args.if_due), ("--prune", args.prune)]
+    chosen = [flag for flag, given in solo + tick if given]
+    # `required=True` on a group would have covered this; spelled out here for the
+    # same reason. A mode-less run must be an error, not a silent success — that is
+    # how a broken timer stays invisible.
+    if not chosen:
+        ap.error("one of --delete, --prune, --if-due or --show-schedule is required")
+    solo_given = [flag for flag, given in solo if given]
+    if solo_given and len(chosen) > 1:
+        others = ", ".join(flag for flag in chosen if flag != solo_given[0])
+        ap.error(f"{solo_given[0]} cannot be combined with {others}")
+
+    try:
+        if args.delete is not None:
+            path = delete_archive(args.delete)
+            print(f"deleted backup {path}")
+            return 0
+        if args.show_schedule:
+            # sort_keys so the output is byte-stable for anything diffing it, and
+            # indented because an operator reads this on a terminal as often as the
+            # web UI parses it.
+            print(json.dumps(read_schedule(), indent=2, sort_keys=True))
+            return 0
+
+        sched = read_schedule()
+        rc = 0
+        # **--if-due before --prune, and the order is the design.** Retention is
+        # applied to the collection *including* the archive just created, so the new
+        # archive counts toward BACKUP_KEEP_MIN and an expired one ages out in the
+        # same tick. Pruning first would leave the directory sitting one archive over
+        # the floor until the next tick.
+        if args.if_due:
+            rc = run_if_due(sched)
+        if args.prune:
+            # Pruned even when the create above failed, which is the useful way
+            # round: the most likely reason a backup fails is a full volume, and
+            # retention is what frees space for the next attempt. The floor is what
+            # keeps that from being dangerous.
+            deleted = prune_archives(int(sched["BACKUP_RETENTION_DAYS"]),
+                                     int(sched["BACKUP_KEEP_MIN"]))
+            if not deleted:
+                print(f"prune: nothing to prune - no archive in {BACKUP_DIR} is "
+                      f"both past the {sched['BACKUP_RETENTION_DAYS']}-day "
+                      f"retention window and outside the newest "
+                      f"{sched['BACKUP_KEEP_MIN']}.")
+            else:
+                print(f"prune: removed {len(deleted)} archive(s).")
+        return rc
+    except archive.ArchiveError as exc:
+        print(f"palworld-backups: {exc}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        # An unexpected filesystem error is still an operator-facing message, not a
+        # traceback out of a root process.
+        print(f"palworld-backups: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
