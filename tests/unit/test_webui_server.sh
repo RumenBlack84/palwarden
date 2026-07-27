@@ -57,6 +57,7 @@ PALWARDEN_WEBUI_ROOT="$WORK/webroot" \
 PALWARDEN_WEBUI_BIND=127.0.0.1 \
 PALWARDEN_WEBUI_PORT="$PORT" \
 PALWARDEN_SBIN_DIR="$WORK/sbin" \
+PALWARDEN_JOBS_DIR="$WORK/jobs" \
 PALWARDEN_PARSER_BIN="$DIR/../../bin/palworld-config-parser" \
 PALWORLD_CONFIG_FILE="$WORK/cfg/PalWorldSettings.ini" \
   python3 "$WEBUI" --serve >"$WORK/server.log" 2>&1 &
@@ -126,8 +127,11 @@ broken="$(body -u "$CREDS" "$U/api/health")"
 assert_contains "$broken" '"ok": false' "a tool that exits non-zero with empty stdout reports ok:false"
 
 
-# --- mutations are not available in this increment ------------------------
-assert_eq "$(code -u "$CREDS" -X POST "$U/api/jobs")" "501" "POST /api/jobs is not implemented yet"
+# --- mutations need more than Basic auth ----------------------------------
+# The full job API lives in tests/unit/test_webui_jobs.sh; here we only pin the
+# invariant this suite is about: authentication alone never mutates anything.
+assert_eq "$(code -u "$CREDS" -X POST "$U/api/jobs")" "403" \
+  "POST /api/jobs needs the token header, not just Basic auth"
 
 # --- nothing sensitive in the log ----------------------------------------
 assert_not_contains "$(cat "$WORK/server.log")" "pw-for-tests" "password never logged"

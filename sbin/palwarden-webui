@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # SPDX-FileCopyrightText: 2026 Brian Grant
-"""palwarden web UI server: static editors plus a read-only JSON API.
+"""palwarden web UI server: static editors, a read-only JSON API, and the job queue.
 
 Runs UNPRIVILEGED on purpose. It executes only read-only tools; anything that
-mutates the server is enqueued for the root worker (increment 2), so a bug in
-this HTTP parser cannot restart the game or run SteamCMD.
+mutates the server is *enqueued* as a job file for the root worker
+(palwarden-jobd), so a bug in this HTTP parser cannot restart the game or run
+SteamCMD. Writing a job file is the most this process can ever do.
 
 Every path — including the static editors — requires HTTP Basic auth. Basic over
 plain HTTP is acceptable only because the listener is loopback-bound and remote
 access goes through an SSH tunnel, which supplies the encryption.
+
+Mutations need a second factor on top of Basic: the shared token in the
+`X-Palwarden-Token` header. A browser attaches Basic credentials to a
+cross-origin POST all by itself, so Basic alone is not proof of intent; a
+cross-origin page cannot set a custom header without a CORS preflight, which we
+never answer. Origin/Sec-Fetch-Site are checked as well, which is what catches
+DNS rebinding (where Host alone would look legitimate).
 """
 
 from __future__ import annotations
@@ -20,6 +28,7 @@ import hmac
 import http.server
 import importlib.machinery
 import importlib.util
+import ipaddress
 import json
 import os
 import re
@@ -30,6 +39,13 @@ import sys
 import urllib.parse
 from pathlib import Path
 
+# Mirror palwarden-jobd: prepend the bare-metal lib dir and the repo's lib/ so
+# `palwarden_jobs` resolves in both installed and dev-checkout layouts. Both
+# sides of the queue must use the *same* on-disk format implementation.
+sys.path.insert(0, "/usr/local/lib")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import palwarden_jobs as jobs  # noqa: E402
+
 WEBUI_ENV = Path(os.environ.get("PALWARDEN_WEBUI_ENV", "/etc/palworld/webui.env"))
 
 WEB_ROOT = Path(os.environ.get("PALWARDEN_WEBUI_ROOT", "/opt/palworld/tools/config-webui"))
@@ -37,6 +53,13 @@ BIND = os.environ.get("PALWARDEN_WEBUI_BIND", "127.0.0.1")
 PORT = int(os.environ.get("PALWARDEN_WEBUI_PORT", "8088"))
 SBIN = Path(os.environ.get("PALWARDEN_SBIN_DIR", "/usr/local/sbin"))
 PARSER_BIN = Path(os.environ.get("PALWARDEN_PARSER_BIN", "/usr/local/bin/palworld-config-parser"))
+# Deliberately NOT derived from SBIN, for the same reason palwarden-jobd does not
+# derive ENGINE_CONFIG_BIN from it: SBIN is where *invoked commands* live (tests
+# point it at stub shell scripts, and module-loading a bash script as Python
+# raises SyntaxError). The validators we import live next to this script in both
+# the installed layout and a dev checkout.
+JOBD_BIN = Path(os.environ.get(
+    "PALWARDEN_JOBD_BIN", str(Path(__file__).resolve().parent / "palwarden-jobd")))
 CONFIG_FILE = Path(os.environ.get(
     "PALWORLD_CONFIG_FILE",
     "/opt/palworld/server/Pal/Saved/Config/LinuxServer/PalWorldSettings.ini"))
@@ -52,6 +75,28 @@ WINDOW_RE = re.compile(r"^\d{1,4}[mhd]$")
 REALM = "palwarden"
 
 REQUIRED_KEYS = ("WEBUI_USER", "WEBUI_PASSWORD", "WEBUI_TOKEN")
+
+TOKEN_HEADER = "X-Palwarden-Token"
+# A client that disappears mid-response is routine (a browser tab closing, curl
+# --max-time), not an internal error: it must never produce a traceback, and it
+# must never make a response attempt raise a *second* time out of the handler.
+CLIENT_GONE = (BrokenPipeError, ConnectionResetError, TimeoutError)
+# 64 KiB is far more than any job body needs (the largest is an engine settings
+# object) and small enough that an unauthenticated-shaped flood cannot make this
+# process buffer anything interesting.
+MAX_BODY_BYTES = 65536
+# Reading a request must not block forever: a client that sends a Content-Length
+# larger than its body would otherwise pin a worker thread for good. Not an env
+# knob on purpose — a typo in a unit file would become a traceback at import,
+# and 10s is generous for a loopback listener even over an SSH tunnel.
+REQUEST_TIMEOUT = 10.0
+# Extra hostnames a browser may legitimately reach this server as, for the
+# reverse-proxy deployments that do not use the documented SSH tunnel.
+EXTRA_ORIGIN_HOSTS = frozenset(
+    h.strip().lower()
+    for h in os.environ.get("PALWARDEN_WEBUI_ORIGIN_HOSTS", "").split(",")
+    if h.strip()
+)
 
 
 def _escape(val: str) -> str:
@@ -158,6 +203,132 @@ def check_basic(header: str | None, creds: dict[str, str]) -> bool:
     ok_user = hmac.compare_digest(user.encode("utf-8"), creds["WEBUI_USER"].encode("utf-8"))
     ok_pass = hmac.compare_digest(password.encode("utf-8"), creds["WEBUI_PASSWORD"].encode("utf-8"))
     return ok_user and ok_pass
+
+
+def check_token(headers, creds: dict[str, str]) -> bool:
+    """Validate the mutation token in constant time. A missing header is a refusal.
+
+    Requires *exactly one* token header. With two, `get()` would silently pick
+    the first and "which one counts" becomes a question the attacker gets to
+    answer; refusing outright removes the question.
+
+    Header values arrive latin-1-decoded from http.client, so encoding back to
+    bytes cannot fail for anything the wire can carry — but this runs before any
+    authorisation decision, so it is wrapped anyway: a TypeError or
+    UnicodeError reachable pre-auth would be a vulnerability, not a cosmetic
+    bug. Same shape as check_basic.
+    """
+    values = headers.get_all(TOKEN_HEADER) or []
+    if len(values) != 1:
+        return False
+    try:
+        supplied = values[0].strip().encode("utf-8", "strict")
+        expected = creds["WEBUI_TOKEN"].encode("utf-8", "strict")
+    except Exception:
+        return False
+    return hmac.compare_digest(supplied, expected)
+
+
+def origin_host_allowed(origin: str) -> bool:
+    """Is this Origin one this server can legitimately be reached as?
+
+    Only the *host* is checked, never the port: the documented access path is an
+    SSH tunnel, which remaps the port freely (`-L 9000:localhost:8088`), so
+    pinning PORT here would reject every real browser session. A foreign
+    hostname is what a rebinding or plain CSRF attempt cannot avoid.
+    """
+    try:
+        host = urllib.parse.urlsplit(origin.strip()).hostname
+    except ValueError:
+        return False
+    if not host:
+        # "null" (an opaque origin: sandboxed iframe, redirect chain) and any
+        # unparseable value land here.
+        return False
+    host = host.lower()
+    if host == "localhost" or host == BIND.lower() or host in EXTRA_ORIGIN_HOSTS:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def origin_ok(headers) -> bool:
+    """Reject a cross-origin mutation on the evidence the browser volunteers.
+
+    `Sec-Fetch-Site` is set by the browser and cannot be spoofed by page script,
+    so anything other than `same-origin` is refused — including `none`, which a
+    fetch() from our own page never produces. `Origin` is checked separately
+    because older browsers omit Sec-Fetch-Site. Both absent means a non-browser
+    client (curl, the CLI), which the token already gates.
+    """
+    for name in ("Sec-Fetch-Site", "Origin"):
+        if len(headers.get_all(name) or []) > 1:
+            return False  # ambiguous: refuse rather than pick one
+    site = headers.get("Sec-Fetch-Site")
+    if site is not None and site.strip().lower() != "same-origin":
+        return False
+    origin = headers.get("Origin")
+    if origin is None:
+        return True
+    return origin_host_allowed(origin)
+
+
+_JOBD_MODULE = None
+
+
+def load_jobd_module():
+    """Load the root worker's validators instead of writing a second copy.
+
+    The API rejects bad input early and the worker rejects it again (it must not
+    trust the queue), but both must agree on what "bad" means — so the rules
+    live in exactly one place. Same hyphenated-script trick as
+    load_parser_module.
+
+    Note this executes palwarden-jobd's module body, which itself module-loads
+    palworld-engine-config for its settings table. If that fails the import
+    raises, so callers must turn it into a message rather than a traceback.
+    (jobd's module body only defines things — it takes no lock and runs no
+    command — so importing it here is inert.)
+
+    Only `ACTIONS` and `validate_params` may be used from the result. The module
+    also exposes `run_job`/`write_engine_env`, and calling either from here would
+    make the unprivileged web process execute the work it is supposed to hand
+    off; that split is the whole security property of the control plane.
+    """
+    global _JOBD_MODULE
+    if _JOBD_MODULE is None:
+        loader = importlib.machinery.SourceFileLoader("palwarden_jobd_for_webui", str(JOBD_BIN))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[loader.name] = module
+        loader.exec_module(module)
+        _JOBD_MODULE = module
+    return _JOBD_MODULE
+
+
+def disruptive_actions(jobd) -> frozenset[str]:
+    return frozenset(name for name, spec in jobd.ACTIONS.items() if spec["disruptive"])
+
+
+def check_jobs_dir() -> str | None:
+    """Return None if the queue directory is usable, else why it is not.
+
+    Created 0700 by the store itself (job params carry config values), so this
+    only has to confirm the result is ours to write. A wrong owner here is the
+    most likely deployment mistake — POST must say so plainly instead of
+    tracebacking on the first enqueue.
+    """
+    try:
+        jobs.JOBS_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError as exc:
+        return (f"job queue directory {jobs.JOBS_DIR} cannot be created: {exc.strerror}. "
+                "Create it owned by the web UI user.")
+    if not os.access(jobs.JOBS_DIR, os.W_OK | os.X_OK):
+        return (f"job queue directory {jobs.JOBS_DIR} is not writable by this process. "
+                "Check that it is owned by the web UI user.")
+    return None
 
 
 def allowed_roots() -> list[Path]:
@@ -342,6 +513,12 @@ READ_ENDPOINTS = {
 class Handler(http.server.BaseHTTPRequestHandler):
     server_version = "palwarden-webui"
     credentials: dict[str, str] = {}
+    # Set once at startup so a misconfigured queue is one clear 500 per POST
+    # rather than a traceback, and reads keep working regardless.
+    jobs_dir_error: str | None = None
+    # socketserver applies this to the connection, so a body that never arrives
+    # cannot hold a thread forever.
+    timeout = REQUEST_TIMEOUT
 
     # --- helpers ----------------------------------------------------------
     def _send_json(self, status: int, payload: dict) -> None:
@@ -352,6 +529,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_json_safely(self, status: int, payload: dict) -> None:
+        """Send a response we are already on the error path for.
+
+        Used only inside `except` blocks: if the client has gone, a second raise
+        here would escape the handler and be logged as a traceback for what is
+        really just a closed connection.
+        """
+        try:
+            self._send_json(status, payload)
+        except CLIENT_GONE:
+            self.close_connection = True
 
     def _challenge(self) -> None:
         body = b"authentication required\n"
@@ -368,12 +557,122 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._challenge()
         return False
 
+    def _read_body(self) -> tuple[bytes | None, str | None]:
+        """Read exactly Content-Length bytes, or explain why we will not.
+
+        Returns (body, error) with exactly one populated. Every rejection here is
+        a 400: a missing, duplicated, non-integer, negative or oversized length
+        must never become a hang or a traceback.
+        """
+        if self.headers.get("Transfer-Encoding"):
+            return None, "chunked transfer encoding is not supported; send Content-Length"
+        raw = self.headers.get_all("Content-Length") or []
+        if len(raw) != 1:
+            return None, "exactly one Content-Length header is required"
+        try:
+            length = int(raw[0].strip())
+        except ValueError:
+            return None, "Content-Length is not an integer"
+        if length < 0:
+            return None, "Content-Length must not be negative"
+        if length > MAX_BODY_BYTES:
+            return None, f"request body must be at most {MAX_BODY_BYTES} bytes"
+        if length == 0:
+            return b"", None
+        try:
+            body = self.rfile.read(length)
+        except OSError as exc:
+            # Includes the socket timeout for a body that never fully arrives.
+            return None, f"could not read the request body: {exc}"
+        if len(body) != length:
+            return None, "request body was shorter than Content-Length"
+        return body, None
+
+    def _enqueue(self) -> None:
+        """POST /api/jobs: validate, then write a job file. Nothing else, ever."""
+        # Basic auth is already established by the caller. It is not enough on
+        # its own: the browser would attach it to a cross-origin POST for free.
+        if not check_token(self.headers, self.credentials):
+            self._send_json(403, {"ok": False,
+                                  "error": f"missing or invalid {TOKEN_HEADER} header"})
+            return
+        if not origin_ok(self.headers):
+            self._send_json(403, {"ok": False, "error": "cross-origin request refused"})
+            return
+        if self.jobs_dir_error:
+            self._send_json(500, {"ok": False, "error": self.jobs_dir_error})
+            return
+        body, error = self._read_body()
+        if error is not None:
+            self._send_json(400, {"ok": False, "error": error})
+            return
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except ValueError:  # covers UnicodeDecodeError and JSONDecodeError
+            self._send_json(400, {"ok": False, "error": "body must be UTF-8 JSON"})
+            return
+        if not isinstance(payload, dict):
+            self._send_json(400, {"ok": False, "error": "body must be a JSON object"})
+            return
+        action = payload.get("action")
+        if not isinstance(action, str):
+            self._send_json(400, {"ok": False, "error": "action must be a string"})
+            return
+        params = payload.get("params")
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            self._send_json(400, {"ok": False, "error": "params must be an object"})
+            return
+
+        try:
+            jobd = load_jobd_module()
+        except Exception as exc:  # a broken install must not leak a traceback
+            self._send_json(500, {"ok": False,
+                                  "error": f"cannot load the job validators: {exc}"})
+            return
+        # validate_params reports an unknown action too, but check first so the
+        # 409 lookup below can trust ACTIONS[action].
+        if action not in jobd.ACTIONS:
+            self._send_json(400, {"ok": False,
+                                  "error": f"{action!r} is not an allowed action"})
+            return
+        normalised, error = jobd.validate_params(action, params)
+        if error is not None:
+            self._send_json(400, {"ok": False, "error": error})
+            return
+
+        # Only disruptive jobs serialise against each other: a queued backup or
+        # snapshot must not stand in the way of a restart the operator wants.
+        if jobd.ACTIONS[action]["disruptive"] and jobs.has_pending(disruptive_actions(jobd)):
+            self._send_json(409, {"ok": False,
+                                  "error": "another disruptive job is queued or running"})
+            return
+        try:
+            # Enqueue the *normalised* params, so the worker runs what we vetted
+            # rather than the raw request body.
+            job = jobs.create_job(action, normalised)
+        except OSError as exc:
+            self._send_json(500, {"ok": False,
+                                  "error": f"cannot write the job file: {exc.strerror}"})
+            return
+        self._send_json(202, {"ok": True, "id": job["id"]})
+
     # --- routes -----------------------------------------------------------
     def do_GET(self) -> None:  # noqa: N802 - stdlib naming
         if not self._authenticated():
             return
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path.startswith("/api/"):
+            if parsed.path == "/api/jobs" or parsed.path.startswith("/api/jobs/"):
+                try:
+                    self._send_jobs(parsed.path)
+                except CLIENT_GONE:
+                    self.close_connection = True
+                except Exception as exc:  # never leak a traceback to the browser
+                    self._send_json_safely(
+                        500, {"ok": False, "error": f"internal error: {exc}"})
+                return
             handler = READ_ENDPOINTS.get(parsed.path)
             if handler is None:
                 self._send_json(404, {"ok": False, "error": "unknown endpoint"})
@@ -381,8 +680,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             query = urllib.parse.parse_qs(parsed.query)
             try:
                 self._send_json(200, handler(query))
+            except CLIENT_GONE:
+                self.close_connection = True
             except Exception as exc:  # never leak a traceback to the browser
-                self._send_json(500, {"ok": False, "error": f"internal error: {exc}"})
+                self._send_json_safely(
+                    500, {"ok": False, "error": f"internal error: {exc}"})
             return
 
         target = resolve_static(self.path)
@@ -409,12 +711,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _send_jobs(self, path: str) -> None:
+        if path == "/api/jobs":
+            self._send_json(200, {"ok": True, "data": jobs.list_jobs()})
+            return
+        job_id = urllib.parse.unquote(path[len("/api/jobs/"):])
+        # read_job returns None for a missing, corrupt or invalidly-named id, so a
+        # crafted id can neither traverse nor raise — no pre-validation needed.
+        job = jobs.read_job(job_id)
+        if job is None:
+            self._send_json(404, {"ok": False, "error": "unknown job"})
+            return
+        self._send_json(200, {"ok": True, "data": job})
+
     def do_POST(self) -> None:  # noqa: N802
         if not self._authenticated():
             return
-        # Mutating endpoints arrive in increment 2, together with the root worker.
-        self._send_json(501, {"ok": False,
-                              "error": "mutating endpoints are not implemented yet"})
+        if urllib.parse.urlparse(self.path).path != "/api/jobs":
+            self._send_json(404, {"ok": False, "error": "unknown endpoint"})
+            return
+        try:
+            self._enqueue()
+        except CLIENT_GONE:
+            # The client hung up (or its body never arrived and the socket timed
+            # out). There is nobody left to send a status to, and trying would
+            # raise a second time straight out of the handler.
+            self.close_connection = True
+        except Exception as exc:  # never leak a traceback to the browser
+            self._send_json_safely(500, {"ok": False, "error": f"internal error: {exc}"})
 
     # --- logging: request lines only, never headers -----------------------
     def log_message(self, fmt: str, *args) -> None:
@@ -425,9 +749,28 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
+    def handle_error(self, request, client_address) -> None:
+        """Keep the log free of tracebacks for hangups and idle timeouts.
+
+        A traceback in the service log should mean "a real bug happened here", so
+        the routine ways a connection ends are logged as one line instead. Any
+        other exception still gets the full traceback.
+        """
+        exc = sys.exc_info()[1]
+        if isinstance(exc, CLIENT_GONE):
+            print(f"{client_address[0]} connection ended early: "
+                  f"{type(exc).__name__}", file=sys.stderr)
+            return
+        super().handle_error(request, client_address)
+
 
 def make_server(creds: dict[str, str]) -> ThreadingHTTPServer:
     Handler.credentials = creds
+    Handler.jobs_dir_error = check_jobs_dir()
+    if Handler.jobs_dir_error:
+        # A warning, not a fatal error: the read-only dashboard is still useful,
+        # and refusing to start would hide the diagnosis behind a dead service.
+        print(f"warning: {Handler.jobs_dir_error}", file=sys.stderr)
     return ThreadingHTTPServer((BIND, PORT), Handler)
 
 
@@ -453,6 +796,17 @@ def main() -> int:
         creds = load_credentials(WEBUI_ENV)   # fail closed before binding
         if os.geteuid() == 0:
             sys.exit("error: refusing to run as root; run as the palworld/steam user.")
+        # Load the worker's validators up front, for the same reason credentials
+        # are loaded up front: a broken install must be a message at startup, not
+        # a surprise 500 on the operator's first restart request.
+        try:
+            load_jobd_module()
+        except Exception as exc:
+            sys.exit(
+                f"error: cannot load the job validators from {JOBD_BIN}: {exc}. "
+                "Set PALWARDEN_JOBD_BIN if palwarden-jobd is not installed "
+                "alongside this script."
+            )
         httpd = make_server(creds)
         print(f"palwarden-webui listening on {BIND}:{PORT} (root {WEB_ROOT})",
               file=sys.stderr)
