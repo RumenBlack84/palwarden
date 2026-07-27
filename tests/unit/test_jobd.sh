@@ -37,7 +37,6 @@ jobd() {
   PALWARDEN_JOBS_DIR="$WORK/jobs" PYTHONPATH="$LIB" \
   PALWARDEN_SBIN_DIR="$WORK/bin" PALWORLD_ENGINE_ENV="${ENGINE_ENV_OVERRIDE:-$WORK/etc/engine.env}" \
   PALWORLD_BACKUP_DIR="$WORK/backups" PALWARDEN_JOBD_LOCK="$WORK/jobd.lock" \
-  PATH="$WORK/bin:$PATH" \
     python3 "$JOBD" "$@"
 }
 enqueue() {  # enqueue <action> <json-params>
