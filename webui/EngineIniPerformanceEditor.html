@@ -385,7 +385,7 @@ const POLL_MAX_ATTEMPTS=450;
 // and /api/jobs are served by palwarden-webui, a separate service that a
 // graceful restart never touches. So the restart itself is not expected to
 // interrupt polling; this budget is for real network trouble.
-const POLL_MAX_STATUS_FAILURES=5;
+const POLL_MAX_STATUS_FAILURES=10;
 const TERMINAL=['succeeded','failed'];
 
 function token(){

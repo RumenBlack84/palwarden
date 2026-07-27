@@ -471,7 +471,9 @@ SINKS = (
 # version of this check twice in this very file.
 COLOR_PATTERNS = (
     r"#[0-9a-fA-F]{3,8}\b",
-    r"\b(?:rgb|rgba|hsl|hsla|color)\s*\(",
+    # Every CSS colour function, not just the ones in use today: the point is
+    # that a future edit cannot slip a literal colour past the token discipline.
+    r"\b(?:rgb|rgba|hsl|hsla|hwb|lab|lch|oklab|oklch|color|color-mix)\s*\(",
 )
 
 bad = []
