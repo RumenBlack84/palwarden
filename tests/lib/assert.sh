@@ -24,6 +24,10 @@ assert_not_contains() { case "$1" in *"$2"*) fail "${3:-unexpected substring}: '
 assert_file_contains() { if grep -qF -- "$2" "$1" 2>/dev/null; then pass; else fail "${3:-file check}: '$1' missing '$2'"; fi; }
 # assert_file_not_contains <file> <needle> [msg]
 assert_file_not_contains() { if grep -qF -- "$2" "$1" 2>/dev/null; then fail "${3:-file check}: '$1' contains '$2'"; else pass; fi; }
+# assert_file_exists <file> [msg]
+assert_file_exists() { if [ -f "$1" ]; then pass; else fail "${2:-file check}: '$1' does not exist"; fi; }
+# assert_path_absent <path> [msg]
+assert_path_absent() { if [ -e "$1" ] || [ -L "$1" ]; then fail "${2:-path check}: '$1' exists"; else pass; fi; }
 # assert_rc <expected_rc> <cmd...>
 assert_rc() { local exp="$1"; shift; "$@" >/dev/null 2>&1; local rc=$?; if [ "$rc" = "$exp" ]; then pass; else fail "rc: expected $exp, got $rc for: $*"; fi; }
 
