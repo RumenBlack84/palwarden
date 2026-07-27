@@ -98,9 +98,15 @@ def open_archive_fd(path) -> int:
       * O_NONBLOCK: this is what stops a planted FIFO blocking *inside* the
         open, before any of our code runs. The S_ISREG check below cannot do it,
         because without O_NONBLOCK it is never reached.
-      * S_ISREG: with the open non-blocking, fstat then rejects the FIFO (and
-        directories, devices, sockets) explicitly, so the refusal says what is
-        wrong instead of surfacing as a mystery gzip error.
+      * S_ISREG: O_NONBLOCK is cleared a few lines below, before tarfile ever
+        reads from this descriptor. From that point on, S_ISREG is the *only*
+        thing standing between the root worker and an indefinite read: a FIFO
+        with a writer that keeps the other end open (never closes, never sends
+        EOF) blocks a blocking read forever, exactly like the open() itself
+        would without O_NONBLOCK. Rejecting non-regular files here, while the
+        descriptor is still non-blocking, is what makes clearing O_NONBLOCK
+        safe. It also means the refusal says what is wrong instead of
+        surfacing as a mystery gzip error several layers later.
     """
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -206,9 +212,14 @@ def extract_archive(path, dest_dir, max_members=MAX_MEMBERS,
 
     The validation pass and the extraction pass run over the **same descriptor**
     (rewound in between) rather than opening the path twice. Re-opening would
-    leave a window in which the file that was validated is not the file that gets
-    extracted — and the upload directory is writable by the web process, so that
-    window is reachable, not theoretical.
+    leave a window in which the *name* that was validated is not the *name* that
+    gets extracted — and the upload directory is writable by the web process, so
+    that window is reachable, not theoretical. This guarantees the name but not
+    the bytes: an attacker who rewrites the same inode in place between the two
+    passes still gets pass-2 content that pass-1 never saw. The caller carries
+    that risk — it must ensure the archive cannot be rewritten between
+    validation and extraction, e.g. by only ever extracting from a location the
+    unprivileged web process cannot write to.
 
     `filter="data"` is the kernel-of-last-resort under our own rules: it is what
     strips setuid/setgid bits and refuses links out of the destination even if a
@@ -216,6 +227,15 @@ def extract_archive(path, dest_dir, max_members=MAX_MEMBERS,
     image ships 3.13 where the default is still the unfiltered legacy behaviour,
     so it is passed explicitly.
     """
+    # Checked up front, not by catching the TypeError extractall(filter=...)
+    # would raise on an old Python: catching it around the whole block would
+    # also catch a TypeError raised from *inside* extractall on a crafted
+    # archive, and misreport that as an interpreter problem instead of the
+    # crafted-archive bug it actually is. Checked before opening anything, so
+    # there is no descriptor to leak on the way out.
+    if not hasattr(tarfile, "data_filter"):
+        raise ArchiveError(
+            f"this Python cannot filter tar extraction; refusing to extract {path}")
     fd = open_archive_fd(path)
     try:
         fh = os.fdopen(fd, "rb")
@@ -228,13 +248,6 @@ def extract_archive(path, dest_dir, max_members=MAX_MEMBERS,
         try:
             with tarfile.open(fileobj=fh, mode="r:gz") as tf:
                 tf.extractall(dest_dir, filter="data")
-        except TypeError as exc:
-            # A Python without extraction filters. Refuse rather than fall back
-            # to an unfiltered extractall: the whole point of the argument is
-            # that it holds when one of our own rules does not.
-            raise ArchiveError(
-                f"this Python cannot filter tar extraction ({exc}); "
-                f"refusing to extract {path}") from exc
         except (tarfile.TarError, OSError, EOFError) as exc:
             raise ArchiveError(f"failed to extract {path}: {exc}") from exc
     return info

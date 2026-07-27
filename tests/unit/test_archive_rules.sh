@@ -17,7 +17,10 @@ source "$DIR/../lib/assert.sh"
 LIB="$DIR/../../lib"
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+# fd 9 is used below to hold a FIFO writer open; close it here too so a failed
+# assertion (which does not abort the script, but a stray early exit might)
+# can never leak it past this script's lifetime.
+trap 'exec 9>&- 2>/dev/null; rm -rf "$WORK"' EXIT
 
 py() { PYTHONPATH="$LIB" python3 -c "$1"; }
 
@@ -176,6 +179,30 @@ assert_not_contains "$out" "rc=124" "did not hang on the FIFO"
 # S_ISREG check it would still be refused — as an unreadable gzip stream, several
 # layers later. Pinning the message is what makes that check falsifiable.
 assert_contains "$out" "not a regular file" "the FIFO is refused by the S_ISREG check itself"
+
+# The case above has no writer, so a FIFO open reads EOF almost immediately even
+# without S_ISREG catching it — that is *not* the case this check exists for.
+# The dangerous case is a writer that stays open: once O_NONBLOCK is cleared,
+# nothing but S_ISREG stands between that and a read() that never returns. Hold
+# the write end open for the whole call so there is no EOF to rescue a
+# regression that drops the S_ISREG branch.
+mkfifo "$WORK/fifo_held.tar.gz"
+exec 9<>"$WORK/fifo_held.tar.gz"
+# Real (valid) gzip magic plus a few header/deflate bytes — enough for gzip to
+# commit to decompressing rather than fail fast on bad magic, and not enough to
+# finish, so a read with no S_ISREG guard has to wait for bytes that never come.
+head -c 20 "$WORK/good.tar.gz" >&9
+out="$(timeout 5 env PYTHONPATH="$LIB" python3 -c "
+import palwarden_archive as a
+try:
+    a.validate_archive('$WORK/fifo_held.tar.gz'); print('ACCEPTED')
+except a.ArchiveError as e:
+    print('refused:', e)"; echo "rc=$?")"
+exec 9>&-
+assert_not_contains "$out" "rc=124" \
+  "does not hang on a FIFO whose writer stays open the whole call"
+assert_contains "$out" "not a regular file" \
+  "the writer-held FIFO is refused by S_ISREG, not by an eventual EOF"
 
 # A directory at the archive path is the same class of mistake and must not
 # surface as a traceback either.
