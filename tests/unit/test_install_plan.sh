@@ -31,6 +31,11 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 PLAN="$WORK/plan.txt"
 
+# Snapshot /opt/palworld first so the side-effect check below is a real
+# before/after comparison rather than an assertion that cannot fail.
+opt_listing() { find /opt/palworld -mindepth 1 -maxdepth 1 2>/dev/null | sort; }
+OPT_BEFORE="$(opt_listing)"
+
 # --dry-run touches nothing and needs no root, so this is the whole plan.
 bash "$INSTALL" --dry-run > "$PLAN" 2>&1
 assert_eq "$?" "0" "install.sh --dry-run exits cleanly"
@@ -39,10 +44,13 @@ assert_eq "$?" "0" "install.sh --dry-run exits cleanly"
 # The point of asserting on --dry-run at all: every line is prefixed, so a command
 # that escaped `run` would show up as a side effect instead.
 assert_file_contains "$PLAN" "DRY-RUN: install -d" "the plan is printed, not executed"
-if [ -e /opt/palworld/config-snapshots ] && [ ! -d /opt/palworld ]; then
-  fail "--dry-run created something under /opt"
-else
+# The old form of this check was `[ -e .../config-snapshots ] && [ ! -d /opt/palworld ]`,
+# which is self-contradictory — if the child exists the parent is a directory — so
+# the pass branch always ran. Compare a real before/after listing instead.
+if [ "$OPT_BEFORE" = "$(opt_listing)" ]; then
   pass
+else
+  fail "--dry-run changed /opt/palworld: before='$OPT_BEFORE' after='$(opt_listing)'"
 fi
 
 # --- the snapshot and save-backup roots are root-owned ------------------------
