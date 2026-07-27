@@ -214,6 +214,73 @@ assert_file_exists "$BACKUPS/$p3" "the second-newest too"
 assert_file_exists "$BACKUPS/$p4" "and the newest"
 assert_eq "$(count)" "3" "BACKUP_KEEP_MIN archives survive an all-expired collection"
 
+# --- list_archives' filters, driven through --prune, not merely shielded ------
+# Every fixture above puts only well-named regular archives in the directory, so
+# none of them can tell a filtered entry from an unfiltered one apart. These do,
+# by planting the two things list_archives is supposed to keep OUT of the
+# collection, old enough that they would be prune candidates if they got in.
+reset_dir
+printf 'BACKUP_RETENTION_DAYS=14\nBACKUP_KEEP_MIN=3\n' > "$SCHED"
+old1="$(mk 40)"; old2="$(mk 30)"; old3="$(mk 20)"
+new1="$(mk 10)"; new2="$(mk 5)"; new3="$(mk 1)"
+# An operator file that happens to live in the backups directory. Without the
+# valid_archive_name filter this is a genuine, aged prune candidate, which would
+# make --prune a way to delete an arbitrary file out of a root-owned directory.
+printf 'operator notes\n' > "$BACKUPS/keepme.txt"
+touch -d '90 days ago' "$BACKUPS/keepme.txt"
+# palworld-restore's in-flight import temp: same directory, aged, and named so it
+# would sort as an ordinary prune candidate too. Without the filter, --prune can
+# destroy a promotion that is mid-copy.
+importtmp=".${new1}.import.deadbeefcafef00d"
+printf 'in-flight promotion\n' > "$BACKUPS/$importtmp"
+touch -d '50 days ago' "$BACKUPS/$importtmp"
+before="$(count)"
+out="$(backups --prune 2>"$WORK/err")"
+assert_file_exists "$BACKUPS/keepme.txt" \
+  "a foreign non-archive file survives --prune untouched"
+assert_file_exists "$BACKUPS/$importtmp" \
+  "an in-flight --import temp file survives --prune untouched"
+assert_eq "$(count)" "3" "--prune removed exactly the three expired archives, no more"
+assert_eq "$((before - $(count)))" "3" \
+  "the archive count dropped by exactly the number of expired archives"
+
+# The guard-inversion shape: "zz-notes.txt" sorts AFTER every "palworld-save-…"
+# name (ASCII 'z' > 'p'). If a foreign name like this were ever counted as an
+# archive, it would occupy the lexically-newest slot instead of the real archive,
+# which flips which one BACKUP_KEEP_MIN and the never-empty guard protect. One
+# real, old archive plus one such foreign file is the minimal case where that
+# flip is observable: the guard must still protect the ARCHIVE, not the note.
+reset_dir; reset_sched
+printf 'BACKUP_RETENTION_DAYS=1\nBACKUP_KEEP_MIN=1\n' > "$SCHED"
+lone="$(mk 90)"
+printf 'zz notes\n' > "$BACKUPS/zz-notes.txt"
+touch -d '90 days ago' "$BACKUPS/zz-notes.txt"
+backups --prune >/dev/null 2>&1
+assert_file_exists "$BACKUPS/$lone" \
+  "the sole real archive survives even with a lexically-later foreign name present"
+assert_file_exists "$BACKUPS/zz-notes.txt" \
+  "the foreign file is never a --prune candidate at all"
+assert_eq "$(count)" "1" \
+  "the never-empty guard still protects the real archive, not the note"
+
+# An old symlink under a valid archive name, its own timestamp aged (not just its
+# target's), pointing outside the directory. The backups directory is root-owned
+# but every archive in it is chowned to the service account, so a planted link is
+# exactly the shape to refuse — here via list_archives, since --prune never
+# names an individual entry the way --delete does.
+reset_dir; reset_sched
+printf 'BACKUP_RETENTION_DAYS=1\nBACKUP_KEEP_MIN=1\n' > "$SCHED"
+lone="$(mk 90)"
+printf 'VICTIM\n' > "$WORK/prune-victim"
+linkname="palworld-save-$(date -u -d '95 days ago' +%Y%m%dT%H%M%SZ).tar.gz"
+ln -s "$WORK/prune-victim" "$BACKUPS/$linkname"
+touch -h -d '95 days ago' "$BACKUPS/$linkname"
+backups --prune >/dev/null 2>&1
+if [ -L "$BACKUPS/$linkname" ]; then pass; else fail "an archive-named symlink was removed by --prune"; fi
+assert_file_exists "$WORK/prune-victim" "and its target is untouched"
+assert_file_exists "$BACKUPS/$lone" "the real archive it would have displaced is still here"
+rm -f "$BACKUPS/$linkname"
+
 # --- --prune does NOT delete by count ----------------------------------------
 # A burst of restores (each taking a pre-restore safety archive) must not push out
 # an older archive that is still inside the retention window. Eight archives, all
@@ -330,6 +397,30 @@ assert_file_exists "$LOG" "an archive older than the interval triggers a backup"
 assert_file_exists "$BACKUPS/$stale" "--if-due creates, it never removes"
 assert_eq "$(count)" "2" "the new archive joins the old one"
 
+# --- newest_archive_mtime uses the archive's mtime, not the name's stamp -----
+# mk() deliberately derives an archive's name stamp and its mtime from the same
+# days-ago value, so in every fixture above the two orderings agree and cannot
+# tell "newest by name" from "newest by mtime" apart. An --import promotion is
+# the documented case where they disagree: an old-named archive can be touched
+# just now. Two archives are needed, not one: the name-newest one is genuinely
+# old, and a name-OLDER one is the one just touched, so a scheduler that used
+# the name-newest archive's mtime (list_archives()[:1]) would see the wrong,
+# older mtime and wrongly call a backup due.
+reset_dir
+printf 'BACKUP_INTERVAL_HOURS=24\n' > "$SCHED"
+recent_named="$(mk 5)"    # name-newest; genuinely 5 days old, past the interval
+promoted="$(mk 40)"       # name-oldest...
+touch "$BACKUPS/$promoted"  # ...but just (re)written, as an --import promotion would
+out="$(backups --if-due 2>"$WORK/err")"; rc=$?
+assert_eq "$rc" "0" "--if-due succeeds when the name-newest and mtime-newest archives differ"
+assert_path_absent "$LOG" \
+  "the freshly-touched, name-oldest archive decides due-ness by mtime: not due"
+assert_contains "$out" "not due" \
+  "a promoted archive's mtime, not its name, is what the schedule reads"
+assert_file_exists "$BACKUPS/$recent_named" "--if-due did not remove anything here"
+assert_file_exists "$BACKUPS/$promoted" "nor create anything, since it correctly saw 'not due'"
+assert_eq "$(count)" "2" "the collection is unchanged by a due-check that found nothing due"
+
 # --- --if-due --prune compose, in that order ---------------------------------
 # The order is the point, not an accident: retention is applied to the collection
 # INCLUDING the archive just created, so the new archive counts toward
@@ -358,7 +449,21 @@ assert_contains "$out" '"BACKUP_RETENTION_DAYS": 14' "default retention"
 assert_contains "$out" '"BACKUP_KEEP_MIN": 3' "default floor"
 assert_eq "$(wc -c < "$WORK/err" | tr -d ' ')" "0" "an absent schedule file is not a warning"
 # Really JSON, not something that merely looks like it — the web UI parses this.
-assert_rc 0 python3 -c "import json,sys; json.load(open(sys.argv[1]))" <(printf '%s' "$out")
+# The key SET is pinned too: Task 6's HTTP endpoint and the browser panel both
+# consume this JSON as-is, so a fifth key added here for an unrelated reason
+# would ship into the API silently unless a test enumerates all four and no
+# more. Types are pinned alongside the keys, using `type(x) is int` rather than
+# `isinstance`, because bool is a subclass of int in Python: isinstance would
+# not catch BACKUP_KEEP_MIN silently becoming a JSON bool.
+assert_rc 0 python3 -c "
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert sorted(d) == ['BACKUP_ENABLED', 'BACKUP_INTERVAL_HOURS', 'BACKUP_KEEP_MIN',
+                      'BACKUP_RETENTION_DAYS'], sorted(d)
+assert type(d['BACKUP_ENABLED']) is bool, type(d['BACKUP_ENABLED'])
+for key in ('BACKUP_INTERVAL_HOURS', 'BACKUP_RETENTION_DAYS', 'BACKUP_KEEP_MIN'):
+    assert type(d[key]) is int, (key, type(d[key]))
+" <(printf '%s' "$out")
 
 printf '# a comment\n\nBACKUP_ENABLED="false"\nBACKUP_INTERVAL_HOURS=6\nBACKUP_RETENTION_DAYS=30\nBACKUP_KEEP_MIN=5\nNOT_OURS=whatever\n' > "$SCHED"
 out="$(backups --show-schedule 2>"$WORK/err")"

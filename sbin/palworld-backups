@@ -256,8 +256,7 @@ def delete_archive(name: str) -> Path:
     return path
 
 
-def prune_archives(retention_days: int, keep_min: int,
-                   now: float | None = None) -> list[str]:
+def prune_archives(retention_days: int, keep_min: int) -> list[str]:
     """Apply retention. Returns the names deleted, oldest first.
 
     Deletion is by **age**, not by count: many archives inside the retention window
@@ -287,8 +286,7 @@ def prune_archives(retention_days: int, keep_min: int,
     own. It is what has to survive a bug in the clamp. Do not fold these parameters
     back into a `read_schedule()` call.
     """
-    if now is None:
-        now = time.time()
+    now = time.time()
     names = list_archives()  # newest first, by name
     cutoff = now - retention_days * SECONDS_PER_DAY
     # The newest keep_min are off the table before age is even considered.
