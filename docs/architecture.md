@@ -140,6 +140,47 @@ Two things this split deliberately does *not* do:
   unprivileged web user on purpose, because that user is the one writing job
   files; root only reads and updates them. Root ownership breaks every button.
 
+### The backup panel
+
+`webui/backups.html` is the same control plane applied to world saves: list,
+download, upload, import, restore, delete, and the schedule form. It adds no new
+privilege — every mutation is still a job file that `palwarden-jobd` re-validates
+and runs as root (`backup_import`, `backup_restore`, `backup_delete`,
+`backup_schedule_save`) — plus two endpoints that move *bytes* rather than jobs:
+`POST /api/backups/upload` (streams into the staging dir; promotes nothing) and
+`GET /api/backups/<name>/download` (streams one archive out). Both are described
+in [`tools.md`](tools.md#palwarden-webui).
+
+Scheduled backups are a third path that involves neither: `palworld-backups
+--if-due --prune`, run as root on a short fixed tick by
+`palworld-backup-auto.timer` or the container's `backup-auto` service. The
+*schedule* is a file the panel writes through `backup_schedule_save`, so the web
+process never has to be given control of a timer.
+
+**Why the two new directories have opposite ownership.** This is the panel's whole
+security argument, and getting either one backwards is silent on the happy path:
+
+| Path | Owner | Mode | Because |
+|------|-------|------|---------|
+| `/var/lib/palworld/uploads` | service account | 0700 | The unprivileged web process is its **only writer** — it streams a browser upload straight into it, exactly as it writes the job queue. `palwarden-webui` refuses an upload outright unless it owns this directory with no group/other bits, so a root-owned one breaks every upload. |
+| `/opt/palworld/restore-scratch` | `root:root` | 0700 | `palworld-restore` copies an archive here and validates **the copy**, because `palworld-backup` chowns each archive to the service account — so an archive in the backups directory is writable by the web process, and validating one in place would prove the name and not the bytes. |
+
+The scratch directory's **parent** matters as much as the directory: it lives under
+the root-owned `/opt/palworld` rather than beside `uploads`, because
+`/var/lib/palworld` is `0755` service-account-owned. Inside a tree that account
+can write, a "root-only" directory is not root-only — the account could pre-create
+it, or `rename` root's aside and put its own at the same name at any moment, and a
+substituted archive would then be restored while the job reported success. That is
+not hypothetical: an earlier draft defaulted the scratch directory to
+`/var/lib/palworld/restore-scratch` and a review demonstrated exactly that. The
+tool also `fstat`s the directory it opened and refuses one it does not own, so a
+mis-provisioned host gets a clean refusal rather than a silent hole — but both
+platforms create it correctly (`install.sh`, `docker/entrypoint.sh`, and the image
+itself).
+
+Ordinary recovery procedures — a failed restore, changing the schedule — are in
+[`palworld-service-runbook.md`](palworld-service-runbook.md) §15.
+
 ## Data / state directories
 
 | Location | Owner | Purpose |
@@ -152,7 +193,11 @@ Two things this split deliberately does *not* do:
 | `/etc/palworld` | mixed | `settings.env`, `notify.env`, `engine.env`, templates. |
 | `/var/lib/palworld` | root/palworld | `metrics.sqlite3`, `public-info.env`, `service-events.json` (last observed service state). |
 | `/var/lib/palworld/jobs` | `palworld` (0700) | Control-plane job queue: `<id>.json` per job. Written by the web UI, executed by `palwarden-jobd`. |
+| `/var/lib/palworld/uploads` | `palworld` (0700) | Upload staging for the backup panel. Written by the web UI, read (and emptied) by `palworld-restore --import`. |
+| `/opt/palworld/restore-scratch` | `root` (0700) | Where `palworld-restore` copies an archive to validate it. Root-owned *and* under a root-owned parent — see below. |
 | `/var/log/palworld` | palworld | `server.log`. |
+| `/run/palworld-*.lock` | — | `flock` files preventing overlapping timer runs. |
+| `/run/palwarden-jobd.lock` | root | `palwarden-jobd`'s exclusive lock — one worker, one job at a time. |
 
 **Why `backups` and `config-snapshots` are root-owned.** Only root ever writes
 them — `palwarden-jobd`'s `backup` and `snapshot_create` actions, the timers, or a
@@ -162,14 +207,15 @@ process could rename a directory root had just created and drop a symlink in its
 place, redirecting root's writes — and its `chown` — anywhere on the filesystem.
 `config-backups` stays service-account-owned because `palworld-engine-config
 rollback` reads from it and the web UI is expected to manage it; it is safe there
-because every use validates the name and opens it `O_NOFOLLOW`.
-| `/run/palworld-*.lock` | — | `flock` files preventing overlapping timer runs. |
-| `/run/palwarden-jobd.lock` | root | `palwarden-jobd`'s exclusive lock — one worker, one job at a time. |
+because every use validates the name and opens it `O_NOFOLLOW`. The *archives* in
+`backups` are still chowned to the service account (the root-owned directory is
+what keeps their names from being substituted), which is precisely why
+`palworld-restore` validates a root-owned copy instead of the file in place.
 
 ## Concurrency & safety
 
 - Timer-driven jobs that can collide with each other or with the server take a
-  `flock` (`fps-sample`, `update`, `memory-watch`).
+  `flock` (`fps-sample`, `update`, `memory-watch`, `backup-auto`).
 - `palwarden-jobd` takes its lock in **every** mode — the daemon loop, `--once`
   and `--reap` alike — so a hand-run one-shot can never race the service or
   mistake a live job for an orphan.

@@ -1,0 +1,27 @@
+#!/command/with-contenv bash
+# shellcheck shell=bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Brian Grant
+#
+# Scheduled world-save backups + retention. Replaces palworld-backup-auto.timer.
+#
+# Runs as ROOT (no s6-setuidgid, unlike config-webui): /opt/palworld/backups is
+# root-owned, palworld-backup reads the whole world tree and chowns the archive it
+# writes, and --prune unlinks inside that root-owned directory. The unprivileged
+# side only ever *lists* backups, over /api/backups.
+#
+# BACKUP_TICK_SECONDS is the tick, not the backup interval. The schedule itself
+# (BACKUP_ENABLED / BACKUP_INTERVAL_HOURS / BACKUP_RETENTION_DAYS /
+# BACKUP_KEEP_MIN) lives in /etc/palworld/backup.env, and palworld-backups decides
+# on each tick whether anything is due. That is what lets the panel change the
+# schedule with nothing to restart, and it is why this service stays enabled even
+# when backups are switched off — BACKUP_ENABLED=false is a no-op inside the tool,
+# not a service to disable.
+#
+# --if-due and --prune together in ONE invocation, in that order: retention is then
+# applied to the collection *including* the archive just created, so the new
+# archive counts toward BACKUP_KEEP_MIN and an expired one ages out in the same
+# tick. palworld-backups composes these two flags deliberately; do not split them.
+exec palwarden-run-periodic \
+  "${BACKUP_TICK_SECONDS:-900}" backup-auto \
+  palworld-backups --if-due --prune

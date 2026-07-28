@@ -14,8 +14,9 @@ against a real server — see [`../tests/`](../tests/) for the suites and
 
 `s6-overlay` is PID 1 (as root) and supervises the services below. Workloads run
 unprivileged as `steam` (uid/gid 1000) — except the memory watchdog, the update
-checker and the job worker, which run as root because cycling the server's s6
-service requires it. Which services run is decided at start by the entrypoint
+checker, the job worker and the scheduled-backup tick, which run as root because
+cycling the server's s6 service (or writing the root-owned backups directory)
+requires it. Which services run is decided at start by the entrypoint
 from `PALWARDEN_MODE` + config:
 
 | Service | embedded | external | Runs as | Needs |
@@ -29,6 +30,14 @@ from `PALWARDEN_MODE` + config:
 | `update-check` (auto-update) | ✅ | — | root | `UPDATE_CHECK=true` |
 | `public-info-watch` | ✅ | — | steam | `PUBLIC_HOSTNAME` |
 | `service-events` (crash watchdog) | ✅ | — | steam | — |
+| `backup-auto` (scheduled backups) | ✅ | — | root | — |
+
+`backup-auto` is enabled on every embedded boot and is **not** gated on a
+`BACKUP_*` variable: whether a backup actually happens is decided per tick by
+`palworld-backups`, from `/etc/palworld/backup.env`. That is what lets the Backups
+page switch scheduled backups off and on with nothing to restart. It runs as root
+because `/opt/palworld/backups` is root-owned and the tool reads the whole world
+tree. `BACKUP_TICK_SECONDS` (default 900) is the tick, not the backup interval.
 
 The server binary is supervised directly, with the service's **`down-signal` set
 to SIGINT** — so stop/restart (and container shutdown) tell Palworld to save its
@@ -183,7 +192,18 @@ never the public Internet).
 |--------|-----------|-------|
 | `palworld-server` | `/opt/palworld/server` | Game install (embedded) |
 | `palworld-saved` | `/opt/palworld/server/Pal/Saved` | Worlds + config (embedded) |
-| `palwarden-state` | `/var/lib/palworld` | `metrics.sqlite3` telemetry (both modes) |
+| `palwarden-state` | `/var/lib/palworld` | `metrics.sqlite3` telemetry, the job queue, upload staging (both modes) |
+| `palwarden-backups` | `/opt/palworld/backups` | World-save archives (embedded) |
+
+`palwarden-backups` is deliberately its own volume and **not** a directory inside
+`palworld-saved`: a backup has to outlive the thing it backs up, and anything left
+in the container's writable layer is destroyed by a plain
+`docker compose up --force-recreate`. Docker seeds a fresh named volume from the
+image path, which is pre-created root-owned `0755` — the ownership
+`palworld-backup` and `palworld-restore` both require — so it never needs a
+runtime `chown`. `docker compose down -v` deletes your backups along with
+everything else; copy them off the host (the Backups page's download button, or
+`docker cp`) before you do that.
 
 Bind mounts work too; match host ownership to `steam` (uid/gid **1000**).
 
@@ -206,7 +226,15 @@ Bind mounts work too; match host ownership to `steam` (uid/gid **1000**).
 `PALWARDEN_MODE`, `UPDATE_ON_START`, `PALWORLD_GAME_PORT`, `WEBUI_PORT`,
 `ADMIN_PASSWORD`, `DISCORD_WEBHOOK`, `WEBUI_USER`, `WEBUI_PASSWORD`,
 `WEBUI_TOKEN`, `FPS_SAMPLE_INTERVAL`, `FPS_RETENTION_DAYS`,
-`PALWORLD_TARGET_HOST`, `PALWORLD_REST_PORT`.
+`PALWORLD_TARGET_HOST`, `PALWORLD_REST_PORT`, `BACKUP_ENABLED`,
+`BACKUP_INTERVAL_HOURS`, `BACKUP_RETENTION_DAYS`, `BACKUP_KEEP_MIN`,
+`BACKUP_TICK_SECONDS`.
+
+The four `BACKUP_*` schedule variables **seed `/etc/palworld/backup.env` on the
+first start only**. The Backups page rewrites that file when the operator saves
+the schedule form, so re-rendering it on every start would revert their change;
+`BACKUP_TICK_SECONDS` is read from the environment on every start because it is
+this container's tick, not part of the schedule.
 
 ## Image internals
 

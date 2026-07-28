@@ -1,0 +1,41 @@
+[Unit]
+Description=Create a scheduled Palworld world-save backup when one is due, then prune
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Runs as root (no User=), like palwarden-jobd.service and the memory watchdog:
+# /opt/palworld/backups is root-owned, palworld-backup has to read the whole world
+# tree and chown what it writes, and --prune unlinks inside a root-owned directory.
+#
+# --if-due AND --prune in one invocation, in that order, on purpose. The tick is
+# short and fixed while the *schedule* lives in /etc/palworld/backup.env, so the
+# tool — not this unit — decides whether a backup is due. That is what lets the
+# interval be changed from the browser with nothing to reload, and lets a host that
+# was powered off wake up and back up on the first tick instead of missing a
+# window. palworld-backups is built to compose these two flags; splitting them
+# across two units would apply retention on a different cadence than creation.
+#
+# flock, like palworld-update-check.service: a tick must never start while the
+# previous one is still tarring a large world. -n so an overlapping tick exits
+# immediately rather than queueing up behind a slow save.
+ExecStart=/usr/bin/flock -n /run/palworld-backups.lock /usr/local/sbin/palworld-backups --if-due --prune
+# Deliberately no Restart=. Every other timer-driven oneshot here (memory-watch,
+# update-check, fps-sample) leaves it unset for the same reason: the timer *is* the
+# retry, on a 15-minute cadence, whereas Restart=on-failure on a oneshot would spin
+# a failing backup at RestartSec intervals against the volume that is most likely
+# already full.
+#
+# Hardening is chosen against the exact set of writes this performs — the archive
+# under /opt/palworld/backups, reads of the game tree under /opt/palworld/server,
+# and palworld-notify's optional webhook read from /etc/palworld — and is
+# deliberately the same single directive palwarden-jobd.service settles on.
+ProtectSystem=true
+# =true and not =strict or =full: it makes /usr and /boot read-only, which this
+# never writes, while leaving /etc, /opt, /var and /run writable. =strict or =full
+# would make /opt/palworld/backups read-only and turn every scheduled backup into a
+# silent failure that nobody notices until a restore is needed. No sandbox
+# directive that touches /opt, /var or the game tree belongs here for that reason.
+# It also installs no syscall filter, so it cannot surprise the tar it shells out
+# to.

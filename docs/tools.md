@@ -58,6 +58,44 @@ Tars `Pal/Saved/{SaveGames,Config}` to
 `/opt/palworld/backups/palworld-save-<UTC>.tar.gz`, prints the path, and notifies
 success/failure with the archive size.
 
+### `palworld-backups`
+`/usr/local/sbin/palworld-backups {--delete ARCHIVE | --prune | --if-due | --show-schedule}`
+
+Owns the *collection* of world-save archives, where `palworld-backup` makes one and
+`palworld-restore` turns one back into a world. Runs as **root** — the backups
+directory is root-owned — from `palworld-backup-auto.timer`, the container's
+`backup-auto` service, or `palwarden-jobd`'s `backup_delete` action.
+
+- `--if-due`: create a backup if `BACKUP_INTERVAL_HOURS` has elapsed since the
+  newest archive (by mtime, so an imported archive counts as "just written"). No
+  archive at all is *due*, so a rebuilt host backs up on its first tick.
+  `BACKUP_ENABLED=false` makes it a printed no-op.
+- `--prune`: delete archives past `BACKUP_RETENTION_DAYS`, keeping the newest
+  `BACKUP_KEEP_MIN` by name whatever their age and **never the last one**.
+- `--delete ARCHIVE`: remove one archive, with **no floor** — the operator has
+  passed three confirmations in the UI, the last of which says when it is the only
+  copy left. Deliberately different from `--prune`; do not unify them.
+- `--show-schedule`: the effective schedule as JSON. `/api/backup-schedule` shells
+  out to this rather than parsing the file again, so the panel always shows what
+  the tick will actually do.
+
+`--if-due --prune` **compose, in that order**, and that is the exact argv both
+platform services run: retention is applied to the collection *including* the
+archive just created, so the new one counts toward `BACKUP_KEEP_MIN` and an expired
+one ages out in the same tick. Pruning happens even when the create failed — a full
+volume is the likeliest cause, and retention is what frees space for the next
+attempt. `--delete` and `--show-schedule` combine with nothing.
+
+The schedule lives in a **file** (`PALWORLD_BACKUP_SCHEDULE`, default
+`/etc/palworld/backup.env`), not in a unit, and the services fire on a short fixed
+tick that asks this tool whether anything is due. That is what lets one
+implementation serve systemd and s6, lets the interval be changed from the browser
+with nothing to reload, and lets a host that was powered off back up on the first
+tick after boot instead of missing a window. A bad value in that file is therefore
+**never fatal**: it warns on stderr and falls back to that key's default (the
+default, not the nearest bound — `BACKUP_RETENTION_DAYS=3560` where `356` was meant
+gives 14 days and a warning, not a silently accepted decade).
+
 ### `palworld-restore`
 `/usr/local/sbin/palworld-restore {--import ARCHIVE | --restore ARCHIVE [--wait S] [--startup-timeout S]}`
 
@@ -472,6 +510,7 @@ Installed to `/etc/systemd/system`. Enable only what you need.
 | `palworld-memory-watch.timer` | timer | every 5m | `palworld-memory-watch --threshold 85 --wait 300`. |
 | `palworld-public-info-watch.timer` | timer | every 10m | `palworld-public-info-watch`. |
 | `palworld-service-events.timer` | timer | every 1m | `palworld-service-events sample` — detects restarts/outages. |
+| `palworld-backup-auto.timer` | timer | every 15m | `palworld-backups --if-due --prune` under a lock, as **root**. The tick is fixed; the *schedule* is `/etc/palworld/backup.env` (editable from the Backups page), so changing how often you back up needs no `daemon-reload`. Hardened like `palwarden-jobd.service` — `ProtectSystem=true` only, because it must write `/opt/palworld/backups`. |
 | `palworld-1dot0-watch.timer` | timer | every 1m *(dated)* | `palworld-launch-watch`. Inert; do not enable. |
 
 Each `*.timer` has a matching one-shot `*.service`. After changing any unit:

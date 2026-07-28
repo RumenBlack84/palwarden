@@ -46,6 +46,19 @@ services:
       MEMORY_CHECK_INTERVAL: ${MEMORY_CHECK_INTERVAL:-300}
       MEMORY_WAIT: ${MEMORY_WAIT:-300}
       DAILY_REPORT_AT: ${DAILY_REPORT_AT:-09:00}
+      # Scheduled world-save backups. These SEED /etc/palworld/backup.env on the
+      # first start only — the Backups page owns that file afterwards (it is
+      # rewritten by palwarden-jobd's backup_schedule_save), so re-rendering it on
+      # every `up` would silently revert a retention policy set in the browser.
+      # Leave them empty to take palworld-backups' own defaults (enabled, every
+      # 24h, 14 days, keep 3).
+      BACKUP_ENABLED: ${BACKUP_ENABLED:-}
+      BACKUP_INTERVAL_HOURS: ${BACKUP_INTERVAL_HOURS:-}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-}
+      BACKUP_KEEP_MIN: ${BACKUP_KEEP_MIN:-}
+      # How often the tick *asks* whether a backup is due, not how often one is
+      # taken. The interval above is what decides that, inside the tool.
+      BACKUP_TICK_SECONDS: ${BACKUP_TICK_SECONDS:-900}
     ports:
       - "${PALWORLD_GAME_PORT:-8211}:8211/udp"
       - "127.0.0.1:${WEBUI_PORT:-8088}:8088"
@@ -54,6 +67,14 @@ services:
       - palworld-server:/opt/palworld/server
       - palworld-saved:/opt/palworld/server/Pal/Saved
       - palwarden-state:/var/lib/palworld
+      # World-save archives, on their own volume and NOT inside palworld-saved:
+      # the whole point of a backup is that it outlives the thing it backs up, and
+      # anything left in the image's writable layer is destroyed by a plain
+      # `docker compose up --force-recreate`. Docker seeds a fresh named volume
+      # from the image path, which the Dockerfile pre-creates root-owned 0755 —
+      # the ownership palworld-backup and palworld-restore both require — so this
+      # never needs a runtime chown.
+      - palwarden-backups:/opt/palworld/backups
     stop_grace_period: 120s
     ulimits:
       nofile:
@@ -90,3 +111,4 @@ volumes:
   palworld-server:
   palworld-saved:
   palwarden-state:
+  palwarden-backups:

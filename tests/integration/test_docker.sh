@@ -15,12 +15,21 @@ source "$DIR/../lib/assert.sh"
 IMG="palwarden:test"
 FAKE="$REPO/tests/fixtures/fake-server"
 STUB="$REPO/tests/fixtures/rest-stub.py"
+FAKE_REST="$REPO/tests/fixtures/fake-server-rest"
 NET="palwarden-itest-net"
 CIDS=()
+# Scratch server trees for the scenarios that let the tooling *rewrite* the world
+# (the restore loop renames Pal/Saved aside and extracts a new one). The other
+# scenarios bind-mount the fixture directly, which is fine because they only ever
+# read it; a restore would leave debris in the repo.
+TMPDIRS=()
 
 cleanup() {
   for c in "${CIDS[@]:-}"; do docker rm -f "$c" >/dev/null 2>&1 || true; done
   docker network rm "$NET" >/dev/null 2>&1 || true
+  for d in "${TMPDIRS[@]:-}"; do
+    if [ -n "$d" ]; then rm -rf "$d" 2>/dev/null || true; fi
+  done
 }
 trap cleanup EXIT
 
@@ -270,6 +279,18 @@ assert_contains "$snap_api" "itest-jobd" "J: /api/snapshots still lists it as th
 assert_eq "$(docker exec pw-it-g stat -c '%U %a' /opt/palworld/backups)" "root 755" \
   "K: the save-backup root exists in the image, root-owned 0755"
 
+# Scheduled backups are on by default, and this container set no BACKUP_* variable
+# at all, so the `backup-auto` service's very first tick already made an archive:
+# no archive exists on a fresh host, which makes a backup due immediately rather
+# than one interval from now. That is the intended behaviour on a rebuilt host, and
+# it is asserted here because it means the directory is NOT empty when the explicit
+# `backup` action below runs — the assertions after it therefore name one archive
+# instead of globbing, which used to match exactly one file.
+bk_boot="$(docker exec pw-it-g sh -c 'ls -1 /opt/palworld/backups | wc -l')"
+if [ "${bk_boot:-0}" -ge 1 ]; then pass; else
+  fail "K: the scheduled tick should have made a backup on first boot, found $bk_boot"
+fi
+
 # Seed a SaveGames tree: the tool tars exactly SaveGames + Config, and the fake
 # server fixture ships neither (Pal/Saved is gitignored precisely because the tests
 # write into it), so without this the tar would fail for an unrelated reason and
@@ -299,15 +320,241 @@ done
 assert_eq "$bk_state" "succeeded" "K: the backup action reaches succeeded through jobd"
 # The specific pre-fix failure, named, so a future regression is unmistakable.
 assert_not_contains "$bk_body" "invalid user" "K: no 'invalid user' from a hardcoded account name"
-# ...and it really produced an archive, not just a zero exit.
-assert_rc 0 docker exec pw-it-g sh -c 'ls /opt/palworld/backups/palworld-save-*.tar.gz'
-assert_rc 0 docker exec pw-it-g sh -c 'tar -tzf /opt/palworld/backups/palworld-save-*.tar.gz | grep -q .'
+# ...and it really produced an archive, not just a zero exit. The newest by name
+# (the name carries a UTC stamp that sorts lexically) is the one this job wrote;
+# the boot tick's archive is older. Named rather than globbed because the glob now
+# matches more than one file, and `tar -tzf` with two operands is an error.
+bk_name="$(docker exec pw-it-g sh -c 'ls -1 /opt/palworld/backups | sort | tail -1')"
+assert_contains "$bk_name" "palworld-save-" "K: the job produced an archive ($bk_name)"
+bk_after="$(docker exec pw-it-g sh -c 'ls -1 /opt/palworld/backups | wc -l')"
+assert_eq "$bk_after" "$((bk_boot + 1))" "K: ...one more than before the job ran"
+assert_rc 0 docker exec pw-it-g sh -c "tar -tzf '/opt/palworld/backups/$bk_name' | grep -q ."
 # The archive is handed to the service account (safe: the directory is root-owned,
 # so the name cannot be substituted), and the unprivileged /api/backups sees it.
-assert_eq "$(docker exec pw-it-g sh -c 'stat -c %U /opt/palworld/backups/palworld-save-*.tar.gz')" \
-  "steam" "K: the archive owner comes from PALWORLD_USER, which is steam here"
+# sort -u over every archive, so this covers the scheduled tick's as well as this
+# job's: both run as root through the same tool, and either one leaving a root-owned
+# archive behind is the same bug.
+assert_eq "$(docker exec pw-it-g sh -c 'stat -c %U /opt/palworld/backups/palworld-save-*.tar.gz | sort -u | tr "\n" ","')" \
+  "steam," "K: every archive's owner comes from PALWORLD_USER, which is steam here"
 bk_api="$(docker exec pw-it-g sh -c "curl -s -u '$webui_user:$webui_pass' \
   http://127.0.0.1:8088/api/backups")"
 assert_contains "$bk_api" "palworld-save-" "K: /api/backups is no longer permanently empty"
+
+# --- Scenario L: the full recovery loop, through the real API ----------------
+# Everything the backup panel promises, in one chain and with nothing stubbed:
+#
+#   create a backup -> download it -> DELETE the archive -> upload the downloaded
+#   bytes back -> import -> restore -> the world is the one we backed up.
+#
+# Each link was unit-tested against fakes in tasks 1-7 and none of them had ever
+# run against the other links, a real jobd, a real webui, or a real supervisor.
+# The chain is the feature; this is the only place it exists.
+#
+# A private copy of the REST-serving fixture, for two reasons. (1) A restore
+# rewrites Pal/Saved (renames the old tree aside and extracts a new one), so
+# bind-mounting the repo's fixture would leave debris in the working tree.
+# (2) palworld-restore only deletes the replaced tree on a *confirmed* startup —
+# `palworld-api info` answering — and the plain fake server serves no REST, which
+# would leave the restore permanently "unverifiable" and hide the confirmed-startup
+# branch entirely.
+LWORK="$(mktemp -d)"; TMPDIRS+=("$LWORK")
+cp -r "$FAKE_REST" "$LWORK/server"
+# BACKUP_ENABLED=false so the scheduled tick (scenario M's subject) cannot slip an
+# extra archive into the directory between "delete the only archive" and "check it
+# is gone". The panel's own actions are all explicit here.
+run_c pw-it-l -e PALWARDEN_MODE=embedded -e UPDATE_ON_START=false \
+  -e ADMIN_PASSWORD=not-a-real-admin-password -e BACKUP_ENABLED=false \
+  -v "$LWORK/server":/opt/palworld/server "$IMG"
+wait_up pw-it-l palworld-server || fail "L: server did not come up"
+
+# The two directories this feature adds, with deliberately OPPOSITE ownership.
+# Both are packaged (Dockerfile) and re-created by the entrypoint, and both are
+# 0700 — but for opposite reasons, so they are asserted separately rather than in
+# one loop.
+#
+# The staging dir belongs to the *web* user: palwarden-webui streams uploads into
+# it and refuses an upload outright unless it owns the directory with no
+# group/other bits, so a root-owned one breaks every upload. Before this it existed
+# only because the web handler mkdir'd it on demand.
+assert_eq "$(docker exec pw-it-l stat -c '%U %a' /var/lib/palworld/uploads)" "steam 700" \
+  "L: the upload staging dir is web-owned 0700 (packaged, not created on demand)"
+# The scratch dir is root:root, and so is its parent. palworld-restore validates
+# its *copy* of an archive there because archives in the backups directory are
+# chowned to the service account and are therefore web-writable — validating one
+# in place would prove the name and not the bytes. Under /var/lib/palworld (which
+# steam owns, 0755) steam could rename root's directory aside and substitute its
+# own between the copy and the read, and a swapped archive would restore while
+# reporting success. Hence /opt/palworld, which is root-owned.
+assert_eq "$(docker exec pw-it-l stat -c '%U %a' /opt/palworld/restore-scratch)" "root 700" \
+  "L: the restore scratch dir is root:root 0700"
+assert_eq "$(docker exec pw-it-l stat -c '%U' /opt/palworld)" "root" \
+  "L: ...and so is its parent, which is the half that makes it root-only"
+
+# Privilege split, read off the *running processes* rather than the service
+# definitions: s6-svstat needs root, so anything asked through `docker exec` (which
+# is root) could agree with the service file while the service itself ran as the
+# wrong user. Same bracket trick as scenario J against pgrep matching its own shell.
+assert_eq "$(proc_user pw-it-l 'palwarden-job[d]')" "root" "L: jobd runs as root"
+assert_eq "$(proc_user pw-it-l 'palwarden-webu[i]')" "steam" "L: webui runs unprivileged"
+
+l_user="$(docker exec pw-it-l sh -c 'sed -n "s/^WEBUI_USER=\"\(.*\)\"$/\1/p" /etc/palworld/webui.env')"
+l_pass="$(docker exec pw-it-l sh -c 'sed -n "s/^WEBUI_PASSWORD=\"\(.*\)\"$/\1/p" /etc/palworld/webui.env')"
+l_tok="$(docker exec pw-it-l sh -c 'sed -n "s/^WEBUI_TOKEN=\"\(.*\)\"$/\1/p" /etc/palworld/webui.env')"
+
+# Enqueue one job through the real endpoint with the real gate (Basic + token) and
+# wait for the root worker to finish it. Sets JOB_ID/JOB_STATE/JOB_BODY. Every poll
+# is bounded, so a worker that wedges fails the suite instead of hanging it.
+l_job() {  # l_job <json-body> <tries>
+  local body="$1" tries="$2" enq i
+  JOB_ID=""; JOB_STATE=""; JOB_BODY=""
+  enq="$(docker exec pw-it-l sh -c "curl -s -w '\n%{http_code}' -X POST \
+    -u '$l_user:$l_pass' -H 'X-Palwarden-Token: $l_tok' \
+    -H 'Content-Type: application/json' -d '$body' \
+    http://127.0.0.1:8088/api/jobs")"
+  if [ "$(printf '%s' "$enq" | tail -1)" != "202" ]; then
+    JOB_STATE="not-accepted"; JOB_BODY="$enq"; return 0
+  fi
+  JOB_ID="$(printf '%s' "$enq" | grep -oE '[0-9a-f]{32}' | head -1)"
+  for ((i = 0; i < tries; i++)); do
+    JOB_BODY="$(docker exec pw-it-l sh -c "curl -s -u '$l_user:$l_pass' \
+      http://127.0.0.1:8088/api/jobs/$JOB_ID")"
+    JOB_STATE="$(printf '%s' "$JOB_BODY" | sed -n 's/.*"state": "\([a-z]*\)".*/\1/p' | head -1)"
+    case "$JOB_STATE" in queued|running|"") sleep 1 ;; *) break ;; esac
+  done
+}
+
+# A world with a marker we can recognise later: the whole point of a restore is
+# that the bytes come back, and "a tree exists" would pass even if the archive were
+# empty.
+docker exec pw-it-l sh -c 'install -d -o steam -g steam /opt/palworld/server/Pal/Saved/SaveGames/0 \
+  && printf "world-marker-ORIGINAL\n" > /opt/palworld/server/Pal/Saved/SaveGames/0/Level.sav'
+
+# 1. Create a backup through the API.
+l_job '{"action":"backup","params":{}}' 60
+assert_eq "$JOB_STATE" "succeeded" "L1: a backup job runs to success (body: $JOB_BODY)"
+l_name="$(docker exec pw-it-l sh -c 'ls -1 /opt/palworld/backups | head -1')"
+assert_contains "$l_name" "palworld-save-" "L1: it produced an archive ($l_name)"
+
+# 2. Download it, byte for byte. This is the operator's off-host copy, and it is
+#    the only thing that survives step 3.
+dl_code="$(docker exec pw-it-l sh -c "curl -s -o /tmp/dl.tar.gz -w '%{http_code}' \
+  -u '$l_user:$l_pass' http://127.0.0.1:8088/api/backups/$l_name/download")"
+assert_eq "$dl_code" "200" "L2: GET /api/backups/<name>/download answers 200"
+# Byte-identical, not merely non-empty: a truncated download would still import and
+# still restore *something*, and the failure would surface as a corrupt world.
+dl_sums="$(docker exec pw-it-l sh -c \
+  "sha256sum < /tmp/dl.tar.gz; sha256sum < '/opt/palworld/backups/$l_name'" \
+  | awk '{print $1}' | sort -u | wc -l)"
+assert_eq "$dl_sums" "1" "L2: the downloaded bytes are identical to the archive"
+
+# 3. Delete the archive through the API. Disruptive, so it needs confirm: true —
+#    and after this the downloaded bytes are the only copy in existence.
+l_job "{\"action\":\"backup_delete\",\"params\":{\"backup\":\"$l_name\",\"confirm\":true}}" 45
+assert_eq "$JOB_STATE" "succeeded" "L3: backup_delete runs to success (body: $JOB_BODY)"
+assert_rc 1 docker exec pw-it-l test -e "/opt/palworld/backups/$l_name"
+l_api="$(docker exec pw-it-l sh -c "curl -s -u '$l_user:$l_pass' \
+  http://127.0.0.1:8088/api/backups")"
+assert_not_contains "$l_api" "$l_name" "L3: and /api/backups no longer lists it"
+
+# Now break the live world, so a restore that silently did nothing cannot pass.
+docker exec pw-it-l sh -c \
+  'printf "world-marker-CORRUPTED\n" > /opt/palworld/server/Pal/Saved/SaveGames/0/Level.sav'
+
+# 4. Upload the downloaded bytes back. The body IS the archive (no multipart) and
+#    the name travels in X-Palwarden-Filename; 202, because the archive is only
+#    *accepted for import* — nothing has been promoted or restored yet.
+up_code="$(docker exec pw-it-l sh -c "curl -s -o /tmp/up.json -w '%{http_code}' -X POST \
+  -u '$l_user:$l_pass' -H 'X-Palwarden-Token: $l_tok' \
+  -H 'X-Palwarden-Filename: $l_name' -H 'Content-Type: application/octet-stream' \
+  -H 'Expect:' --data-binary @/tmp/dl.tar.gz \
+  http://127.0.0.1:8088/api/backups/upload")"
+assert_eq "$up_code" "202" "L4: the upload is accepted (202)"
+# Written by the unprivileged process, into its own directory, owner-only.
+assert_eq "$(docker exec pw-it-l stat -c '%U %a' "/var/lib/palworld/uploads/$l_name")" \
+  "steam 600" "L4: the staged upload is web-owned 0600"
+
+# 5. Import: root promotes the staged upload into the root-owned backups dir,
+#    validating a copy rather than the web-writable original.
+l_job "{\"action\":\"backup_import\",\"params\":{\"staged\":\"$l_name\"}}" 60
+assert_eq "$JOB_STATE" "succeeded" "L5: backup_import runs to success (body: $JOB_BODY)"
+assert_rc 0 docker exec pw-it-l test -f "/opt/palworld/backups/$l_name"
+assert_rc 1 docker exec pw-it-l test -e "/var/lib/palworld/uploads/$l_name"
+
+# 6. Restore. Stops the server, takes a safety archive of the (corrupted) world,
+#    extracts beside the target, swaps by rename, restarts and confirms readiness.
+l_job "{\"action\":\"backup_restore\",\"params\":{\"backup\":\"$l_name\",\"wait\":0,\"confirm\":true}}" 150
+assert_eq "$JOB_STATE" "succeeded" "L6: backup_restore runs to success (body: $JOB_BODY)"
+
+# 7. The world came back. This single assertion is what the whole chain is for.
+assert_eq "$(docker exec pw-it-l cat /opt/palworld/server/Pal/Saved/SaveGames/0/Level.sav)" \
+  "world-marker-ORIGINAL" "L7: the restored world is the one that was backed up"
+assert_eq "$(docker exec pw-it-l stat -c '%U' /opt/palworld/server/Pal/Saved/SaveGames/0/Level.sav)" \
+  "steam" "L7: and the restored tree belongs to the service account, not root"
+assert_eq "$(docker exec pw-it-l systemctl is-active palworld.service)" "active" \
+  "L7: the server is running again after the restore"
+
+# The safety net actually fired: the corrupted world was archived before being
+# replaced, so there are two archives now and the operator can undo the undo.
+l_count="$(docker exec pw-it-l sh -c 'ls -1 /opt/palworld/backups | wc -l')"
+assert_eq "$l_count" "2" "L7: a pre-restore safety archive was taken as well"
+assert_contains "$JOB_BODY" "safety backup:" "L7: ...and the job output names it"
+# Deleting the replaced tree hangs on a *positive* readiness confirmation, never on
+# the absence of an error. The REST-serving fixture is what lets that branch run at
+# all, so assert it ran rather than assuming it.
+assert_contains "$JOB_BODY" "cleaned up: removed the replaced world" \
+  "L7: the replaced tree is removed only on a confirmed startup"
+assert_eq "$(docker exec pw-it-l sh -c 'ls -d /opt/palworld/server/Pal/Saved.replaced-* 2>/dev/null | wc -l')" \
+  "0" "L7: ...so none is left behind"
+
+# --- Scenario M: the scheduled tick is wired to the supervisor ---------------
+# The tick is what makes backups happen without an operator, and it is enabled on
+# every embedded boot. What it does on each tick is the *tool's* decision, read
+# from /etc/palworld/backup.env — which is why the service stays enabled even with
+# backups switched off.
+MWORK="$(mktemp -d)"; TMPDIRS+=("$MWORK")
+cp -r "$FAKE" "$MWORK/server"
+run_c pw-it-m -e PALWARDEN_MODE=embedded -e UPDATE_ON_START=false -e ADMIN_PASSWORD=x \
+  -e BACKUP_ENABLED=false -e BACKUP_INTERVAL_HOURS=1 -e BACKUP_TICK_SECONDS=2 \
+  -v "$MWORK/server":/opt/palworld/server "$IMG"
+wait_up pw-it-m palworld-server || fail "M: server did not come up"
+assert_contains "$(services_of pw-it-m)" "backup-auto" "M: the scheduled-backup service is enabled"
+# ...and it is not one of the opt-in services: scenario A ran with no BACKUP_* env
+# at all and must still have it, because switching backups off is BACKUP_ENABLED's
+# job, not a service to disable.
+assert_contains "$svcA" "backup-auto" "M: enabled by default, not gated on a BACKUP_* variable"
+
+# Root, like memory-watch and jobd and unlike config-webui: the backups directory
+# is root-owned, palworld-backup reads the whole world tree, and --prune unlinks in
+# a root-owned directory. Asserted on the running process for scenario J's reason.
+assert_eq "$(proc_user pw-it-m 'run-periodic 2 backup-aut[o]')" "root" \
+  "M: the scheduled-backup service runs as root"
+
+# The schedule was seeded from BACKUP_* env into the file the tool reads.
+assert_rc 0 docker exec pw-it-m grep -qx 'BACKUP_ENABLED=false' /etc/palworld/backup.env
+assert_rc 0 docker exec pw-it-m grep -qx 'BACKUP_INTERVAL_HOURS=1' /etc/palworld/backup.env
+# Unset keys are left out entirely, so the tool's own defaults apply rather than
+# being frozen into the file by the container that happened to start first.
+assert_rc 1 docker exec pw-it-m grep -q 'BACKUP_RETENTION_DAYS' /etc/palworld/backup.env
+# The unprivileged half sees the same effective schedule the tick will use.
+m_user="$(docker exec pw-it-m sh -c 'sed -n "s/^WEBUI_USER=\"\(.*\)\"$/\1/p" /etc/palworld/webui.env')"
+m_pass="$(docker exec pw-it-m sh -c 'sed -n "s/^WEBUI_PASSWORD=\"\(.*\)\"$/\1/p" /etc/palworld/webui.env')"
+m_sched="$(docker exec pw-it-m sh -c "curl -s -u '$m_user:$m_pass' \
+  http://127.0.0.1:8088/api/backup-schedule")"
+assert_contains "$m_sched" '"BACKUP_ENABLED": false' "M: /api/backup-schedule reports the seeded schedule"
+assert_contains "$m_sched" '"BACKUP_RETENTION_DAYS": 14' "M: ...with the tool's default for the keys the file omits"
+
+# A world worth backing up, so "nothing was created" cannot pass for the trivial
+# reason that there was nothing to tar.
+docker exec pw-it-m sh -c 'install -d -o steam -g steam /opt/palworld/server/Pal/Saved/SaveGames/0 \
+  && printf "unscheduled\n" > /opt/palworld/server/Pal/Saved/SaveGames/0/Level.sav'
+# Two ticks at BACKUP_TICK_SECONDS=2, plus slack.
+docker exec pw-it-m sh -c 'sleep 8'
+m_logs="$(docker logs pw-it-m 2>&1)"
+# The tick really ran — without this the assertion below would also pass on a
+# service that never started.
+assert_contains "$m_logs" "[periodic:backup-auto]" "M: the tick is running"
+assert_contains "$m_logs" "scheduled backups are disabled" "M: ...and reports why it created nothing"
+assert_eq "$(docker exec pw-it-m sh -c 'ls -1 /opt/palworld/backups | wc -l')" "0" \
+  "M: BACKUP_ENABLED=false creates nothing"
 
 assert_report

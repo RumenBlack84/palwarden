@@ -35,7 +35,7 @@ join-info publishing.
 | `lib/` | Shared helpers sourced/called by the scripts: Discord notify, config diff/summary (installed to `/usr/local/lib`). |
 | `systemd/` | `*.service` / `*.timer` units for the server and its background jobs (installed to `/etc/systemd/system`). |
 | `needrestart/` | Hooks so unattended `apt` upgrades don't hard-restart the server outside the graceful flow. |
-| `config/` | `settings.env.example` (config template) and `engine.env` (Engine.ini tuning state). |
+| `config/` | `settings.env.example` (config template), `engine.env` (Engine.ini tuning state) and `backup.env` (world-save backup schedule). |
 | `webui/` | The control-plane dashboard plus client-side HTML editors for server settings and Engine.ini. |
 | `docs/` | Architecture, per-tool reference, config guide, backlog, Docker roadmap, and the original export artifacts. |
 | `docker/` | All-in-one container image, compose stack, and s6 service definitions. |
@@ -62,7 +62,11 @@ notification. A daily 09:00 ET timer posts a full health report with an FPS +
 player-count graph. The same actions are reachable from a loopback web UI split
 in two halves: `palwarden-webui` (unprivileged, parses HTTP, only ever *queues* a
 job) and `palwarden-jobd` (root, re-validates each job against its own allowlist
-and runs it).
+and runs it). World saves get the same treatment on their own page: archives are
+taken on a schedule (`palworld-backup-auto.timer`, whose interval and retention
+live in `/etc/palworld/backup.env` and are editable from the browser), and can be
+downloaded, uploaded back, restored over the live world and deleted from there —
+each of those a job root runs, never something the web process does itself.
 
 See [`docs/architecture.md`](docs/architecture.md) for the full data-flow
 diagram and file/directory map.
@@ -127,7 +131,8 @@ sudo systemctl enable --now \
   palworld-update-check.timer \
   palworld-memory-watch.timer \
   palworld-public-info-watch.timer \
-  palworld-fps-daily-report.timer
+  palworld-fps-daily-report.timer \
+  palworld-backup-auto.timer
 
 # 7. (Optional) The web control plane — both halves, or queued actions never run.
 sudo systemctl enable --now \
@@ -163,6 +168,8 @@ the repository (see `.gitignore`). Create them on the host:
 | `/var/lib/palworld/public-info.env` | Generated public join info (IP/port/password state). |
 | `/var/lib/palworld/metrics.sqlite3` | FPS/player telemetry + event markers. |
 | `/var/lib/palworld/jobs/` | The control plane's job queue (mode 0700). Owned by the **service account**, not root, by design: the unprivileged web UI writes job files here and `palwarden-jobd` only reads and updates them. |
+| `/var/lib/palworld/uploads/` | Upload staging for the Backups page (mode 0700). Service-account-owned for the same reason the queue is — the web UI is its only writer. |
+| `/etc/palworld/backup.env` | Scheduled-backup settings (enabled, interval, retention, minimum kept). Live state, not just a template: the Backups page rewrites it, so `install.sh` never overwrites an existing copy. A commented template ships in `config/backup.env`. |
 
 The Palworld REST API authenticates with **`ADMIN_PASSWORD`**, not
 `SERVER_PASSWORD`. If `ADMIN_PASSWORD` is blank in the live config, the API
@@ -178,6 +185,13 @@ helpers cannot authenticate.
   with a tunnel: `ssh -L 8088:127.0.0.1:8088 <host>`. HTTP Basic auth is required
   on **every** path; it is acceptable over plain HTTP only because the listener is
   loopback-bound and the tunnel supplies the encryption.
+- **`/opt/palworld/restore-scratch` must stay `root:root` 0700, under the
+  root-owned `/opt/palworld`.** `palworld-restore` copies an archive there and
+  validates the copy, because archives in `/opt/palworld/backups` are chowned to
+  the service account and are therefore writable by the unprivileged web process.
+  Moving it under `/var/lib/palworld` (which that account owns) would let a
+  substituted archive be restored while reporting success. Both installers create
+  it correctly; the tool refuses to run if it is not.
 - **`WEBUI_PASSWORD` is printed once, at generation, and is not recoverable.**
   To rotate it (or `WEBUI_TOKEN`), edit `/etc/palworld/webui.env` as root,
   `systemctl restart palworld-config-webui.service`, and reload the browser tab —

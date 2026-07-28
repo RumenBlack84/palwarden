@@ -695,6 +695,102 @@ deliberate: the unprivileged server is the process that writes job files. The
 writability check runs once at startup, so fix the ownership *and* restart
 `palworld-config-webui.service`.
 
+## 15. World-save backups: schedule, retention, and recovering a bad restore
+
+Command reference is in [`tools.md`](tools.md) (`palworld-backup`,
+`palworld-backups`, `palworld-restore`); the directory ownership and why it differs
+is in [`architecture.md`](architecture.md). This section is only the procedures.
+
+### Changing the schedule or retention
+
+The schedule is a **file**, not a unit: `/etc/palworld/backup.env`. The timer
+(`palworld-backup-auto.timer`, or the container's `backup-auto` service) fires on a
+short fixed tick and `palworld-backups` decides whether anything is due. So nothing
+needs a reload after a change.
+
+```bash
+# from the browser: Backups page -> Schedule -> Save (writes the file via jobd)
+# or by hand:
+sudo $EDITOR /etc/palworld/backup.env
+palworld-backups --show-schedule      # what the tick will actually do
+```
+
+`--show-schedule` is the authority, and it is worth reading after an edit: a bad
+value is **never fatal** — it warns on stderr and falls back to that key's default,
+because a parse error must not silently stop backups. A key that vanished from the
+output's expectations is a typo in the key name; a value that came back as the
+default when you set something else is out of range.
+
+```bash
+systemctl enable --now palworld-backup-auto.timer   # bare metal, once
+systemctl list-timers palworld-backup-auto.timer    # when it next fires
+journalctl -u palworld-backup-auto.service -n 50 --no-pager
+```
+
+To pause backups without disabling anything, set `BACKUP_ENABLED=false`. The tick
+keeps running and prints why it created nothing; turning them back on is one word
+in a file, with no unit to re-enable and no `daemon-reload`.
+
+Retention deletes by **age** (`BACKUP_RETENTION_DAYS`), keeps the newest
+`BACKUP_KEEP_MIN` whatever their age, and **never deletes the last archive** —
+whatever the settings say. If the directory is growing anyway, it is usually
+because every restore also takes a pre-restore safety archive; those are ordinary
+backups and are pruned like any other.
+
+### Recovering from a failed or wrong restore
+
+A restore leaves **two** independent ways back, and prints both. Read the job's
+output (Backups page, or `GET /api/jobs/<id>`) before touching anything:
+
+```text
+safety backup: palworld-save-<stamp>.tar.gz        <- the world as it was, archived
+replaced: previous world moved to /opt/palworld/server/Pal/Saved.replaced-<stamp>
+```
+
+1. **`Pal/Saved.replaced-<stamp>`** — the previous world tree, moved aside rather
+   than deleted. This is the fastest undo there is: a rename, no untarring. It is
+   kept whenever the restore did **not** confirm a startup (the service failed to
+   start, readiness timed out, or the REST API is not configured so readiness could
+   not be checked at all), and deleted only on a positive confirmation.
+
+   ```bash
+   sudo systemctl stop palworld.service      # container: s6-svc -wD -d /run/service/palworld-server
+   cd /opt/palworld/server/Pal
+   sudo mv Saved Saved.failed-restore
+   sudo mv Saved.replaced-<stamp> Saved
+   sudo chown -R palworld:palworld Saved     # container: steam:steam
+   sudo systemctl start palworld.service
+   ```
+
+2. **The pre-restore safety archive** — an ordinary archive in
+   `/opt/palworld/backups`, named in the job output. Use it when the replaced tree
+   is gone (a confirmed startup removed it, or a later prune took the archive's
+   place): restore it the same way you restored the wrong one, from the Backups
+   page or `sudo palworld-restore --restore <name>`.
+
+If the restore aborted *before* the swap — a validation failure, or a safety backup
+that could not be taken — nothing was touched at all. That is the design: the live
+world is only ever replaced by two `rename` calls after the new tree is fully
+extracted beside it.
+
+Two things to check when a restore keeps failing:
+
+```bash
+stat -c '%U %a' /opt/palworld/restore-scratch     # must be root 700
+stat -c '%U %a' /var/lib/palworld/uploads         # must be <service account> 700
+```
+
+`palworld-restore` verifies the scratch directory and its whole parent chain and
+refuses otherwise, so a wrong owner here shows up as a clean refusal in the job
+output rather than as a bad restore. `--restore` is also **refused entirely in
+`PALWARDEN_MODE=external`**: the game runs on another host, so "is the server
+running?" has no truthful answer locally and the world could be replaced under a
+live server. Restore on the host that runs the server.
+
+Old `Pal/Saved.replaced-*` trees are listed at the start of every restore and are
+never deleted automatically — each is a full world save. Remove them by hand once
+the server is known good.
+
 ## Short version
 
 The core service is simply:

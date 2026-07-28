@@ -86,6 +86,16 @@ if [[ -f /etc/palworld/engine.env && "$FORCE_CONFIG" -eq 0 ]]; then
 else
   install_files 0644 /etc/palworld "$REPO_DIR"/config/engine.env
 fi
+# The scheduled-backup settings, treated exactly like engine.env and for the same
+# reason: it is live tuning state, not a template. The backup panel rewrites this
+# whole file through palwarden-jobd's backup_schedule_save action, so overwriting
+# it on every install would silently revert a retention policy the operator set
+# from the browser.
+if [[ -f /etc/palworld/backup.env && "$FORCE_CONFIG" -eq 0 ]]; then
+  echo "    keeping existing /etc/palworld/backup.env (use --force-config to overwrite)"
+else
+  install_files 0644 /etc/palworld "$REPO_DIR"/config/backup.env
+fi
 
 # 4b. Web UI credentials (generated once; never overwritten). Owned by root,
 # readable only by the webui service group, so the unprivileged palwarden-webui
@@ -146,6 +156,27 @@ done
 # the service account, not root), read and updated by the root worker
 # palwarden-jobd. 0700 because job files can carry config values.
 run install -d -m 0700 "${owner_args[@]}" /var/lib/palworld/jobs
+# The backup panel's two directories, 0700 with deliberately *opposite* owners.
+#
+# uploads is the job queue's twin: the unprivileged web UI streams a browser
+# upload straight into it, and palwarden-webui refuses an upload outright unless it
+# owns this directory with no group/other bits. Service-account-owned for exactly
+# the reason the queue is. (palwarden-webui also creates it on demand, so a host
+# that skipped this line still works — but the first upload is not the place to
+# discover a packaging gap.)
+run install -d -m 0700 "${owner_args[@]}" /var/lib/palworld/uploads
+# restore-scratch is the opposite: root:root, and under the root-owned
+# /opt/palworld rather than beside uploads. palworld-restore copies an archive here
+# and validates *the copy*, because every archive in the backups directory is
+# chowned to the service account and so is writable by the web process —
+# validating one in place would prove the name and not the bytes. That argument
+# needs the whole parent chain root-owned, which /var/lib/palworld is not (it is
+# 0755 service-account-owned, a few lines up): the service account could
+# pre-create the scratch directory, or rename root's aside and drop its own at the
+# same name, and a substituted archive would then be restored while the job
+# reported success. palworld-restore verifies the directory it opened and refuses
+# otherwise, so getting this wrong is a clean refusal rather than a silent hole.
+run install -d -m 0700 -o root -g root /opt/palworld/restore-scratch
 
 # The telemetry DB, pre-created service-account-owned — the same thing
 # docker/entrypoint.sh does, and for the same reason. SQLite runs
@@ -193,8 +224,16 @@ refresh_units() {
     echo "    execute any queued action without it)"
     run systemctl enable palwarden-jobd.service
   fi
+  # palworld-backup-auto.timer joins the two control-plane units here rather than
+  # being left to daemon-reload alone. daemon-reload re-reads unit files but does
+  # not re-arm a timer that is already running, so an operator upgrading from a
+  # release with a different tick would keep the old cadence until the next reboot.
+  # The .timer and not the .service: try-restart only acts on a *running* unit, and
+  # a Type=oneshot backup is running for a few seconds a day — restarting the timer
+  # is what actually picks up a change, and it never triggers a backup itself.
   local unit
-  for unit in palworld-config-webui.service palwarden-jobd.service; do
+  for unit in palworld-config-webui.service palwarden-jobd.service \
+              palworld-backup-auto.timer; do
     if systemctl is-active --quiet "$unit" 2>/dev/null; then
       echo "    restarting running unit $unit so it picks up this release"
     fi
@@ -207,7 +246,7 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   # actions instead of resolving them.
   printf 'DRY-RUN: systemctl daemon-reload\n'
   printf 'DRY-RUN: systemctl enable palwarden-jobd.service (only if palworld-config-webui.service is already enabled)\n'
-  printf 'DRY-RUN: systemctl try-restart palworld-config-webui.service palwarden-jobd.service (running units only)\n'
+  printf 'DRY-RUN: systemctl try-restart palworld-config-webui.service palwarden-jobd.service palworld-backup-auto.timer (running units only)\n'
 else
   refresh_units
 fi
@@ -224,4 +263,8 @@ echo "       systemctl enable --now palworld-fps-sample.timer palworld-update-ch
 echo "     The web UI needs both halves of the control plane — the unprivileged"
 echo "     server and the root worker that executes the jobs it queues:"
 echo "       systemctl enable --now palworld-config-webui.service palwarden-jobd.service"
+echo "     Scheduled world-save backups + retention (the schedule itself lives in"
+echo "     /etc/palworld/backup.env and is editable from the web UI's Backups page,"
+echo "     so this timer only decides how often the tool is *asked*):"
+echo "       systemctl enable --now palworld-backup-auto.timer"
 echo "  See README.md for the full list and security notes."

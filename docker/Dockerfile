@@ -116,6 +116,21 @@ COPY docker/s6-rc.d/ /etc/s6-overlay/s6-rc.d/
 #     symlink — see the note in sbin/palworld-config-snapshot.
 # backups was missing from this list entirely, so /api/backups was permanently
 # empty in the container until the first backup ran.
+#
+# The backup panel adds two more, 0700 and with *opposite* owners, which is the
+# whole of its privilege split expressed in two `install -d` lines:
+#   * /var/lib/palworld/uploads — steam. The unprivileged web process streams
+#     browser uploads into it and refuses to accept one unless it owns the
+#     directory with no group/other bits, exactly like the job queue.
+#   * /opt/palworld/restore-scratch — root:root, under the ROOT-OWNED
+#     /opt/palworld. palworld-restore copies an archive here and validates the
+#     copy, because archives in the backups directory are chowned to steam and are
+#     therefore web-writable. That only holds if neither the directory nor any
+#     parent is steam-writable, so it must not sit under /var/lib/palworld (which
+#     steam owns): steam could rename root's directory aside and substitute its
+#     own, and a swapped archive would restore while reporting success.
+# The entrypoint creates both again at start, because /var/lib/palworld and
+# /opt/palworld are usually volumes and a fresh volume shadows what is baked here.
 RUN chmod +x \
         /usr/local/bin/palwarden-entrypoint \
         /usr/local/bin/palwarden-run-periodic \
@@ -132,6 +147,7 @@ RUN chmod +x \
         /etc/s6-overlay/s6-rc.d/public-info-watch/run \
         /etc/s6-overlay/s6-rc.d/service-events/run \
         /etc/s6-overlay/s6-rc.d/jobd/run \
+        /etc/s6-overlay/s6-rc.d/backup-auto/run \
     && (chmod +x /usr/local/sbin/palworld-* /usr/local/sbin/palwarden-* \
         /usr/local/bin/palworld-config-parser 2>/dev/null || true) \
     && install -d -o steam -g steam \
@@ -142,7 +158,11 @@ RUN chmod +x \
         /var/log/palworld \
     && install -d -o root -g root -m 0755 \
         /opt/palworld/config-snapshots \
-        /opt/palworld/backups
+        /opt/palworld/backups \
+    && install -d -o steam -g steam -m 0700 \
+        /var/lib/palworld/uploads \
+    && install -d -o root -g root -m 0700 \
+        /opt/palworld/restore-scratch
 
 WORKDIR /opt/palworld/server
 

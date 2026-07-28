@@ -1,0 +1,18 @@
+[Unit]
+Description=Ask palworld-backups every 15 minutes whether a backup is due
+
+[Timer]
+# A short *fixed* tick, not the backup interval. BACKUP_INTERVAL_HOURS lives in
+# /etc/palworld/backup.env and is enforced by the tool, so this cadence only bounds
+# how late a due backup can be. Changing the schedule from the web UI therefore
+# needs no daemon-reload and no unit edit.
+OnBootSec=3min
+OnUnitActiveSec=15min
+RandomizedDelaySec=1min
+# Persistent so a host that was down over a window ticks once shortly after boot
+# rather than waiting a full interval first.
+Persistent=true
+Unit=palworld-backup-auto.service
+
+[Install]
+WantedBy=timers.target

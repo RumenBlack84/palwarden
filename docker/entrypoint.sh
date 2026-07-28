@@ -46,6 +46,32 @@ install -d -o steam -g steam /var/lib/palworld /opt/palworld/config-backups
 # Only the mount point's own child is created here (never a recursive chown of a
 # mounted volume; see CLAUDE.md / runbook §11).
 install -d -o steam -g steam -m 0700 /var/lib/palworld/jobs
+# Upload staging for the backup panel, and the deliberate counterpart to the
+# scratch directory below: these two have *opposite* ownership on purpose.
+#
+#   uploads        - steam (the web user), 0700. The unprivileged web process
+#                    streams a browser upload straight into it, exactly as it
+#                    writes the job queue above, and palwarden-webui refuses to
+#                    accept an upload unless it owns this directory with no
+#                    group/other bits. palwarden-webui also creates it on demand;
+#                    that stays, but packaging it here means the very first upload
+#                    is not the thing that discovers a packaging gap.
+#   restore-scratch- root:root, 0700, and under the ROOT-OWNED /opt/palworld.
+#                    palworld-restore copies an archive here and validates the
+#                    copy, because archives in the backups directory are chowned to
+#                    the service account and are therefore writable by the web
+#                    process — validating one in place would prove the name and not
+#                    the bytes. That argument only holds if neither the directory
+#                    NOR ANY PARENT is writable by that account, so it cannot live
+#                    under /var/lib/palworld (steam-owned 0755, right above):
+#                    steam could pre-create it, or rename root's aside and put its
+#                    own there, and a substituted archive would restore while
+#                    reporting success. /opt/palworld is the root-owned parent this
+#                    image already puts backups and config-snapshots under.
+# Both are mount-point children only — never a recursive chown of a mounted
+# volume (see CLAUDE.md / runbook §11).
+install -d -o steam -g steam -m 0700 /var/lib/palworld/uploads
+install -d -o root -g root -m 0700 /opt/palworld/restore-scratch
 # Pre-create the telemetry DB owned by steam so root-context boot steps (e.g.
 # config-apply-env's event marker) don't leave it root-owned.
 [[ -e /var/lib/palworld/metrics.sqlite3 ]] \
@@ -62,6 +88,42 @@ palwarden-render-config /etc/palworld/settings.env /etc/palworld/notify.env
 chown steam:steam /etc/palworld/settings.env 2>/dev/null || true
 if [[ -f /etc/palworld/notify.env ]]; then
   chown steam:steam /etc/palworld/notify.env 2>/dev/null || true
+fi
+
+# Scheduled-backup settings, rendered from BACKUP_* env **only if the file is
+# absent**. Unlike settings.env this is not re-rendered on every start, and that
+# asymmetry is the point: /etc/palworld/backup.env is also written by
+# palwarden-jobd's backup_schedule_save action when the operator saves the schedule
+# form, so re-rendering it from the compose file would silently revert every change
+# made from the browser on the next `docker compose up`. The env vars are the
+# *seed*; the panel owns it thereafter. Root-owned 0644 — it is tuning, not a
+# secret, and the unprivileged web process must never be able to rewrite it.
+#
+# Only the four keys palworld-backups reads, and only the ones actually set, so an
+# unset variable leaves the tool's own default in place rather than pinning it into
+# a file. BACKUP_TICK_SECONDS is deliberately not among them: it is this
+# container's tick, read by the s6 service, not part of the schedule.
+if [[ ! -e /etc/palworld/backup.env ]]; then
+  _sched=""
+  for _key in BACKUP_ENABLED BACKUP_INTERVAL_HOURS BACKUP_RETENTION_DAYS BACKUP_KEEP_MIN; do
+    # Indirect expansion with a default, so `set -u` cannot trip on an unset name.
+    _value="${!_key-}"
+    [[ -n "$_value" ]] || continue
+    _sched+="${_key}=${_value}"$'\n'
+  done
+  if [[ -n "$_sched" ]]; then
+    umask 022
+    {
+      printf '# Rendered by palwarden-entrypoint from BACKUP_* environment variables.\n'
+      printf '# Seeded once: the backup panel (palwarden-jobd backup_schedule_save)\n'
+      printf '# owns this file afterwards, so edits made in the browser survive a\n'
+      printf '# container recreate. Delete it to re-seed from the environment.\n\n'
+      printf '%s' "$_sched"
+    } > /etc/palworld/backup.env
+    chmod 0644 /etc/palworld/backup.env
+    log "rendered /etc/palworld/backup.env from BACKUP_* env."
+  fi
+  unset _sched _key _value
 fi
 
 # Web UI credentials (root-only file; generated once, honouring WEBUI_* from env).
@@ -93,7 +155,8 @@ rm -f "$S6_USER_CONTENTS"/palworld-server \
       "$S6_USER_CONTENTS"/update-check \
       "$S6_USER_CONTENTS"/public-info-watch \
       "$S6_USER_CONTENTS"/service-events \
-      "$S6_USER_CONTENTS"/jobd
+      "$S6_USER_CONTENTS"/jobd \
+      "$S6_USER_CONTENTS"/backup-auto
 enable_service() { : > "$S6_USER_CONTENTS/$1"; log "service enabled: $1"; }
 
 if [[ "$MODE" == "embedded" ]]; then
@@ -172,6 +235,12 @@ if [[ "$MODE" == "embedded" ]]; then
   # Root half of the web UI control plane. Paired with config-webui (enabled
   # just above): without it, jobs the UI accepts would sit in the queue forever.
   enable_service jobd
+  # Scheduled world-save backups + retention, embedded only (there is no world
+  # tree to tar in external mode). Enabled unconditionally and *not* gated on a
+  # BACKUP_* variable: whether a backup happens is BACKUP_ENABLED's business,
+  # decided per tick inside palworld-backups, so switching backups off from the
+  # panel needs no service change and switching them back on needs no recreate.
+  enable_service backup-auto
 fi
 
 if [[ "$TELEMETRY_READY" == "1" ]]; then

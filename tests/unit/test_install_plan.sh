@@ -72,6 +72,51 @@ assert_file_contains "$PLAN" "install -d -m 0700" "the job queue keeps its 0700 
 assert_file_not_contains "$PLAN" "install -d -m 0700 -o root -g root /var/lib/palworld/jobs" \
   "the job queue is NOT forced root-owned"
 
+# --- the backup panel's two directories, with OPPOSITE owners ----------------
+# Same class of finding as the two above, and the reason it is pinned here rather
+# than only in the container suite: the ownership is the security property, and
+# getting it backwards is silent on the happy path.
+#
+# The staging dir must be service-account-owned 0700 (the unprivileged web UI is
+# its only writer, exactly like the job queue) and must therefore NOT be in the
+# root-owned loop.
+assert_file_contains "$PLAN" "install -d -m 0700" "the upload staging dir is 0700"
+assert_file_not_contains "$PLAN" \
+  "install -d -m 0700 -o root -g root /var/lib/palworld/uploads" \
+  "the upload staging dir is NOT forced root-owned (that breaks every upload)"
+upload_lines="$(grep -c 'install -d.*/var/lib/palworld/uploads' "$PLAN")"
+assert_eq "$upload_lines" "1" "the upload staging dir is created exactly once"
+# The scratch dir is the mirror image: root:root 0700, under the root-owned
+# /opt/palworld and *not* under /var/lib/palworld. palworld-restore validates its
+# copy of an archive there because archives in the backups directory are chowned to
+# the service account; a scratch dir whose parent that account owns lets a
+# substituted archive be restored while the job reports success.
+assert_file_contains "$PLAN" \
+  "install -d -m 0700 -o root -g root /opt/palworld/restore-scratch" \
+  "the restore scratch dir is created root:root 0700"
+assert_file_not_contains "$PLAN" "/var/lib/palworld/restore-scratch" \
+  "and never under the service-account-owned /var/lib/palworld"
+
+# --- the schedule file is installed, and never clobbered ---------------------
+# It is live state, not a template: the panel rewrites it through jobd's
+# backup_schedule_save, so reinstalling over it would revert a retention policy the
+# operator set from the browser. --dry-run runs on a host with no
+# /etc/palworld/backup.env, so the plan shows the install; the preservation branch
+# is the `-f ... && FORCE_CONFIG -eq 0` test right beside engine.env's.
+assert_file_contains "$PLAN" "config/backup.env /etc/palworld/backup.env" \
+  "the scheduled-backup settings file is installed"
+# shellcheck disable=SC2016  # the literal source text, not an expression to expand
+assert_file_contains "$DIR/../../install.sh" \
+  '[[ -f /etc/palworld/backup.env && "$FORCE_CONFIG" -eq 0 ]]' \
+  "...and an existing one is preserved unless --force-config"
+
+# --- the new timer is refreshed too ------------------------------------------
+# daemon-reload re-reads unit files but does not re-arm a running timer, so an
+# upgrade that changed the tick would keep the old cadence until reboot. The
+# .timer, not the .service: try-restart only acts on a running unit.
+assert_file_contains "$PLAN" "palworld-backup-auto.timer" \
+  "the scheduled-backup timer is refreshed alongside the control plane"
+
 # --- the telemetry DB is pre-created ----------------------------------------
 assert_file_contains "$PLAN" "/var/lib/palworld/metrics.sqlite3" \
   "the telemetry DB is pre-created so the unprivileged web UI can open it"
