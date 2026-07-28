@@ -36,6 +36,10 @@
 # still the ones in compose.yaml, so a real deployment listening on 8088/8211
 # makes `live_up` fail loudly rather than quietly sharing state — which is the
 # behaviour we want.)
+#
+# `name:` alone is not a guarantee — COMPOSE_PROJECT_NAME, from the environment or
+# from docker/.env, overrides it — so tests/live/lib/testbed.sh passes
+# `-p palwarden-live` explicitly. This stays for the hand-run invocation above.
 name: palwarden-live
 
 services:
