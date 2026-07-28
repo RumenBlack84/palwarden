@@ -38,6 +38,7 @@ import importlib.machinery
 import importlib.util
 import ipaddress
 import json
+import math
 import os
 import re
 import secrets
@@ -152,9 +153,22 @@ if _raw_upload_timeout:
         # process hold threads forever. Same rule as archive.env_int, which cannot
         # be reused here because this one is a float.
         _parsed = float(_raw_upload_timeout)
-        UPLOAD_TIMEOUT = _parsed if _parsed > 0 else UPLOAD_TIMEOUT
     except ValueError:
-        pass
+        print(f"warning: PALWARDEN_UPLOAD_TIMEOUT={_raw_upload_timeout!r} is not a "
+              f"number; using the default {UPLOAD_TIMEOUT}s", file=sys.stderr)
+    else:
+        # float() happily parses "inf"/"nan", and both pass `> 0`. Rejected here,
+        # not just at the socket call: `socket.settimeout(inf)` raises
+        # OverflowError and `settimeout(nan)` raises ValueError, and either would
+        # fire from inside _stream_upload's try block on the *first* upload after
+        # start rather than at import — turning a config typo into a 500 on every
+        # upload instead of a clear warning at startup.
+        if math.isfinite(_parsed) and _parsed > 0:
+            UPLOAD_TIMEOUT = _parsed
+        else:
+            print(f"warning: PALWARDEN_UPLOAD_TIMEOUT={_raw_upload_timeout!r} must be "
+                  f"a positive, finite number; using the default {UPLOAD_TIMEOUT}s",
+                  file=sys.stderr)
 
 # One limit for both "which jobs does GET /api/jobs show" and "which jobs can
 # block a disruptive POST with a 409". They must be the same number: a job the
@@ -641,10 +655,13 @@ def ep_backups(_query: dict) -> dict:
     back in), but it is a misleading row in the panel and it consumes a listing
     slot that a real archive should have.
 
-    Deliberately not applied to ep_snapshots: config snapshots are written only by
-    root tools that rename into place from elsewhere, their names carry an
-    operator-chosen label so there is no pattern to filter by, and nothing in the
-    snapshot flow takes a name back from this listing.
+    Deliberately not applied to ep_snapshots, but not because that listing lacks
+    in-flight state the way this reasoning might suggest: root holds the snapshot
+    directory open across several subprocesses, so an in-flight snapshot *can*
+    briefly appear there too. The conclusion still holds for a narrower reason —
+    snapshot names carry an operator-chosen label, so there is no fixed pattern to
+    filter by, and nothing in the snapshot flow takes a name back from this
+    listing either.
     """
     return _list_dir(SAVE_BACKUP_DIR, name_ok=archive.valid_archive_name)
 
@@ -928,6 +945,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
                               "UI user, mode 0700.")
             return
         try:
+            # mkdir's mode= only applies on *creation*: exist_ok=True happily
+            # accepts a directory a hand-rolled deploy left group/other-readable
+            # (or owned by someone else) and never revisits it. check_jobs_dir
+            # follows the same shape for the job queue; this is the upload
+            # staging directory's equivalent.
+            _upload_dir_stat = os.stat(UPLOAD_DIR)
+        except OSError as exc:
+            self._reject(500, f"cannot stat upload staging directory {UPLOAD_DIR}: "
+                              f"{exc.strerror}")
+            return
+        if _upload_dir_stat.st_uid != os.geteuid() or (_upload_dir_stat.st_mode & 0o077):
+            self._reject(500, f"upload staging directory {UPLOAD_DIR} must be owned "
+                              f"by this process and have no group/other permission "
+                              f"bits (found owner uid {_upload_dir_stat.st_uid}, mode "
+                              f"{oct(_upload_dir_stat.st_mode & 0o777)}). Fix its "
+                              "ownership/permissions (0700, owned by the web UI user) "
+                              "and retry.")
+            return
+        try:
             vfs = os.statvfs(UPLOAD_DIR)
         except OSError as exc:
             self._reject(500, f"cannot check free space on {UPLOAD_DIR}: {exc.strerror}")
@@ -974,18 +1010,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         error: str | None = None
         status = 500
-        # REQUEST_TIMEOUT is right for every other path in this file and would abort
-        # a real upload mid-flight, so raise it for this request only and put the
-        # old value back below. socketserver sets the timeout per connection, so the
-        # restore matters the moment protocol_version becomes HTTP/1.1 and a
-        # connection carries a second request — until then it is unobservable (every
-        # connection here serves exactly one request and is then closed), so no test
-        # can pin the restore itself. The *raise* is pinned: a trickled upload that
-        # outlives PALWARDEN_UPLOAD_TIMEOUT is cut off, which cannot happen if this
-        # path silently inherited REQUEST_TIMEOUT.
-        previous_timeout = self.connection.gettimeout()
-        self.connection.settimeout(UPLOAD_TIMEOUT)
+        # previous_timeout/timeout_changed live outside the try so the `finally`
+        # can see them even if gettimeout()/settimeout() itself raises (see below);
+        # timeout_changed, not "previous_timeout is not None", is the restore guard,
+        # because None is gettimeout()'s own answer for "no timeout" and would
+        # otherwise be indistinguishable from "we never got that far".
+        previous_timeout = None
+        timeout_changed = False
         try:
+            # REQUEST_TIMEOUT is right for every other path in this file and would
+            # abort a real upload mid-flight, so raise it for this request only and
+            # put the old value back in `finally`. socketserver sets the timeout per
+            # connection, so the restore matters the moment protocol_version becomes
+            # HTTP/1.1 and a connection carries a second request — until then it is
+            # unobservable (every connection here serves exactly one request and is
+            # then closed), so no test can pin the restore itself. The *raise* is
+            # pinned: a trickled upload that outlives PALWARDEN_UPLOAD_TIMEOUT is cut
+            # off, which cannot happen if this path silently inherited
+            # REQUEST_TIMEOUT. Inside the try (not above it) so that anything either
+            # call raises — e.g. an OverflowError from a non-finite UPLOAD_TIMEOUT
+            # that slipped past the module-load-time guard — still closes `fd` and
+            # unlinks `tmp` in `finally`, instead of leaking both.
+            previous_timeout = self.connection.gettimeout()
+            self.connection.settimeout(UPLOAD_TIMEOUT)
+            timeout_changed = True
             remaining = length
             while remaining > 0:
                 # Bounded by the *framing*: reading past Content-Length would eat
@@ -1017,7 +1065,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     error = f"cannot write the staging file: {exc.strerror}"
                     break
         finally:
-            self.connection.settimeout(previous_timeout)
+            if timeout_changed:
+                self.connection.settimeout(previous_timeout)
             os.close(fd)
             # Every failure path, including a short read and an exception on the way
             # out (CLIENT_GONE, a kill): a partial upload must leave no debris for

@@ -39,19 +39,29 @@ JOBS="$WORK/queue/jobs"
 PORT=18099
 PORT_SLOW=18098
 PORT_FULL=18095
+PORT_HUGE=18094
+PORT_BADPERM=18093
+PORT_INF=18092
 PID=""
 PID_SLOW=""
 PID_FULL=""
+PID_HUGE=""
+PID_BADPERM=""
+PID_INF=""
 cleanup() {
   [ -n "$PID" ] && kill "$PID" 2>/dev/null
   [ -n "$PID_SLOW" ] && kill "$PID_SLOW" 2>/dev/null
   [ -n "$PID_FULL" ] && kill "$PID_FULL" 2>/dev/null
+  [ -n "$PID_HUGE" ] && kill "$PID_HUGE" 2>/dev/null
+  [ -n "$PID_BADPERM" ] && kill "$PID_BADPERM" 2>/dev/null
+  [ -n "$PID_INF" ] && kill "$PID_INF" 2>/dev/null
   rm -rf "$WORK"
 }
 trap cleanup EXIT
 
 ARCHIVE="palworld-save-20260101T000000Z.tar.gz"
 ARCHIVE2="palworld-save-20260102T000000Z.tar.gz"
+ARCHIVE3="palworld-save-20260106T000000Z.tar.gz"
 
 # --- fixture ---------------------------------------------------------------
 mkdir -p "$WORK/webroot" "$WORK/sbin" "$WORK/cfg" "$WORK/vol" "$BACKUPS" "$WORK/etc"
@@ -397,6 +407,25 @@ assert_ne "$short_code" "202" "a truncated body is never accepted"
 assert_eq "$(staged)" "" "a truncated upload leaves no staged file and no temp"
 assert_eq "$(serving)" "200" "still serving after a truncated upload"
 
+# --- upload: a body longer than Content-Length is truncated, not overrun ----
+# The success path is the one path in this handler that does not set
+# close_connection, which is exactly the shape that would desync under the
+# one-line `protocol_version = "HTTP/1.1"` switch this file promises three times
+# is safe: only Content-Length bytes may ever be consumed from the socket, with
+# the rest left for whatever request follows on a kept-alive connection.
+python3 -c 'open("'"$WORK"'/longbody.bin", "wb").write(b"A" * 5000)'
+{
+  printf 'POST /api/backups/upload HTTP/1.1\r\nHost: 127.0.0.1:%s\r\nAuthorization: Basic %s\r\nX-Palwarden-Token: tok-for-tests\r\nX-Palwarden-Filename: %s\r\nContent-Length: 10\r\nConnection: close\r\n\r\n' \
+    "$PORT" "$B64" "$ARCHIVE3"
+  cat "$WORK/longbody.bin"
+} > "$WORK/longbody.req"
+assert_eq "$(raw "$WORK/longbody.req")" "202" \
+  "a body longer than Content-Length is still accepted"
+assert_eq "$(wc -c < "$UPLOADS/$ARCHIVE3" | tr -d ' ')" "10" \
+  "the staged file is exactly the Content-Length, not the whole body sent"
+assert_eq "$(serving)" "200" "still serving after a body longer than Content-Length"
+rm -f "$UPLOADS/$ARCHIVE3"
+
 # --- neither existing constant leaked into the other -----------------------
 # The 64 KiB job cap still applies to POST /api/jobs...
 python3 - "$WORK" <<'EOF'
@@ -432,6 +461,26 @@ assert_eq "$(staged)" "" "the timed-out upload leaves nothing behind"
 assert_eq "$(code -u "$CREDS" "http://127.0.0.1:$PORT_SLOW/api/health")" "200" \
   "still serving after a timed-out upload"
 
+# --- a non-finite PALWARDEN_UPLOAD_TIMEOUT falls back to the default, warned --
+# float("inf") passes the old `> 0` check, but socket.settimeout(inf) raises
+# OverflowError deep inside the upload path (turning every upload into a leaked
+# fd, a leaked temp file, and a 500). The override must be rejected at
+# module-load time instead, with the default used and a warning logged.
+start_server "$PORT_INF" "$WORK/server-inf.log" \
+  PALWARDEN_MAX_UPLOAD_BYTES=200000 PALWARDEN_UPLOAD_TIMEOUT=inf
+PID_INF=$!
+assert_eq "$(code -u "$CREDS" -H "$TOKHDR" -H "X-Palwarden-Filename: $ARCHIVE2" \
+  -H 'Expect:' --data-binary '@'"$WORK/second.bin" \
+  "http://127.0.0.1:$PORT_INF/api/backups/upload")" "202" \
+  "PALWARDEN_UPLOAD_TIMEOUT=inf falls back to the default instead of 500ing"
+assert_contains "$(cat "$WORK/server-inf.log")" "warning:" \
+  "the non-finite override is logged as a warning at startup"
+assert_not_contains "$(cat "$WORK/server-inf.log")" "Traceback" \
+  "the non-finite override never reaches a traceback"
+assert_eq "$(code -u "$CREDS" "http://127.0.0.1:$PORT_INF/api/health")" "200" \
+  "still serving with a non-finite upload timeout override"
+rm -f "$UPLOADS/$ARCHIVE2"
+
 # --- upload: no free space is a 507, not a filled volume -------------------
 start_server "$PORT_FULL" "$WORK/server-full.log" \
   PALWARDEN_MAX_UPLOAD_BYTES=200000 PALWARDEN_UPLOAD_FREE_MARGIN=1125899906842624
@@ -448,7 +497,58 @@ assert_eq "$(staged)" "" "a 507 stages nothing"
 assert_eq "$(code -u "$CREDS" "http://127.0.0.1:$PORT_FULL/api/health")" "200" \
   "still serving after a 507"
 
+# --- upload: the free-space check bounds the upload itself, not just the margin
+# (the `free < length + UPLOAD_FREE_MARGIN` comparison at :937 has two terms that
+# can each shield the other from a single-check mutation: dropping UPLOAD_FREE_MARGIN
+# leaves this passing because `length` alone still bounds it, and dropping `length`
+# leaves the PORT_FULL test above passing because the margin alone still bounds it).
+# Default margin (no override) and a MAX_UPLOAD_BYTES far above anything a real disk
+# could hold, so only `length` itself can be doing the work here: a Content-Length of
+# "everything free, plus a spare gigabyte" must still 507, before a byte is read.
+start_server "$PORT_HUGE" "$WORK/server-huge.log" \
+  PALWARDEN_MAX_UPLOAD_BYTES=1125899906842624
+PID_HUGE=$!
+AVAIL="$(df --output=avail -B1 "$WORK" | tail -1 | tr -d ' ')"
+HUGE_LEN=$((AVAIL + 1073741824))
+printf 'POST /api/backups/upload HTTP/1.1\r\nHost: 127.0.0.1:%s\r\nAuthorization: Basic %s\r\nX-Palwarden-Token: tok-for-tests\r\nX-Palwarden-Filename: %s\r\nContent-Length: %s\r\nConnection: close\r\n\r\n' \
+  "$PORT_HUGE" "$B64" "$ARCHIVE" "$HUGE_LEN" > "$WORK/toobig.req"
+assert_eq "$(python3 "$WORK/raw.py" "$PORT_HUGE" "$WORK/toobig.req")" "507" \
+  "a Content-Length larger than free space is 507 even with a comfortable margin, no body sent"
+assert_eq "$(staged)" "" "the oversized-length request stages nothing"
+assert_eq "$(code -u "$CREDS" "http://127.0.0.1:$PORT_HUGE/api/health")" "200" \
+  "still serving after the oversized-length 507"
+
+# --- upload: an existing staging directory's mode and owner are checked ----
+# mkdir(..., mode=0700) only applies the mode on *creation*; a directory a
+# hand-rolled deploy left group/other-readable (or owned by someone else) would
+# otherwise be accepted forever. Uses its own staging directory, pre-created 0755,
+# so the shared $UPLOADS used by every other server in this file (created 0700 by
+# the very first server) is untouched.
+BADPERM_UPLOADS="$WORK/vol/uploads-badperm"
+mkdir -p "$BADPERM_UPLOADS"
+chmod 0755 "$BADPERM_UPLOADS"
+start_server "$PORT_BADPERM" "$WORK/server-badperm.log" \
+  PALWARDEN_UPLOAD_DIR="$BADPERM_UPLOADS" PALWARDEN_MAX_UPLOAD_BYTES=200000
+PID_BADPERM=$!
+assert_eq "$(code -u "$CREDS" -H "$TOKHDR" -H "X-Palwarden-Filename: $ARCHIVE" \
+  -H 'Expect:' --data-binary '@'"$WORK/good.bin" \
+  "http://127.0.0.1:$PORT_BADPERM/api/backups/upload")" "500" \
+  "a pre-existing 0755 staging directory is refused, not silently accepted"
+assert_eq "$(stat -c %a "$BADPERM_UPLOADS")" "755" \
+  "the refusal does not itself fix the directory (that is the operator's job)"
+assert_eq "$(find "$BADPERM_UPLOADS" -mindepth 1 | wc -l | tr -d ' ')" "0" \
+  "the bad-permission refusal stages nothing"
+assert_eq "$(code -u "$CREDS" "http://127.0.0.1:$PORT_BADPERM/api/health")" "200" \
+  "still serving after the bad-permission refusal"
+
 # --- the listing hides in-flight and off-pattern files ---------------------
+# Debris that sorts *above* the real archive (a far-future date is lexically
+# greater), planted past the 50-entry limit `_list_dir` applies: if the name filter
+# ran after the limit instead of before it, these 51 entries alone would fill every
+# slot and $ARCHIVE would never reach the response the assertions below check.
+for i in $(seq 1 51); do
+  printf 'debris' > "$BACKUPS/palworld-save-21000101T000000Z.tar.gz.import.fake$i"
+done
 listing="$(body -u "$CREDS" "$U/api/backups")"
 assert_contains "$listing" "$ARCHIVE" "the listing shows a real archive"
 assert_not_contains "$listing" "$IMPORT_TEMP" \
@@ -531,7 +631,8 @@ assert_eq "$(printf '%s' "$shape" | sed -n 3p)" "6" \
   "the schedule reflects the file, not the defaults"
 
 # --- nothing sensitive, and no traceback, in any log ----------------------
-for log in "$WORK/server.log" "$WORK/server-slow.log" "$WORK/server-full.log"; do
+for log in "$WORK/server.log" "$WORK/server-slow.log" "$WORK/server-full.log" \
+           "$WORK/server-huge.log" "$WORK/server-badperm.log" "$WORK/server-inf.log"; do
   assert_not_contains "$(cat "$log")" "tok-for-tests" "token never logged ($log)"
   assert_not_contains "$(cat "$log")" "pw-for-tests" "password never logged ($log)"
   assert_not_contains "$(cat "$log")" "Traceback" "no traceback reached the log ($log)"
