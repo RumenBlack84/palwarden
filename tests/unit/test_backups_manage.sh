@@ -27,7 +27,11 @@ source "$DIR/../lib/assert.sh"
 TOOL="$DIR/../../sbin/palworld-backups"
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+# A FIFO-with-live-writer test holds fd 9 open across a timed run. If an
+# assertion between opening and closing it fails (and this suite does not stop
+# on the first failure), the fd must not leak past the script's own lifetime -
+# so the EXIT trap closes it too, unconditionally and silently.
+trap 'exec 9>&- 2>/dev/null; rm -rf "$WORK"' EXIT
 
 BACKUPS="$WORK/backups"
 SCHED="$WORK/backup.env"
@@ -547,5 +551,104 @@ reset_dir
 printf 'BACKUP_INTERVAL_HOURS=nonsense\n' > "$SCHED"
 backups --if-due >/dev/null 2>&1
 assert_file_exists "$LOG" "--if-due still backs up with an unparseable schedule file"
+
+# --- the schedule read survives a wedged or hostile file --------------------
+# In the container, /var/lib/palworld (which holds backup.env) is steam-owned,
+# and steam is exactly the account this feature treats as hostile: it can
+# unlink the real file and plant a FIFO, a symlink, or a directory under that
+# name. read_schedule reads through archive.open_archive_fd for exactly this
+# reason - see that function's docstring and read_schedule's for why
+# O_NONBLOCK, S_ISREG and O_NOFOLLOW are each doing a distinct job and none of
+# them is redundant with either of the others.
+#
+# Every case here is wrapped in `timeout` so a regression (a blocking open, or
+# a blocking read on a FIFO with a writer) fails this suite in seconds instead
+# of hanging it, or hanging whatever CI runs it under. rc=124 is timeout's own
+# "the command was killed" code, so it is asserted OUT explicitly everywhere,
+# not just implied by a non-timeout rc.
+
+# A FIFO with no writer. Before the fix this hung inside SCHEDULE_FILE's plain
+# read_text() - a blocking open() with nothing on the other end never returns.
+# The regular-file requirement in open_archive_fd must reject it instead, and
+# the caller must treat that refusal the same as any other bad file: warn and
+# fall back to defaults, not raise.
+reset_dir; reset_sched
+mkfifo "$SCHED"
+out="$(timeout 5 env PALWARDEN_SAVE_BACKUP_DIR="$BACKUPS" PALWORLD_BACKUP_SCHEDULE="$SCHED" \
+  python3 "$TOOL" --show-schedule 2>"$WORK/err")"; rc=$?
+assert_ne "$rc" "124" "a writerless FIFO at the schedule path does not hang the read"
+assert_eq "$rc" "0" "and --show-schedule still succeeds, with defaults"
+assert_contains "$out" '"BACKUP_INTERVAL_HOURS": 24' "defaults are used for a FIFO schedule file"
+assert_file_contains "$WORK/err" "$SCHED" "the warning names the wedged file"
+rm -f "$SCHED"
+
+# A FIFO WITH a live writer held open. A writerless FIFO reads as EOF the
+# instant something opens it for read, so it never exercises a blocking
+# *read* - only a blocking *open*. This is the one case that is unique to
+# S_ISREG once O_NONBLOCK is cleared: if S_ISREG were ever skipped, tarfile-
+# style buffered reads on this fd would block forever because the writer end
+# is still open. fd 9 is opened read-write on the FIFO before the timed run so
+# there is always a writer, and explicitly closed after - and by the trap too,
+# in case an assertion below fails and skips the close.
+reset_dir; reset_sched
+mkfifo "$SCHED"
+exec 9<>"$SCHED"
+out="$(timeout 5 env PALWARDEN_SAVE_BACKUP_DIR="$BACKUPS" PALWORLD_BACKUP_SCHEDULE="$SCHED" \
+  python3 "$TOOL" --show-schedule 2>"$WORK/err")"; rc=$?
+exec 9>&-
+assert_ne "$rc" "124" "a FIFO with a live writer does not hang the read either"
+assert_eq "$rc" "0" "--show-schedule succeeds, with defaults, even with a writer holding the FIFO open"
+assert_contains "$out" '"BACKUP_INTERVAL_HOURS": 24' "defaults are used for a live-writer FIFO"
+assert_file_contains "$WORK/err" "$SCHED" "the warning names the file here too"
+rm -f "$SCHED"
+
+# A symlink at the schedule path. O_NOFOLLOW is what refuses this - without
+# it, whoever can create backup.env's parent entry chooses which file root
+# reads config from.
+reset_dir; reset_sched
+printf 'VICTIM\n' > "$WORK/sched-victim"
+ln -s "$WORK/sched-victim" "$SCHED"
+out="$(backups --show-schedule 2>"$WORK/err")"; rc=$?
+assert_eq "$rc" "0" "a symlinked schedule file falls back to defaults rather than failing"
+assert_contains "$out" '"BACKUP_INTERVAL_HOURS": 24' "defaults are used for a symlinked schedule file"
+assert_file_contains "$WORK/err" "$SCHED" "the warning names the symlinked path"
+rm -f "$SCHED" "$WORK/sched-victim"
+
+# A directory at the schedule path. Not a FIFO and not a symlink, so this is
+# what proves S_ISREG (not merely O_NOFOLLOW or O_NONBLOCK) is doing its own
+# work: a directory opens successfully and non-blockingly, and only the
+# S_ISREG check afterwards refuses it.
+reset_dir; reset_sched
+mkdir "$SCHED"
+out="$(backups --show-schedule 2>"$WORK/err")"; rc=$?
+assert_eq "$rc" "0" "a directory at the schedule path falls back to defaults rather than failing"
+assert_contains "$out" '"BACKUP_INTERVAL_HOURS": 24' "defaults are used for a directory schedule path"
+assert_file_contains "$WORK/err" "$SCHED" "the warning names the directory path"
+rmdir "$SCHED"
+
+# Unchanged behaviour, pinned again here so a future change to the read path
+# cannot fix the FIFO/symlink/directory cases while quietly breaking the
+# ordinary ones: missing is silent, a valid file parses, a malformed one warns
+# and defaults.
+reset_dir; reset_sched
+out="$(backups --show-schedule 2>"$WORK/err")"; rc=$?
+assert_eq "$rc" "0" "a missing schedule file still succeeds"
+assert_eq "$(wc -c < "$WORK/err" | tr -d ' ')" "0" "...and is still silent, not a warning"
+assert_contains "$out" '"BACKUP_INTERVAL_HOURS": 24' "...with defaults"
+
+reset_dir; reset_sched
+printf 'BACKUP_INTERVAL_HOURS=6\nBACKUP_RETENTION_DAYS=30\n' > "$SCHED"
+out="$(backups --show-schedule 2>"$WORK/err")"; rc=$?
+assert_eq "$rc" "0" "a valid schedule file still succeeds"
+assert_contains "$out" '"BACKUP_INTERVAL_HOURS": 6' "...and its values are still used"
+assert_eq "$(wc -c < "$WORK/err" | tr -d ' ')" "0" "...silently"
+
+reset_dir; reset_sched
+printf 'BACKUP_INTERVAL_HOURS=bogus\n' > "$SCHED"
+out="$(backups --show-schedule 2>"$WORK/err")"; rc=$?
+assert_eq "$rc" "0" "a malformed schedule file still succeeds"
+assert_contains "$out" '"BACKUP_INTERVAL_HOURS": 24' "...falls back to the default"
+assert_file_contains "$WORK/err" "BACKUP_INTERVAL_HOURS" "...and still warns, by key"
+rm -f "$SCHED"
 
 assert_report

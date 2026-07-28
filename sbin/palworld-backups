@@ -122,13 +122,62 @@ def read_schedule() -> dict:
     Parsing is the same shape as `palworld-engine-config`'s `parse_env` — comments,
     blank lines, and surrounding quotes tolerated, unknown keys ignored — because
     this file is rendered from the same kind of env source.
+
+    The read itself goes through `archive.open_archive_fd`, not a plain
+    `Path.read_text()`. `SCHEDULE_FILE` is root-owned 0644, but the *directory*
+    that holds it in the container (`/var/lib/palworld`) is `steam`-owned, and
+    `steam` is exactly the account this feature treats as hostile — it can
+    unlink the real file and plant a name of its own choosing in its place. Two
+    of `open_archive_fd`'s three protections matter here for the same reason
+    they matter for an uploaded archive:
+
+      * `O_NONBLOCK` stops a planted FIFO from blocking *inside the open*, before
+        this function's `except` even runs. That is the actual tick-killer: a
+        blocking open on a FIFO with no writer hangs a root process forever,
+        and the periodic tick and every `palwarden-jobd` backup action take
+        this same lock before calling in here, so one wedged read stops
+        scheduled backups silently and stalls the web panel for the lock's
+        30-minute wait.
+      * `S_ISREG`, checked on the descriptor before `O_NONBLOCK` is cleared, is
+        what refuses a FIFO, a directory, or a device instead of reading from
+        it. `O_NOFOLLOW` covers the remaining case, a symlink at the name.
+
+    Reused rather than duplicated, because it is the fourth place in this repo
+    that has needed exactly this shape (`_read_job_text`, `palworld-restore`'s
+    upload handling, `palworld-engine-config`'s managed reads, and this one),
+    and a fifth hand-rolled copy is how one of the four eventually drifts.
+
+    Its error handling does not fit this caller unchanged, though, so it is
+    wrapped rather than surfaced as-is: `open_archive_fd` raises `ArchiveError`
+    for a missing file exactly like it does for a planted FIFO, because for an
+    uploaded archive both really are failures. Here a missing file is normal
+    (nobody has saved a schedule yet) and every other refusal — symlink, FIFO,
+    directory, device, or an ordinary permission error — must NOT be fatal: it
+    joins the same warn-and-default path as a malformed value, on purpose. A
+    schedule read that raised here would trade a wedged tick for a crashed one;
+    both stop backups just as silently, and the entire point of this file being
+    a file instead of a unit is that a bad reading of it must never stop the
+    tick. So `open_archive_fd`'s missing-file case is unwrapped back to the
+    normal "return defaults, no warning" behaviour, and its every other case
+    including the non-regular-file refusal collapses into a warning, not a
+    raise.
     """
     sched = dict(DEFAULTS)
     try:
-        text = SCHEDULE_FILE.read_text(errors="replace")
-    except FileNotFoundError:
-        # The normal state before anyone saves a schedule, so not a warning.
+        fd = archive.open_archive_fd(SCHEDULE_FILE)
+    except archive.ArchiveError as exc:
+        # open_archive_fd chains the original OSError with `from exc` only for
+        # the open() failure branch (missing file, permission, ELOOP on a
+        # symlink); the "not a regular file" refusal raises bare, with no
+        # __cause__. That is exactly the distinction needed here: a missing
+        # file is silent, everything else warns.
+        if isinstance(exc.__cause__, FileNotFoundError):
+            return sched
+        _warn(f"cannot read {SCHEDULE_FILE} ({exc}); using the default schedule")
         return sched
+    try:
+        with os.fdopen(fd, "r", errors="replace") as fh:
+            text = fh.read()
     except OSError as exc:
         _warn(f"cannot read {SCHEDULE_FILE} ({exc}); using the default schedule")
         return sched
