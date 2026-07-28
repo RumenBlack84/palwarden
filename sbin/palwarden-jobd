@@ -333,7 +333,7 @@ def validate_schedule(params: dict) -> dict[str, str]:
         raise ValueError("settings must be a non-empty object")
     normalised: dict[str, str] = {}
     for key, value in raw.items():
-        if False:
+        if key not in SCHEDULE_KEYS:
             raise ValueError(f"unknown backup schedule setting: {key!r}")
         if key in SCHEDULE_BOOL_KEYS:
             # A real JSON boolean only. "true"/1 are exactly the shape
