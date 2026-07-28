@@ -92,18 +92,48 @@ fi
 
 # Scheduled-backup settings, rendered from BACKUP_* env **only if the file is
 # absent**. Unlike settings.env this is not re-rendered on every start, and that
-# asymmetry is the point: /etc/palworld/backup.env is also written by
-# palwarden-jobd's backup_schedule_save action when the operator saves the schedule
-# form, so re-rendering it from the compose file would silently revert every change
-# made from the browser on the next `docker compose up`. The env vars are the
-# *seed*; the panel owns it thereafter. Root-owned 0644 — it is tuning, not a
-# secret, and the unprivileged web process must never be able to rewrite it.
+# asymmetry is the point: the schedule file is also written by palwarden-jobd's
+# backup_schedule_save action when the operator saves the schedule form, so
+# re-rendering it from the compose file would silently revert every change made
+# from the browser on the next `docker compose up`. The env vars are the *seed*;
+# the panel owns it thereafter. Root-owned 0644 — it is tuning, not a secret.
+#
+# **Where** it lives is a container-only difference and it matters as much as the
+# seeding rule. The bare-metal default is /etc/palworld/backup.env, which is
+# genuinely persistent on a real host; in the container /etc is the writable layer,
+# which `docker compose up --force-recreate` throws away — so a schedule saved from
+# the panel reverted to the 14-day retention default on the next recreate and the
+# next --prune then deleted the very history the operator had raised retention to
+# keep. compose.yaml therefore points PALWORLD_BACKUP_SCHEDULE at the
+# palwarden-state volume, and this seeding follows the variable rather than the
+# literal path so the two cannot drift. The default here matches the tools' own
+# default, so running the image without compose.yaml still behaves.
+SCHEDULE_FILE="${PALWORLD_BACKUP_SCHEDULE:-/etc/palworld/backup.env}"
+# Only when it is missing: both real destinations already exist by now, and an
+# unconditional `install -d` would reassign the *owner* of one of them —
+# /var/lib/palworld is deliberately steam-owned (it is the web user's job queue and
+# telemetry directory), and taking it to root would break the unprivileged writers.
+_sched_dir="$(dirname "$SCHEDULE_FILE")"
+[[ -d "$_sched_dir" ]] || install -d -o root -g root "$_sched_dir"
+unset _sched_dir
+# Carry a schedule saved by a pre-volume image across the upgrade that moved the
+# file, rather than making the operator notice their retention policy reset. Same
+# shape as the palwarden-backups upgrade guard below: /etc/palworld/backup.env
+# still exists in a *restarted* old container's writable layer.
+if [[ ! -e "$SCHEDULE_FILE" && "$SCHEDULE_FILE" != /etc/palworld/backup.env
+      && -f /etc/palworld/backup.env ]]; then
+  if cat /etc/palworld/backup.env > "$SCHEDULE_FILE" 2>/dev/null; then
+    chown root:root "$SCHEDULE_FILE" 2>/dev/null || true
+    chmod 0644 "$SCHEDULE_FILE" 2>/dev/null || true
+    log "migrated the saved backup schedule from /etc/palworld/backup.env to $SCHEDULE_FILE (it is on a volume now, so it survives a recreate)."
+  fi
+fi
 #
 # Only the four keys palworld-backups reads, and only the ones actually set, so an
 # unset variable leaves the tool's own default in place rather than pinning it into
 # a file. BACKUP_TICK_SECONDS is deliberately not among them: it is this
 # container's tick, read by the s6 service, not part of the schedule.
-if [[ ! -e /etc/palworld/backup.env ]]; then
+if [[ ! -e "$SCHEDULE_FILE" ]]; then
   _sched=""
   for _key in BACKUP_ENABLED BACKUP_INTERVAL_HOURS BACKUP_RETENTION_DAYS BACKUP_KEEP_MIN; do
     # Indirect expansion with a default, so `set -u` cannot trip on an unset name.
@@ -120,11 +150,18 @@ if [[ ! -e /etc/palworld/backup.env ]]; then
       printf '# owns this file afterwards, so edits made in the browser survive a\n'
       printf '# container recreate. Delete it to re-seed from the environment.\n\n'
       printf '%s' "$_sched"
-    } > /etc/palworld/backup.env
-    chmod 0644 /etc/palworld/backup.env
-    log "rendered /etc/palworld/backup.env from BACKUP_* env."
+    } > "$SCHEDULE_FILE"
+    chown root:root "$SCHEDULE_FILE" 2>/dev/null || true
+    chmod 0644 "$SCHEDULE_FILE" 2>/dev/null || true
+    log "rendered $SCHEDULE_FILE from BACKUP_* env."
   fi
   unset _sched _key _value
+elif [[ "$(stat -c %U "$SCHEDULE_FILE" 2>/dev/null || echo root)" != "root" ]]; then
+  # Only root (the entrypoint, or palwarden-jobd acting on the panel's behalf)
+  # should ever have written this. The state volume's directory is steam-owned, so
+  # a non-root owner here means the unprivileged web process replaced the file
+  # behind the validated path — worth saying out loud rather than reading silently.
+  log "WARNING: $SCHEDULE_FILE is not owned by root; it may have been replaced outside the backup panel. Values are still range-checked when read." >&2
 fi
 
 # Web UI credentials (root-only file; generated once, honouring WEBUI_* from env).

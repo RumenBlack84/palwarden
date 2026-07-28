@@ -831,6 +831,104 @@ def _check_scratch_identity(scratch: Path, dfd: int,
             f"refusing to extract bytes that were never validated")
 
 
+def _open_staging_dir(new_tree: Path) -> int:
+    """Open the just-created staging tree and pin it. Returns a dir fd.
+
+    The scratch-copy scheme pins the *archive* root is about to trust. This pins
+    the other half — the *destination* root is about to write — and it is needed
+    for the same reason, one directory over: `SAVED_DIR.parent` (`.../Pal`) is
+    owned by the service account, and `palwarden-webui` runs as that account. So
+    the account we are defending against can `rename` the directory `os.mkdir`
+    just created aside and drop a symlink at the same name, at any moment between
+    the mkdir and the extraction. `extract_archive` resolves its destination path
+    when it extracts, so it would follow that link and unpack the archive
+    wherever the link points, as root.
+
+    `O_DIRECTORY|O_NOFOLLOW` refuses a name that is already a link, and `fstat`
+    on the descriptor is what proves the thing we opened is the directory we made
+    (ours, and a real directory) rather than something that merely answered to the
+    name. Every write then goes through `/proc/self/fd/<tfd>/` — see `_at` — so
+    the destination cannot be re-resolved after this point.
+    """
+    try:
+        tfd = os.open(new_tree, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise archive.ArchiveError(
+            f"cannot open the staging tree {new_tree}: {exc}") from exc
+    try:
+        st = os.fstat(tfd)
+        me = os.geteuid()
+        if not stat.S_ISDIR(st.st_mode):
+            raise archive.ArchiveError(
+                f"the staging tree {new_tree} is not a directory; refusing to "
+                f"extract into it")
+        if st.st_uid != me:
+            raise archive.ArchiveError(
+                f"the staging tree {new_tree} is owned by uid {st.st_uid}, not by "
+                f"uid {me} that this tool runs as; refusing to extract a world "
+                f"into a directory another account can rewrite")
+        # Prove the descriptor-relative spelling the extraction uses resolves,
+        # here, where the failure is a clean refusal — same reason
+        # `_open_scratch_dir` does it for the read side.
+        os.stat(_at(tfd, "."))
+    except OSError as exc:
+        os.close(tfd)
+        raise archive.ArchiveError(
+            f"cannot secure the staging tree {new_tree}: {exc}") from exc
+    except BaseException:
+        os.close(tfd)
+        raise
+    return tfd
+
+
+def _check_staging_identity(new_tree: Path, tfd: int) -> None:
+    """Refuse if `new_tree` no longer names the directory we extracted into.
+
+    The extraction is pinned to the descriptor, but the *swap* is a `rename` of a
+    name, and the same account that could swap the name before the extraction can
+    swap it after. Renaming a planted symlink into `SAVED_DIR` is what leaves the
+    live world a link — which `_chown_tree` would then walk through. This is the
+    same trade `_check_scratch_identity` documents: no door in the API takes a
+    descriptor, so the window is narrowed to the rename itself and made loud
+    instead of silent, and it refuses *before* the live world is moved aside.
+    """
+    try:
+        st = os.lstat(new_tree)
+    except OSError as exc:
+        raise archive.ArchiveError(
+            f"the staging tree {new_tree} became unreadable after it was "
+            f"extracted ({exc}); refusing to swap it into place") from exc
+    pinned = os.fstat(tfd)
+    if (st.st_dev, st.st_ino) != (pinned.st_dev, pinned.st_ino):
+        raise archive.ArchiveError(
+            f"the staging tree {new_tree} was replaced after it was extracted "
+            f"(it is no longer the directory this restore created); refusing to "
+            f"swap it into {SAVED_DIR}")
+
+
+def _discard_staging(tfd: int, display: Path) -> None:
+    """Remove the staging tree we created, located through its descriptor.
+
+    Not `shutil.rmtree(new_tree)`: if that name was swapped for a symlink while we
+    were extracting, that spelling has root deleting whatever the link points at,
+    which is a worse outcome than the debris we are cleaning up. The descriptor's
+    /proc link names the directory we actually created, wherever it now lives.
+    """
+    try:
+        real = os.readlink(f"/proc/self/fd/{tfd}")
+    except OSError as exc:
+        print(f"palworld-restore: warning: cannot locate the staging tree "
+              f"{display} to clean it up: {exc}", file=sys.stderr)
+        return
+    if real.endswith(" (deleted)") or not os.path.isdir(real):
+        print(f"palworld-restore: warning: the staging tree {display} is no "
+              f"longer a directory ({real}); leaving it alone", file=sys.stderr)
+        return
+    # ignore_errors so a cleanup problem cannot mask the failure that is the real
+    # news.
+    shutil.rmtree(real, ignore_errors=True)
+
+
 def _saved_populated() -> bool:
     """True when SAVED_DIR exists and holds at least one entry.
 
@@ -941,10 +1039,23 @@ def _resolve_account() -> tuple[int, int]:
 
 
 def _chown_tree(root: Path) -> None:
-    """Give the restored tree to the service account. Never fatal.
+    """Give the restored tree to the service account. Never fatal *after* the
+    root-is-not-a-link check below, which is fatal by design.
 
     `os.walk(followlinks=False)` plus `lchown`, so a symlink *inside* the tree
     cannot redirect the chown at a path outside it.
+
+    **The root of the walk is the exposure those two do not cover.**
+    `followlinks=False` is about *descending* into symlinked subdirectories; the
+    directory os.walk is *given* is followed unconditionally. So if `root` is
+    itself a symlink — which is what a swap of the staging name for a link, and
+    then the rename into place, leaves behind — this function walks the link's
+    target and hands every path under it to the service account. A reviewer
+    demonstrated exactly that, with the restore reporting success while it
+    happened. `os.lstat` + `S_ISLNK` is the refusal, and it is a raise rather
+    than a warning: the tree we are about to hand over not being the tree we
+    extracted means the swap already succeeded, and there is nothing about the
+    rest of the restore worth continuing at that point.
 
     The guarantee that makes this belt and braces is `palwarden_archive`'s
     `_check_member` type rule — `if not (member.isreg() or member.isdir())` — which
@@ -961,6 +1072,21 @@ def _chown_tree(root: Path) -> None:
     `_check_member` is what does. `followlinks=False` is os.walk's default; it is
     written out because the whole point of the line is that it must not change.
     """
+    try:
+        st = os.lstat(root)
+    except OSError as exc:
+        raise archive.ArchiveError(
+            f"cannot inspect the restored tree {root} before giving it to the "
+            f"service account: {exc}") from exc
+    if stat.S_ISLNK(st.st_mode):
+        raise archive.ArchiveError(
+            f"the restored tree {root} is a symbolic link, not a directory; "
+            f"refusing to change ownership through it (a link at this name would "
+            f"redirect the chown at a tree this restore never created)")
+    if not stat.S_ISDIR(st.st_mode):
+        raise archive.ArchiveError(
+            f"the restored tree {root} is not a directory; refusing to change "
+            f"ownership through it")
     uid, gid = _resolve_account()
     if uid == -1 and gid == -1:
         return
@@ -1141,36 +1267,64 @@ def restore_archive(name: str, wait: int | None = None,
             safety = _safety_backup()
             _graceful_stop(wait)
 
-            new_tree = SAVED_DIR.parent / f"{SAVED_DIR.name}.restore-{stamp}"
-            replaced_path = SAVED_DIR.parent / f"{SAVED_DIR.name}.replaced-{stamp}"
+            # The entropy is not cosmetic and it is not about collisions. The
+            # staging and replaced names live in `SAVED_DIR.parent` (`.../Pal`),
+            # which is owned by the *service account* — the account
+            # `palwarden-webui` runs as, and the one this whole file is defending
+            # against. A second-resolution stamp is a name that account can
+            # *predict*, and therefore pre-place a symlink at: `os.mkdir` then
+            # fails EEXIST at best, and at worst the name is swapped after the
+            # mkdir. `secrets.token_hex` is the same treatment the scratch and
+            # import temp names already get, for the same reason — the destination
+            # deserved it as much as the source did.
+            suffix = f"{stamp}-{secrets.token_hex(8)}"
+            new_tree = SAVED_DIR.parent / f"{SAVED_DIR.name}.restore-{suffix}"
+            replaced_path = SAVED_DIR.parent / f"{SAVED_DIR.name}.replaced-{suffix}"
             try:
                 # The parent may not exist at all on a rebuilt host.
                 SAVED_DIR.parent.mkdir(parents=True, exist_ok=True)
-                # mkdir, not makedirs(exist_ok=True): a name already occupied at
-                # this second is a clean refusal rather than an extraction into
-                # someone else's directory.
+                # mkdir, not makedirs(exist_ok=True): an occupied name is a clean
+                # refusal rather than an extraction into someone else's directory.
                 os.mkdir(new_tree, 0o755)
             except OSError as exc:
                 raise archive.ArchiveError(
                     f"cannot create the staging tree {new_tree}: {exc}") from exc
+            # Pin the destination before anything is written to it, and keep the
+            # descriptor until the swap is done: creating the directory is not the
+            # same as still having it. See `_open_staging_dir`.
+            tfd = _open_staging_dir(new_tree)
             try:
-                # Immediately before the extraction, not anywhere earlier: the
-                # point is that no unchecked bytes reach the staging tree.
-                _check_scratch_identity(scratch, dfd, ident)
-                # Extract beside the target, never over it: a partial extraction
-                # must not be able to leave a half-replaced world. Everything up
-                # to here is reversible by doing nothing.
-                #
-                # Reached through the held directory descriptor, like every other
-                # read of this file — see `_at`.
-                archive.extract_archive(_at(dfd, scratch.name), new_tree)
-            except BaseException:
-                # The live tree has not been touched yet, so the only debris is
-                # ours. ignore_errors so a cleanup problem cannot mask the
-                # extraction failure that is the real news.
-                shutil.rmtree(new_tree, ignore_errors=True)
-                raise
-            print(f"extracted: {new_tree}")
+                try:
+                    # Immediately before the extraction, not anywhere earlier: the
+                    # point is that no unchecked bytes reach the staging tree.
+                    _check_scratch_identity(scratch, dfd, ident)
+                    # Extract beside the target, never over it: a partial extraction
+                    # must not be able to leave a half-replaced world. Everything up
+                    # to here is reversible by doing nothing.
+                    #
+                    # *Both* paths go through a held descriptor — the archive
+                    # through `dfd`, the destination through `tfd` — so neither the
+                    # bytes read nor the directory written can be re-resolved to
+                    # something else between the check and the use. See `_at`.
+                    archive.extract_archive(_at(dfd, scratch.name), _at(tfd, "."))
+                    print(f"extracted: {new_tree}")
+                    # The rename below is by name, so the name is re-checked against
+                    # the descriptor first: a staging tree swapped for a symlink
+                    # after the extraction would otherwise be renamed into place and
+                    # leave the live world a link. Deliberately before the live tree
+                    # is moved aside, so the refusal costs nothing.
+                    _check_staging_identity(new_tree, tfd)
+                except BaseException:
+                    # The live tree has not been touched yet, so the only debris is
+                    # ours — and `_discard_staging` removes *ours*, found through
+                    # `tfd`, not whatever the name points at now. That distinction is
+                    # the whole reason the identity failure above is inside this
+                    # try: `rmtree(new_tree)` on a swapped name would have root
+                    # deleting an attacker-chosen tree while cleaning up.
+                    _discard_staging(tfd, new_tree)
+                    raise
+            finally:
+                os.close(tfd)
 
             try:
                 # is_symlink as well as exists, so a symlinked Pal/Saved is moved

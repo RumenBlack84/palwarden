@@ -12,7 +12,9 @@
 #
 # BACKUP_TICK_SECONDS is the tick, not the backup interval. The schedule itself
 # (BACKUP_ENABLED / BACKUP_INTERVAL_HOURS / BACKUP_RETENTION_DAYS /
-# BACKUP_KEEP_MIN) lives in /etc/palworld/backup.env, and palworld-backups decides
+# BACKUP_KEEP_MIN) lives in the file PALWORLD_BACKUP_SCHEDULE names — on the
+# palwarden-state volume in the container, /etc/palworld/backup.env on bare metal;
+# with-contenv above is what carries the variable in — and palworld-backups decides
 # on each tick whether anything is due. That is what lets the panel change the
 # schedule with nothing to restart, and it is why this service stays enabled even
 # when backups are switched off — BACKUP_ENABLED=false is a no-op inside the tool,

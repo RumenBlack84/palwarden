@@ -172,6 +172,11 @@ if mode == "record":
 
     def extract(path, dest, *a, **k):
         print("EXTRACT=%s" % os.path.realpath(path))
+        # The *destination*, also by realpath and for the same reason: it is
+        # handed over as /proc/self/fd/<tfd>/., so realpath is what says which
+        # directory that descriptor is pinned to - and it is where the staging
+        # name's entropy becomes observable.
+        print("DEST=%s" % os.path.realpath(dest))
         return orig_extract(path, dest, *a, **k)
 
     mod.archive.validate_archive_fileobj = validate_fileobj
@@ -246,6 +251,45 @@ elif mode == "nocopy":
     # The regression this task exists to prevent: skip the copy and hand the
     # backups-directory path straight to the validation.
     mod._scratch_copy = lambda src, dfd: src
+elif mode == "swaptree":
+    # The reviewer's working exploit against the *destination*, which the scratch
+    # copy says nothing about. `SAVED_DIR.parent` (`.../Pal`) is owned by the
+    # service account, so the account palwarden-webui runs as can rename the
+    # staging tree root just created aside and drop a symlink at the same name.
+    # A restore that extracts to the *name* then unpacks the archive wherever
+    # that link points, as root, renames the link into place as the live world,
+    # and _chown_tree walks through it - all with rc=0 and "the REST API is
+    # healthy". The interleaving happens in _check_scratch_identity, which is
+    # the last call before the extraction and has nothing to do with the
+    # destination, so nothing under test is stubbed out.
+    orig_ident = mod._check_scratch_identity
+
+    def swapping_ident(scratch, dfd, ident):
+        orig_ident(scratch, dfd, ident)
+        parent = str(mod.SAVED_DIR.parent)
+        prefix = mod.SAVED_DIR.name + ".restore-"
+        for entry in sorted(os.listdir(parent)):
+            if entry.startswith(prefix):
+                staged = os.path.join(parent, entry)
+                os.rename(staged, staged + ".moved")
+                os.symlink(mode_arg, staged)
+
+    mod._check_scratch_identity = swapping_ident
+elif mode == "linkroot":
+    # The same swap, but landed: the live world *is* a symlink by the time the
+    # ownership pass runs. os.walk(followlinks=False) does not help here - it
+    # governs descending into symlinked subdirectories, while the directory
+    # os.walk is handed is followed unconditionally - so this is the shape that
+    # has root chowning an attacker-chosen tree to the service account.
+    orig_chown = mod._chown_tree
+
+    def linking_chown(root):
+        aside = str(root) + ".aside"
+        os.rename(str(root), aside)
+        os.symlink(mode_arg, str(root))
+        return orig_chown(root)
+
+    mod._chown_tree = linking_chown
 elif mode == "extractfail":
     # A partial extraction. Writes into the staging tree, then fails.
     def failing_extract(path, dest, *a, **k):
@@ -720,6 +764,108 @@ STICKY_SCRATCH="$(mktemp -d)/scratch"
 out="$(SCRATCH_OVERRIDE="$STICKY_SCRATCH" run --restore "$NAME" 2>&1)"
 assert_not_contains "$out" "writable by other accounts" \
   "a sticky parent is not treated as writable by others"
+
+# ===========================================================================
+# PROPERTY 1b: the *destination* is pinned too, not just the archive
+# ===========================================================================
+# The scratch scheme protects the bytes root reads. It says nothing about the
+# directory root writes - and `Pal/` is owned by the service account, which is the
+# account palwarden-webui runs as. So the staging tree root creates can be renamed
+# aside and replaced with a symlink at any moment after the mkdir. A reviewer's
+# exploit did exactly that and got rc=0, "the REST API is healthy", a `Pal/Saved`
+# that was a symlink, and root chowning the link's target.
+#
+# Three things stop it and each is asserted on its own below: the destination is
+# opened O_DIRECTORY|O_NOFOLLOW and written through /proc/self/fd/<tfd>/ (so the
+# extraction cannot follow a link planted afterwards), the name is re-checked
+# against that descriptor before the rename (so a swapped name is not renamed into
+# place), and the staging name carries entropy (so the name cannot be predicted and
+# pre-placed at all).
+reset_all
+populate_world
+stage
+ATTACK="$WORK/attacker-target"
+rm -rf "$ATTACK"; mkdir -p "$ATTACK"
+printf 'ATTACKER\n' > "$ATTACK/keep.txt"
+out="$(harness swaptree "$ATTACK" --restore "$NAME" --startup-timeout 5 2>&1)"
+assert_not_contains "$out" "rc=0" "a staging tree swapped for a symlink is refused"
+assert_contains "$out" "was replaced after it was extracted" \
+  "the refusal is the staging-identity check itself, naming the swap"
+# The heart of it: nothing may be unpacked through the planted link. This is what
+# fails if the extraction is pointed at the staging *name* instead of the held
+# descriptor.
+assert_path_absent "$ATTACK/SaveGames" "nothing was extracted through the planted symlink"
+assert_path_absent "$ATTACK/Config" "not even the archive's Config reached the link target"
+assert_eq "$(cat "$ATTACK/keep.txt")" "ATTACKER" "the link target is exactly as it was"
+# ...and the live world is untouched, because the refusal lands before the swap.
+assert_eq "$(cat "$SAVED/SaveGames/old.sav" 2>/dev/null)" "PREVIOUS" \
+  "the live world survives the destination swap"
+assert_eq "$(replaced_trees)" "0" "the live world was never moved aside"
+assert_eq "$(cat "$LOGD/systemctl.log")" "" "the server was never started"
+assert_eq "$(scratch_entries)" "0" "the scratch copy is still cleaned up"
+
+# The ownership pass refuses a symlink at the root of its walk. Reached here by
+# landing the swap outright - which the two checks above are what prevent - because
+# this is the last line of defence and has to be falsifiable on its own.
+reset_all
+populate_world
+stage
+rm -rf "$ATTACK"; mkdir -p "$ATTACK/SaveGames"
+printf 'ATTACKER\n' > "$ATTACK/SaveGames/keep.sav"
+link_group=""
+link_primary="$(id -gn)"
+for g in $(id -Gn); do
+  if [ "$g" != "$link_primary" ]; then link_group="$g"; break; fi
+done
+out="$(OWNER_GROUP="${link_group:-$link_primary}" harness linkroot "$ATTACK" \
+        --restore "$NAME" --startup-timeout 5 2>&1)"
+assert_not_contains "$out" "rc=0" "a symlink at the root of the restored tree is refused"
+assert_contains "$out" "is a symbolic link" \
+  "the refusal is the link check in the ownership pass"
+assert_not_contains "$out" "ownership: " "no ownership was handed out at all"
+assert_eq "$(cat "$ATTACK/SaveGames/keep.sav")" "ATTACKER" "the link target's contents are untouched"
+if [ -n "$link_group" ]; then
+  assert_eq "$(stat -c %G "$ATTACK/SaveGames/keep.sav")" "$link_primary" \
+    "the link target was not chowned to the service account"
+  assert_eq "$(stat -c %G "$ATTACK/SaveGames")" "$link_primary" \
+    "nor was a directory under it"
+else
+  echo "  (note: $OWNER_USER has only one group; skipping the link-target chown check)"
+fi
+
+# The staging name carries entropy, so it cannot be predicted a second in advance.
+reset_all
+populate_world
+stage
+out="$(harness record "" --restore "$NAME" --startup-timeout 5 2>&1)"
+assert_contains "$out" "rc=0" "the recording harness still restores cleanly (output: $out)"
+dest="$(printf '%s\n' "$out" | sed -n 's/^DEST=//p' | head -n 1)"
+if [[ "$dest" =~ \.restore-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{16}$ ]]; then ent="yes"; else ent="no"; fi
+assert_eq "$ent" "yes" \
+  "the staging tree name carries 16 hex characters of entropy after the stamp (got '$dest')"
+
+# Behaviourally: pre-place a symlink at every name a second-resolution stamp could
+# produce over the next few seconds - which is what the service account can do,
+# since it owns Pal/. With entropy those names are not the one used, so the restore
+# succeeds and the planted links are never touched. Without it, os.mkdir hits one
+# of them (EEXIST) and the restore is dead on a name an attacker chose.
+reset_all
+populate_world
+stage
+rm -rf "$ATTACK"; mkdir -p "$ATTACK"
+printf 'ATTACKER\n' > "$ATTACK/keep.txt"
+now="$(date -u +%s)"
+for off in 0 1 2 3 4 5; do
+  ln -s "$ATTACK" "$SAVED.restore-$(date -u -d "@$((now + off))" +%Y%m%dT%H%M%SZ)" 2>/dev/null \
+    || ln -s "$ATTACK" "$SAVED.restore-$(TZ=UTC date -r "$((now + off))" +%Y%m%dT%H%M%SZ)" 2>/dev/null
+done
+out="$(run --restore "$NAME" --startup-timeout 5 2>&1)"
+rc=$?
+assert_eq "$rc" "0" "a symlink at every predictable staging name does not stop the restore (output: $out)"
+assert_eq "$(cat "$SAVED/SaveGames/marker.txt" 2>/dev/null)" "GOOD" "the world was restored anyway"
+assert_path_absent "$ATTACK/SaveGames" "nothing was extracted through a pre-placed link"
+assert_eq "$(cat "$ATTACK/keep.txt")" "ATTACKER" "the pre-placed links' target is untouched"
+rm -f "$SAVED".restore-*
 
 # ===========================================================================
 # external mode: the service question has no truthful answer, so refuse

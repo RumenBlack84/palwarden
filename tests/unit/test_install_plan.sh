@@ -90,7 +90,15 @@ assert_eq "$backup_lines" "1" "the save-backup root is created exactly once"
 # The queue directory, by contrast, MUST stay service-account-owned: the
 # unprivileged web UI is its only writer and it is 0700, so a root-owned queue
 # means the UI cannot enqueue anything at all.
-assert_file_contains "$PLAN" "install -d -m 0700" "the job queue keeps its 0700 mode"
+# Asserted on the *queue's own line*, not on the bare substring `install -d -m 0700`
+# (which any 0700 line in the plan satisfies) and not only on one exact literal
+# spelling of the root form (which reordering the flags to `-o root -g root -m 0700`
+# would slip past while both assertions still passed). Same fix as the uploads pair
+# below; they were the same mutually-shielding shape.
+jobs_line="$(grep -m1 'install -d.*/var/lib/palworld/jobs' "$PLAN")"
+assert_contains "$jobs_line" "-m 0700" "the job queue keeps its 0700 mode ($jobs_line)"
+assert_not_contains "$jobs_line" "root" \
+  "the job queue is NOT root-owned, in any flag order (a root-owned queue means the UI cannot enqueue)"
 assert_file_not_contains "$PLAN" "install -d -m 0700 -o root -g root /var/lib/palworld/jobs" \
   "the job queue is NOT forced root-owned"
 
@@ -102,7 +110,20 @@ assert_file_not_contains "$PLAN" "install -d -m 0700 -o root -g root /var/lib/pa
 # The staging dir must be service-account-owned 0700 (the unprivileged web UI is
 # its only writer, exactly like the job queue) and must therefore NOT be in the
 # root-owned loop.
-assert_file_contains "$PLAN" "install -d -m 0700" "the upload staging dir is 0700"
+# On the uploads line itself, for the reason spelled out at the job queue above: the
+# pair that used to be here asserted the bare substring `install -d -m 0700` — which
+# the *jobs* line already satisfied — and refused only the one exact literal
+# `install -d -m 0700 -o root -g root /var/lib/palworld/uploads`, so `-o root -g root
+# -m 0700` passed both while nothing pinned "uploads is service-account-owned". A
+# root-owned uploads dir makes palwarden-webui reject EVERY upload with HTTP 500.
+uploads_line="$(grep -m1 'install -d.*/var/lib/palworld/uploads' "$PLAN")"
+assert_contains "$uploads_line" "-m 0700" "the upload staging dir is 0700 ($uploads_line)"
+assert_not_contains "$uploads_line" "root" \
+  "the upload staging dir is NOT root-owned, in any flag order (that breaks every upload)"
+# The queue is the reference: these two are owned the same way by design, so the
+# uploads line must carry exactly the queue line's owner flags.
+assert_eq "${uploads_line% *}" "${jobs_line% *}" \
+  "the upload staging dir is created with the same mode and owner flags as the job queue"
 assert_file_not_contains "$PLAN" \
   "install -d -m 0700 -o root -g root /var/lib/palworld/uploads" \
   "the upload staging dir is NOT forced root-owned (that breaks every upload)"

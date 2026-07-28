@@ -104,8 +104,24 @@ palworld_notify success "palworld.service is active after restart; waiting for R
 api_deadline=$((SECONDS + startup_timeout))
 api_output=""
 while true; do
+  api_rc=0
   if api_output="$(sudo /usr/local/sbin/palworld-api info 2>&1)"; then
     break
+  else
+    api_rc=$?
+  fi
+  # Exit 2 is "not configured" (no settings.env, REST disabled, or no
+  # ADMIN_PASSWORD) — the container branch above already stops on it, and bare metal
+  # had no reason to be different: waiting cannot fix it, so polling to the deadline
+  # only delays a restart that has already succeeded. The unit is active either way,
+  # which is the part this function actually restarted.
+  if (( api_rc == 2 )); then
+    palworld_notify success "palworld.service restarted; REST API not configured, so readiness was not checked."
+    echo "palworld.service is active; REST API not configured (skipped readiness check):" >&2
+    printf '%s\n' "$api_output" >&2
+    /usr/local/sbin/palworld-fps mark "graceful restart completed" --category restart --details "REST not configured" >/dev/null 2>&1 || true
+    systemctl is-active palworld.service
+    exit 0
   fi
   if (( SECONDS >= api_deadline )); then
     palworld_notify error "restart warning: palworld.service is active, but REST API did not become ready within ${startup_timeout}s. Last API check: ${api_output}"

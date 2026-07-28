@@ -83,7 +83,7 @@ JOBD_INTERVAL_DEFAULT = 2.0
 BACKUP_LOCK = Path(os.environ.get("PALWARDEN_BACKUP_LOCK", "/run/palworld-backups.lock"))
 BACKUP_LOCK_WAIT_DEFAULT = 1800.0
 # Only actions that mutate the collection or the world. backup_schedule_save writes
-# /etc/palworld/backup.env and is deliberately absent: it races nothing (the tick
+# SCHEDULE_ENV and is deliberately absent: it races nothing (the tick
 # re-reads the file each time), and holding a lock across it would let a slow tar
 # block the operator from switching backups off.
 BACKUP_LOCKED_ACTIONS = frozenset({"backup", "backup_import", "backup_restore", "backup_delete"})

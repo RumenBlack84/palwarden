@@ -21,6 +21,11 @@ export UPDATE_ON_START=false
 export ADMIN_PASSWORD=not-a-real-admin-password
 export PALWORLD_GAME_PORT=18211
 export WEBUI_PORT=18088
+# A non-default seed for the backup schedule, so the seeding path is actually armed
+# when the panel-saved-schedule assertions below run. Without it, "the recreate did
+# not re-render the schedule" would pass for the wrong reason: there would be
+# nothing to render from.
+export BACKUP_RETENTION_DAYS=7
 
 # Server settings go through an env file, the documented mechanism (compose
 # forwards .env into the container so open-ended PALWORLD_CFG_* keys work).
@@ -124,6 +129,48 @@ assert_contains "$bk_name" "palworld-save-" "an archive was created before the r
 bk_sum="$(docker exec "$C" sh -c "sha256sum < '/opt/palworld/backups/$bk_name'" | awk '{print $1}')"
 if [ "${#bk_sum}" -eq 64 ]; then pass; else fail "could not hash the archive before the recreate"; fi
 
+# --- the schedule the panel saved has to survive the same recreate -----------
+# Same bug, one file over, and the consequence is worse than losing the file: the
+# schedule used to be written to /etc/palworld/backup.env, and /etc is the
+# container's writable layer. A `docker compose up --force-recreate` therefore
+# reverted an operator's saved retention to the 14-day default, and the next
+# --prune tick then deleted the history they had raised retention specifically to
+# keep. So it goes on the palwarden-state volume, next to the job queue.
+#
+# Written by the real writer — palwarden-jobd's write_backup_schedule, the function
+# the panel's backup_schedule_save action calls, running as root inside the
+# container — and read back through `palworld-backups --show-schedule`, which is
+# the schedule as the tools actually see it. Neither side names the path, so this
+# asserts the property and not the plumbing.
+# The entrypoint's seed first: BACKUP_RETENTION_DAYS=7 is exported above, so the
+# schedule the tools read must be 7 and not the tool default of 14 — which is what
+# says the seeding wrote to the path compose points the tools at, rather than to a
+# path only the entrypoint believes in.
+sched_seed="$(docker exec "$C" palworld-backups --show-schedule 2>/dev/null)"
+assert_contains "$sched_seed" '"BACKUP_RETENTION_DAYS": 7' \
+  "the entrypoint seeded the schedule where the tools read it ($sched_seed)"
+
+# `python3 -c`, not a heredoc into `python3 -`: `docker exec` without -i attaches no
+# stdin, so a heredoc silently runs an EMPTY program and exits 0 — which looked like
+# a passing write and left the assertions below reading the seeded file instead.
+sched_path="$(docker exec --user root "$C" python3 -c '
+import importlib.machinery, importlib.util
+loader = importlib.machinery.SourceFileLoader("jobd", "/usr/local/sbin/palwarden-jobd")
+spec = importlib.util.spec_from_loader(loader.name, loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+mod.write_backup_schedule({"BACKUP_ENABLED": "true", "BACKUP_INTERVAL_HOURS": "6",
+                          "BACKUP_RETENTION_DAYS": "90", "BACKUP_KEEP_MIN": "25"})
+print(mod.SCHEDULE_ENV)
+' 2>&1)"
+assert_contains "$sched_path" "/var/lib/palworld/" \
+  "the saved schedule lives on the state volume, not in the writable layer ($sched_path)"
+sched_before="$(docker exec "$C" palworld-backups --show-schedule 2>/dev/null)"
+assert_contains "$sched_before" '"BACKUP_RETENTION_DAYS": 90' \
+  "the non-default retention was saved ($sched_before)"
+assert_contains "$sched_before" '"BACKUP_KEEP_MIN": 25' "...and the non-default floor"
+assert_contains "$sched_before" '"BACKUP_INTERVAL_HOURS": 6' "...and the non-default interval"
+
 # --force-recreate replaces the container (and its writable layer) while keeping
 # the named volumes — exactly what `git pull && docker compose up -d` does.
 dc up -d --force-recreate >/dev/null 2>&1 || fail "compose up --force-recreate failed"
@@ -142,6 +189,23 @@ assert_eq "$(docker exec "$C" stat -c '%U' /opt/palworld)" "root" \
 # The archive itself belongs to the service account, as palworld-backup left it.
 assert_eq "$(docker exec "$C" stat -c '%U' "/opt/palworld/backups/$bk_name")" "steam" \
   "...and the archive still belongs to the service account"
+# The schedule, read back from the new container: byte-identical, because a
+# retention policy that silently resets on an upgrade is how a --prune deletes a
+# history the operator was keeping on purpose.
+sched_after="$(docker exec "$C" palworld-backups --show-schedule 2>/dev/null)"
+assert_eq "$sched_after" "$sched_before" \
+  "the schedule saved from the panel survived --force-recreate"
+assert_not_contains "$sched_after" '"BACKUP_RETENTION_DAYS": 7' \
+  "...and was not overwritten by the BACKUP_* seed in the environment"
+assert_eq "$(docker exec "$C" stat -c '%U %a' "$sched_path")" "root 644" \
+  "...and the schedule file is still root-owned 0644"
+# The seeding is what must not fight it: the entrypoint may only *seed* an absent
+# file, so a fresh container with BACKUP_* unset re-rendering it would look exactly
+# like this assertion passing while the values came from the environment.
+logs_after="$(docker logs "$C" 2>&1)"
+assert_not_contains "$logs_after" "rendered $sched_path from BACKUP_* env" \
+  "the recreate did not re-render the schedule over the saved one"
+
 # The backups volume's two siblings are volumes for the same reason.
 assert_rc 0 docker volume inspect "${PROJECT}_palwarden-config-snapshots"
 assert_rc 0 docker volume inspect "${PROJECT}_palwarden-config-backups"

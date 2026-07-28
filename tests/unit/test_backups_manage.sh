@@ -369,6 +369,46 @@ assert_path_absent "$LOG" "BACKUP_ENABLED=false invokes palworld-backup not at a
 assert_eq "$(count)" "0" "and creates no archive"
 assert_contains "$out" "disabled" "--if-due says why it did nothing"
 
+# BACKUP_ENABLED=false stops *creating*, and does NOT stop retention. Both
+# directions are asserted because neither was, and the wrong half of the pair was
+# what config/backup.env used to promise: an operator reading "master switch" turned
+# backups off to freeze a known-good set, and every tick kept pruning it.
+#
+# The composition is what makes this reachable — the timer and the s6 service both
+# run `--if-due --prune` in ONE invocation, and --prune is unconditional on purpose
+# (a full volume is the likeliest reason a create fails, and retention is what frees
+# the space). So this is the shipped behaviour, and it is now what the file says.
+reset_dir
+printf 'BACKUP_ENABLED=false\nBACKUP_RETENTION_DAYS=14\nBACKUP_KEEP_MIN=1\n' > "$SCHED"
+expired="$(mk 40)"; fresh="$(mk 1)"
+out="$(backups --if-due --prune 2>"$WORK/err")"; rc=$?
+assert_eq "$rc" "0" "--if-due --prune exits 0 with backups disabled"
+assert_path_absent "$LOG" "nothing was created while backups are switched off"
+assert_path_absent "$BACKUPS/$expired" \
+  "the expired archive is still pruned with BACKUP_ENABLED=false"
+assert_file_exists "$BACKUPS/$fresh" "the in-window archive is left alone"
+assert_contains "$out" "creating nothing" "the tick says it created nothing"
+assert_contains "$out" "prune: removed 1 archive(s)" "...and says it pruned anyway"
+
+# The other direction, which is the remedy the file now points at: retention is what
+# decides what survives, so raising it freezes the set even with backups off.
+reset_dir
+printf 'BACKUP_ENABLED=false\nBACKUP_RETENTION_DAYS=3650\nBACKUP_KEEP_MIN=100\n' > "$SCHED"
+expired="$(mk 40)"; fresh="$(mk 1)"
+out="$(backups --if-due --prune 2>"$WORK/err")"; rc=$?
+assert_eq "$rc" "0" "--if-due --prune exits 0 with retention raised"
+assert_file_exists "$BACKUPS/$expired" \
+  "raising BACKUP_RETENTION_DAYS is what actually freezes the older archive"
+assert_file_exists "$BACKUPS/$fresh" "...and the newer one"
+assert_eq "$(count)" "2" "nothing at all was pruned"
+assert_contains "$out" "nothing to prune" "the tick says there was nothing to prune"
+
+# And the file has to say it, because the wording is what an operator acts on.
+assert_file_contains "$DIR/../../config/backup.env" "does not stop retention" \
+  "config/backup.env says BACKUP_ENABLED=false does not stop retention"
+assert_file_contains "$DIR/../../config/backup.env" "raise BACKUP_RETENTION_DAYS" \
+  "...and names raising retention as the way to freeze a set"
+
 # No archive at all: the first tick on a fresh host must back up.
 reset_dir; reset_sched
 out="$(backups --if-due 2>"$WORK/err")"; rc=$?

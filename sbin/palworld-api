@@ -2,7 +2,23 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # SPDX-FileCopyrightText: 2026 Brian Grant
 set -euo pipefail
-config_env=/etc/palworld/settings.env
+# Overridable only so the suite can exercise the exit codes below against a file it
+# owns; the default is the one real path, as in every other tool here. sudo resets
+# the environment, so this is not a way to point the helper somewhere else.
+config_env="${PALWORLD_SETTINGS_ENV:-/etc/palworld/settings.env}"
+# The two halves of "cannot read the config" are deliberately different exit codes,
+# and the difference is load-bearing for --restore.
+#
+#   * absent  -> 2, the same code as "REST not enabled" and "no ADMIN_PASSWORD".
+#     All three mean *not configured*: no amount of waiting or retrying changes the
+#     answer. palworld-restore reads 2 as "readiness is unverifiable" and 1 as a
+#     transport failure worth retrying until its deadline — so on a rebuilt host,
+#     the exact disaster-recovery case restore exists for, exiting 1 here made a
+#     correct restore poll the full 180s and then report failure.
+#   * unreadable but present -> 1. That is a permission problem on a file that IS
+#     configured, it is fixable, and it must surface as an error rather than being
+#     quietly reported as "the REST API isn't set up".
+if [[ ! -e "$config_env" ]]; then echo "$config_env does not exist (REST API is not configured)" >&2; exit 2; fi
 if [[ ! -r "$config_env" ]]; then echo "Cannot read $config_env" >&2; exit 1; fi
 # shellcheck disable=SC1090
 source "$config_env"
