@@ -36,6 +36,18 @@ was powered off back up on the first tick after boot instead of missing a window
 It is also why a typo in that file must never be fatal: an unparseable value warns
 and falls back to the default, because a crash here silently stops backups on the
 one host whose operator was editing the file.
+
+**Warn-and-default on a bad schedule read is right for `--if-due` and wrong for
+`--prune`, and that split is deliberate, not an oversight to "simplify" away.**
+A schedule that cannot be read still lets `--if-due` create a backup on
+defaults, because a default-cadence backup beats a wedged or crashed tick.
+`--prune` deletes archives, though, and doing that on a policy substituted
+because the *real* one could not be read would let whoever can replace the
+schedule file (in the container, `steam` owns its directory) dictate what gets
+removed from a directory it cannot touch directly — the retention numbers
+authorising a deletion have to come from an actual read of them. See
+`read_schedule`'s docstring for the mechanism (a `trustworthy` flag, not a
+guess from comparing values to `DEFAULTS`).
 """
 
 from __future__ import annotations
@@ -103,16 +115,20 @@ def _warn(message: str) -> None:
     print(f"palworld-backups: warning: {message}", file=sys.stderr)
 
 
-def read_schedule() -> dict:
-    """The effective schedule: defaults, overlaid with whatever the file validly says.
+def read_schedule() -> tuple[dict, bool]:
+    """The effective schedule, and whether the read of it can be trusted.
 
-    **Never raises.** Every failure mode — a missing file, an unreadable one, a key
-    that is not an integer, a value outside its range, a bool that is not a bool —
-    warns on stderr and leaves that key's default in place. This is the whole reason
-    the schedule is a file rather than a unit: the tick has to keep running. A tool
-    that exited non-zero on a stray character would stop backups on exactly the host
-    whose operator was mid-edit, and the failure would be invisible until the day
-    someone needed a restore.
+    Returns `(sched, trustworthy)`.
+
+    `sched` is always usable — defaults, overlaid with whatever the file
+    validly says. **Never raises.** Every failure mode — a missing file, an
+    unreadable one, a key that is not an integer, a value outside its range, a
+    bool that is not a bool — warns on stderr and leaves that key's default in
+    place. This is the whole reason the schedule is a file rather than a unit:
+    the tick has to keep running. A tool that exited non-zero on a stray
+    character would stop backups on exactly the host whose operator was
+    mid-edit, and the failure would be invisible until the day someone needed
+    a restore.
 
     Out-of-range values fall back to the **default**, they are not clamped to the
     nearest bound. `BACKUP_RETENTION_DAYS=3560` where `356` was meant should give 14
@@ -161,6 +177,36 @@ def read_schedule() -> dict:
     normal "return defaults, no warning" behaviour, and its every other case
     including the non-regular-file refusal collapses into a warning, not a
     raise.
+
+    **`trustworthy` is the second, newer half, and it is not the same question
+    as "did any key fall back to its default".** It answers "was the *file*
+    itself readable at all" — False only when `SCHEDULE_FILE` could not be
+    read as a plain file (a FIFO, a symlink, a directory, or an OSError partway
+    through the read), i.e. exactly the branches below that warn before this
+    docstring's "every other refusal" text. It is True both for the ordinary
+    missing-file case (nothing to distrust — nobody has saved a schedule yet)
+    and for a file that opened and read fine but contained a bad *value* (that
+    read genuinely succeeded; only one key's number was wrong).
+
+    The reason this exists at all, and the asymmetry a future edit must not
+    erase: `--if-due` only ever *creates* an archive, so running it on
+    defaults when the schedule cannot be read is the safe failure mode — a
+    default-cadence backup beats a wedged or crashed tick. `--prune`
+    *deletes* archives on the strength of `BACKUP_RETENTION_DAYS` and
+    `BACKUP_KEEP_MIN`, and a retention policy has to come from a real read of
+    the operator's settings, not from a fallback substituted because the
+    real ones could not be read. `steam` owns the container's schedule
+    directory (though not the file, so it cannot edit it) and can unlink the
+    real file and plant a FIFO in its place; if pruning went ahead on the
+    resulting defaults, that would be a root-mediated way for the untrusted
+    account to delete backups past the operator's actual retention window —
+    it cannot unlink an archive itself, since the backups directory is
+    root-owned, but a substituted schedule file gets root to do it instead.
+    `main` uses `trustworthy` to skip `--prune` (and only `--prune`) when it
+    is False, printing why, while `--if-due` proceeds unaffected. It is
+    returned as its own value rather than inferred by comparing `sched`
+    against `DEFAULTS`, because an operator may legitimately set every key to
+    exactly its default, and that must not be mistaken for a failed read.
     """
     sched = dict(DEFAULTS)
     try:
@@ -168,19 +214,30 @@ def read_schedule() -> dict:
     except archive.ArchiveError as exc:
         # open_archive_fd chains the original OSError with `from exc` only for
         # the open() failure branch (missing file, permission, ELOOP on a
-        # symlink); the "not a regular file" refusal raises bare, with no
-        # __cause__. That is exactly the distinction needed here: a missing
-        # file is silent, everything else warns.
+        # symlink); the `NotARegularFileError` subclass it raises for a FIFO,
+        # directory, or other non-regular entry carries no __cause__ at all.
+        # That is exactly the distinction needed here: a missing file is
+        # silent and trustworthy (nobody has saved a schedule yet), everything
+        # else warns and is untrustworthy.
         if isinstance(exc.__cause__, FileNotFoundError):
-            return sched
-        _warn(f"cannot read {SCHEDULE_FILE} ({exc}); using the default schedule")
-        return sched
+            return sched, True
+        if isinstance(exc, archive.NotARegularFileError):
+            # Named for what was actually refused. The shared helper's own
+            # message says "archive", which is the right word for its usual
+            # callers (an uploaded save) but not for a schedule file — this
+            # warning is what an operator greps for during an outage, and it
+            # should not send them looking for the wrong kind of file.
+            _warn(f"{SCHEDULE_FILE} is not a regular file; refusing to read "
+                  f"it; using the default schedule")
+        else:
+            _warn(f"cannot read {SCHEDULE_FILE} ({exc}); using the default schedule")
+        return sched, False
     try:
         with os.fdopen(fd, "r", errors="replace") as fh:
             text = fh.read()
     except OSError as exc:
         _warn(f"cannot read {SCHEDULE_FILE} ({exc}); using the default schedule")
-        return sched
+        return sched, False
     for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
@@ -214,7 +271,7 @@ def read_schedule() -> dict:
                   f"using the default {DEFAULTS[key]}")
             continue
         sched[key] = number
-    return sched
+    return sched, True
 
 
 def list_archives() -> list[str]:
@@ -515,10 +572,11 @@ def main(argv: list[str] | None = None) -> int:
             # sort_keys so the output is byte-stable for anything diffing it, and
             # indented because an operator reads this on a terminal as often as the
             # web UI parses it.
-            print(json.dumps(read_schedule(), indent=2, sort_keys=True))
+            sched, _trustworthy = read_schedule()
+            print(json.dumps(sched, indent=2, sort_keys=True))
             return 0
 
-        sched = read_schedule()
+        sched, trustworthy = read_schedule()
         rc = 0
         # **--if-due before --prune, and the order is the design.** Retention is
         # applied to the collection *including* the archive just created, so the new
@@ -526,21 +584,42 @@ def main(argv: list[str] | None = None) -> int:
         # same tick. Pruning first would leave the directory sitting one archive over
         # the floor until the next tick.
         if args.if_due:
+            # --if-due runs on `sched` unconditionally, `trustworthy` or not:
+            # creating on defaults when the schedule cannot be read is the
+            # safe failure mode (a default-cadence backup beats a wedged or
+            # crashed tick), and that half of the design is unchanged. See
+            # read_schedule's docstring for why --prune below is different.
             rc = run_if_due(sched)
         if args.prune:
-            # Pruned even when the create above failed, which is the useful way
-            # round: the most likely reason a backup fails is a full volume, and
-            # retention is what frees space for the next attempt. The floor is what
-            # keeps that from being dangerous.
-            deleted = prune_archives(int(sched["BACKUP_RETENTION_DAYS"]),
-                                     int(sched["BACKUP_KEEP_MIN"]))
-            if not deleted:
-                print(f"prune: nothing to prune - no archive in {BACKUP_DIR} is "
-                      f"both past the {sched['BACKUP_RETENTION_DAYS']}-day "
-                      f"retention window and outside the newest "
-                      f"{sched['BACKUP_KEEP_MIN']}.")
+            if not trustworthy:
+                # A failed read of the schedule file must never authorise a
+                # deletion. `sched` here holds only *defaults*, substituted
+                # because the real file could not be read (a FIFO, a symlink,
+                # or a directory planted over it) — not because the operator
+                # asked for the defaults. Pruning on a substituted policy
+                # would let whoever can replace the schedule file dictate what
+                # gets deleted from a directory it cannot touch directly. This
+                # is per-mode, not an early exit: --if-due above already ran
+                # (or was skipped on its own terms), and this skip only
+                # withholds --prune for this one invocation, not the tick.
+                print(f"prune: skipped - the schedule at {SCHEDULE_FILE} could "
+                      f"not be read as a plain file, so its retention policy "
+                      f"is not trusted for a deletion (see the warning above).",
+                      file=sys.stderr)
             else:
-                print(f"prune: removed {len(deleted)} archive(s).")
+                # Pruned even when the create above failed, which is the useful way
+                # round: the most likely reason a backup fails is a full volume, and
+                # retention is what frees space for the next attempt. The floor is what
+                # keeps that from being dangerous.
+                deleted = prune_archives(int(sched["BACKUP_RETENTION_DAYS"]),
+                                         int(sched["BACKUP_KEEP_MIN"]))
+                if not deleted:
+                    print(f"prune: nothing to prune - no archive in {BACKUP_DIR} is "
+                          f"both past the {sched['BACKUP_RETENTION_DAYS']}-day "
+                          f"retention window and outside the newest "
+                          f"{sched['BACKUP_KEEP_MIN']}.")
+                else:
+                    print(f"prune: removed {len(deleted)} archive(s).")
         return rc
     except archive.ArchiveError as exc:
         print(f"palworld-backups: {exc}", file=sys.stderr)

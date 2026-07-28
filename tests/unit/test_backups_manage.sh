@@ -651,4 +651,143 @@ assert_contains "$out" '"BACKUP_INTERVAL_HOURS": 24' "...falls back to the defau
 assert_file_contains "$WORK/err" "BACKUP_INTERVAL_HOURS" "...and still warns, by key"
 rm -f "$SCHED"
 
+# --- a failed schedule read must never authorise --prune ---------------------
+# The reviewer's scenario: an operator policy wide enough to keep everything
+# (BACKUP_RETENTION_DAYS=365, BACKUP_KEEP_MIN=3) over eight archives aged
+# 20-350 days. With the real schedule file, nothing is past the 365-day
+# window, so nothing is pruned. If steam plants a FIFO (or a symlink, or a
+# directory) over the schedule file, `read_schedule` cannot read the real
+# policy and falls back to the 14-day/KEEP_MIN=3 *default* - which, applied to
+# this same collection, prunes the five archives older than 14 days beyond the
+# newest three. That fallback is the right behaviour for --if-due (a
+# default-cadence backup beats a wedged tick) and the wrong one for --prune (a
+# deletion must not be authorised by a policy nobody actually set), so --prune
+# must refuse to run at all on an untrustworthy read rather than deleting on
+# the substituted defaults.
+reset_dir; reset_sched
+printf 'BACKUP_RETENTION_DAYS=365\nBACKUP_KEEP_MIN=3\n' > "$SCHED"
+mk 350 >/dev/null; mk 270 >/dev/null; mk 210 >/dev/null; mk 170 >/dev/null
+mk 130 >/dev/null; mk 90 >/dev/null; mk 50 >/dev/null; mk 20 >/dev/null
+
+out="$(backups --prune 2>"$WORK/err")"; rc=$?
+assert_eq "$rc" "0" "--prune succeeds against the real schedule file"
+assert_contains "$out" "nothing to prune" \
+  "the operator's real 365-day policy prunes nothing"
+assert_eq "$(count)" "8" "all eight archives survive with the real schedule file"
+
+rm -f "$SCHED"; mkfifo "$SCHED"
+out="$(timeout 5 env PALWARDEN_SAVE_BACKUP_DIR="$BACKUPS" PALWARDEN_SBIN_DIR="$STUB" \
+  PALWORLD_BACKUP_SCHEDULE="$SCHED" python3 "$TOOL" --prune 2>"$WORK/err")"; rc=$?
+assert_ne "$rc" "124" "a FIFO planted over the schedule does not hang --prune"
+assert_eq "$rc" "0" "--prune still exits 0 when the schedule cannot be read"
+assert_file_contains "$WORK/err" "prune: skipped" \
+  "--prune says it skipped rather than silently pruning on defaults"
+assert_file_contains "$WORK/err" "$SCHED" "the skip names the unreadable schedule path"
+assert_eq "$(count)" "8" \
+  "a FIFO over the schedule prunes NOTHING - the reviewer's 5-archive deletion is closed"
+rm -f "$SCHED"
+
+printf 'VICTIM\n' > "$WORK/prune-guard-victim"
+ln -s "$WORK/prune-guard-victim" "$SCHED"
+out="$(backups --prune 2>"$WORK/err")"; rc=$?
+assert_eq "$rc" "0" "--prune exits 0 when the schedule is a symlink"
+assert_file_contains "$WORK/err" "prune: skipped" \
+  "--prune skips rather than pruning on defaults for a symlinked schedule too"
+assert_eq "$(count)" "8" "a symlinked schedule prunes nothing"
+rm -f "$SCHED" "$WORK/prune-guard-victim"
+
+mkdir "$SCHED"
+out="$(backups --prune 2>"$WORK/err")"; rc=$?
+assert_eq "$rc" "0" "--prune exits 0 when the schedule path is a directory"
+assert_file_contains "$WORK/err" "prune: skipped" \
+  "--prune skips rather than pruning on defaults for a directory schedule too"
+assert_eq "$(count)" "8" "a directory at the schedule path prunes nothing"
+rmdir "$SCHED"
+
+# --if-due still creates in the SAME invocation where --prune is skipped: the
+# skip is per-mode, not an early exit that also cancels the tick's other half.
+reset_dir; reset_sched
+mkfifo "$SCHED"
+out="$(timeout 5 env PALWARDEN_SAVE_BACKUP_DIR="$BACKUPS" PALWARDEN_SBIN_DIR="$STUB" \
+  PALWORLD_BACKUP_SCHEDULE="$SCHED" python3 "$TOOL" --if-due --prune 2>"$WORK/err")"; rc=$?
+assert_ne "$rc" "124" "--if-due --prune does not hang with a FIFO schedule"
+assert_eq "$rc" "0" "--if-due --prune exits 0 with an unreadable schedule"
+assert_file_exists "$LOG" \
+  "--if-due still creates a due backup even though --prune is skipped in the same run"
+assert_file_contains "$WORK/err" "prune: skipped" "...and --prune reports the skip"
+assert_eq "$(count)" "1" "the composed run created exactly the one due archive"
+rm -f "$SCHED"
+
+# A MISSING schedule file is not a failed read: it is the ordinary, silent
+# case (nobody has ever saved a schedule), and --prune must still run on the
+# defaults it silently supplies - conflating "missing" with "unreadable" here
+# would disable retention on every fresh install. Four archives, not two: the
+# default BACKUP_KEEP_MIN is 3, so with only two archives the floor alone
+# would protect both regardless of the (missing) schedule, and the test would
+# pass for the wrong reason.
+reset_dir; reset_sched
+m1="$(mk 40)"; m2="$(mk 30)"; m3="$(mk 20)"; m4="$(mk 1)"
+out="$(backups --prune 2>"$WORK/err")"; rc=$?
+assert_eq "$rc" "0" "--prune succeeds with no schedule file at all"
+assert_eq "$(wc -c < "$WORK/err" | tr -d ' ')" "0" \
+  "a missing schedule file is silent - it is not the untrustworthy case"
+assert_path_absent "$BACKUPS/$m1" \
+  "--prune still runs on the default 14-day retention when the schedule file was never created"
+assert_file_exists "$BACKUPS/$m2" "the default KEEP_MIN=3 floor keeps the next-oldest"
+assert_file_exists "$BACKUPS/$m3" "...and the one after"
+assert_file_exists "$BACKUPS/$m4" "...and the newest"
+
+# A malformed-but-READABLE schedule file: the file itself opened and read
+# fine, so that read succeeded - only one key's value was bad. --prune must
+# still run (on the defaults substituted for that one key), unlike the
+# unreadable-file cases above.
+reset_dir; reset_sched
+printf 'BACKUP_RETENTION_DAYS=not-a-number\nBACKUP_KEEP_MIN=1\n' > "$SCHED"
+b1="$(mk 40)"; b2="$(mk 1)"
+out="$(backups --prune 2>"$WORK/err")"; rc=$?
+assert_eq "$rc" "0" "--prune succeeds against a malformed-but-readable schedule file"
+assert_file_contains "$WORK/err" "BACKUP_RETENTION_DAYS" \
+  "the malformed key still warns, same as before this fix"
+assert_not_contains "$out" "skipped" \
+  "--prune does NOT skip for a malformed value - that read of the file succeeded"
+assert_path_absent "$BACKUPS/$b1" \
+  "--prune still runs on the 14-day default for the one bad key"
+assert_file_exists "$BACKUPS/$b2" "and the archive inside that default window survives"
+rm -f "$SCHED"
+
+# --- mutation check: the untrustworthy guard is load-bearing ------------------
+# Copy sbin/ AND lib/ together into a scratch tree: palworld-backups inserts
+# its own sibling lib/ at sys.path[0], ahead of PYTHONPATH, so a mutant
+# palwarden_archive.py injected only via PYTHONPATH is never loaded and a
+# mutation there would silently report "no effect". Mutating sbin/palworld-backups
+# itself sidesteps that trap entirely, but the copy-both discipline is kept
+# here too since it is the safe default for this suite.
+MUTDIR="$WORK/mutant"
+mkdir -p "$MUTDIR/sbin" "$MUTDIR/lib"
+cp "$DIR/../../sbin/palworld-backups" "$MUTDIR/sbin/palworld-backups"
+cp "$DIR/../../lib/palwarden_archive.py" "$MUTDIR/lib/palwarden_archive.py"
+chmod +x "$MUTDIR/sbin/palworld-backups"
+
+occurrences="$(grep -c '^            if not trustworthy:$' "$MUTDIR/sbin/palworld-backups")"
+assert_eq "$occurrences" "1" \
+  "the guard line exists exactly once before mutation, so the sed below hits only it"
+sed -i 's/^            if not trustworthy:$/            if False:  # MUTATED: prune guard disabled/' \
+  "$MUTDIR/sbin/palworld-backups"
+assert_ne "$(grep -c '^            if not trustworthy:$' "$MUTDIR/sbin/palworld-backups")" "1" \
+  "the mutation actually replaced the guard line"
+python3 -m py_compile "$MUTDIR/sbin/palworld-backups"
+assert_eq "$?" "0" "the mutated file still parses as valid Python"
+
+reset_dir; reset_sched
+printf 'BACKUP_RETENTION_DAYS=365\nBACKUP_KEEP_MIN=3\n' > "$SCHED"
+mk 350 >/dev/null; mk 270 >/dev/null; mk 210 >/dev/null; mk 170 >/dev/null
+mk 130 >/dev/null; mk 90 >/dev/null; mk 50 >/dev/null; mk 20 >/dev/null
+rm -f "$SCHED"; mkfifo "$SCHED"
+env PALWARDEN_SAVE_BACKUP_DIR="$BACKUPS" PALWARDEN_SBIN_DIR="$STUB" \
+    PALWORLD_BACKUP_SCHEDULE="$SCHED" \
+    python3 "$MUTDIR/sbin/palworld-backups" --prune >/dev/null 2>&1
+assert_eq "$(count)" "3" \
+  "with the guard mutated away, a planted FIFO reproduces the reviewer's bug: only the KEEP_MIN=3 floor survives (5 deleted)"
+rm -f "$SCHED"
+
 assert_report

@@ -84,6 +84,21 @@ class ArchiveError(Exception):
     """
 
 
+class NotARegularFileError(ArchiveError):
+    """The path exists but is a FIFO, directory, device, or other non-regular
+    entry — raised only by `open_archive_fd`'s `S_ISREG` check.
+
+    A subclass, not a sibling: every existing `except ArchiveError` still
+    catches this, so no caller needs to change. It exists so a caller that
+    cares about *this specific* refusal (as opposed to "does not exist" or
+    "cannot be opened at all") can say so by type instead of pattern-matching
+    the message or introspecting `__cause__` — see `palworld-backups`'
+    `read_schedule`, which needs exactly that distinction to phrase its own
+    warning without borrowing this module's "archive" vocabulary for a file
+    that is not one.
+    """
+
+
 def valid_archive_name(name: str) -> bool:
     """True only for a bare filename palworld-backup could have written.
 
@@ -116,6 +131,18 @@ def open_archive_fd(path) -> int:
         descriptor is still non-blocking, is what makes clearing O_NONBLOCK
         safe. It also means the refusal says what is wrong instead of
         surfacing as a mystery gzip error several layers later.
+
+    **Exception contract, part of this function's interface, not an
+    implementation detail:** the `os.open` failure branch below always chains
+    the original `OSError` via `from exc` — `ENOENT`, `EACCES`, `ELOOP` on a
+    symlink, all of them — so `except ... as exc: isinstance(exc.__cause__,
+    FileNotFoundError)` is a supported way to ask "did the path simply not
+    exist?" The `S_ISREG` refusal is different in kind, not merely in
+    wording: the path exists and opened fine, it is just the wrong kind of
+    thing, so it raises the `NotARegularFileError` subclass instead, with no
+    `__cause__` to inspect. Callers that need to tell "missing" from "wrong
+    type" from "everything else" apart should match on cause and on type, not
+    on message text.
     """
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -124,7 +151,7 @@ def open_archive_fd(path) -> int:
         raise ArchiveError(f"cannot open archive {path}: {exc}") from exc
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise ArchiveError(f"archive is not a regular file; refused: {path}")
+            raise NotARegularFileError(f"archive is not a regular file; refused: {path}")
         # Drop O_NONBLOCK now the descriptor is known to be a regular file. It
         # was only ever there to survive the open; leaving it set would hand
         # tarfile a descriptor whose reads can in principle short-return, which
