@@ -474,14 +474,32 @@ import re, sys
 # one of these turns a hostile server string into script that can read the
 # mutation token out of sessionStorage. innerHTML is listed here too: the ""
 # clearing idiom is allowed below, nothing else is.
+#
+# Each pattern is written against the spellings that reach the same sink, because
+# an earlier version of this guard required `=` immediately after the property and
+# was therefore blind to `innerHTML +=` — the append form, which is exactly how the
+# job log would grow a hole (`pre.innerHTML += line`). Eight bypasses passed it.
 SINKS = (
-    (r"\.innerHTML\s*=\s*([^;\n]*)", "innerHTML"),
-    (r"\.outerHTML\s*=\s*([^;\n]*)", "outerHTML"),
-    (r"\.insertAdjacentHTML\s*\(([^;\n]*)", "insertAdjacentHTML"),
+    # `+=` as well as `=`. The `= ""` clearing idiom is exempted below; `+= ""` is
+    # not, because it is not a clear.
+    (r"\.innerHTML\s*(?:\+?=)\s*([^;\n]*)", "innerHTML"),
+    (r"\.outerHTML\s*(?:\+?=)\s*([^;\n]*)", "outerHTML"),
+    # The bracketed spelling reaches the same setter without a dotted access.
+    (r"\[\s*['\"](?:inner|outer)HTML['\"]\s*\]\s*\+?=", "bracketed HTML property"),
+    # Bare names, not dotted calls: a bound alias
+    # (`const ins = node.insertAdjacentHTML.bind(node)`) hides the dot.
+    (r"\binsertAdjacentHTML\b", "insertAdjacentHTML"),
     (r"\bdocument\.write(?:ln)?\s*\(([^;\n]*)", "document.write"),
     (r"\.setHTMLUnsafe\s*\(([^;\n]*)", "setHTMLUnsafe"),
+    # Range.createContextualFragment and DOMParser both parse a string into nodes
+    # that are then inserted with append() — no HTML property is ever assigned.
+    (r"\bcreateContextualFragment\s*\(", "createContextualFragment"),
+    (r"\bDOMParser\b", "DOMParser"),
+    # An <iframe srcdoc="…"> is a document built from a string, attribute or
+    # property.
+    (r"\bsrcdoc\b", "srcdoc"),
     # A <template> is only useful once its content is cloned into the document,
-    # and its content is markup by construction. Neither page has one; if one is
+    # and its content is markup by construction. No page has one; if one is
     # ever wanted, revisit this guard rather than deleting it.
     (r"<template\b", "template element"),
 )
@@ -499,11 +517,14 @@ for path in sys.argv[1:]:
     name = path.rsplit("/", 1)[-1]
     src = open(path, encoding="utf-8").read()
 
-    # 1. No HTML-parsing sink. The one exception is clearing a node with "".
+    # 1. No HTML-parsing sink. The one exception is clearing a node with "", and it
+    #    is keyed to the `=` form: `innerHTML += ""` is an append, not a clear, and
+    #    a guard that exempted it would exempt the append spelling entirely.
     for pattern, label in SINKS:
         for m in re.finditer(pattern, src):
             arg = (m.group(1).strip() if m.groups() else "")
-            if label == "innerHTML" and arg in ('""', "''"):
+            if (label == "innerHTML" and "+=" not in m.group(0)
+                    and arg in ('""', "''")):
                 continue
             bad.append("%s: %s used (%r)" % (name, label, arg or m.group(0)))
 

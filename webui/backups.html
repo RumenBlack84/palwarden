@@ -54,13 +54,14 @@
                     margin: 0 0 var(--pw-space-2); letter-spacing: -.01em; }
     .pw-page > p { color: var(--pw-fg-muted); margin: 0 0 var(--pw-space-4); }
 
-    /* pw-grid / pw-card: every top-level region is a titled card. */
-    .pw-grid { display: grid; gap: var(--pw-space-3);
-               grid-template-columns: repeat(6, 1fr); margin-bottom: var(--pw-space-3); }
+    /* pw-card: every top-level region is a titled card. Unlike the dashboard and
+       the Engine editor this page has no .pw-grid container — its four cards are a
+       single full-width stack, each one a table-ish list that reads badly in a
+       narrow column — so the grid rules (.pw-grid, .pw-card--wide and .pw-card's
+       column span) are deliberately absent rather than defined-and-inert. */
     .pw-card { background: var(--pw-surface); border: 1px solid var(--pw-border);
                border-radius: 6px; padding: var(--pw-space-3);
-               grid-column: span 2; margin-bottom: var(--pw-space-3); }
-    .pw-card--wide { grid-column: span 3; }
+               margin-bottom: var(--pw-space-3); }
     .pw-card > h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .1em;
                     color: var(--pw-fg-muted); margin: 0 0 var(--pw-space-2);
                     font-family: var(--pw-sans); }
@@ -139,8 +140,6 @@
     .pw-toast > span { word-break: break-word; }
 
     @media (max-width: 900px) {
-      .pw-grid { grid-template-columns: 1fr; }
-      .pw-card, .pw-card--wide { grid-column: span 1; }
       #archives > div { grid-template-columns: 1fr; }
       #schedule > div { grid-template-columns: 1fr 6rem; }
     }
@@ -289,6 +288,14 @@
 // only to give a better message before spending an upload: the server re-checks it
 // and is the actual authority.
 const ARCHIVE_RE=/^palworld-save-[0-9]{8}T[0-9]{6}Z\.tar\.gz$/;
+// The server's upload ceiling, learned from GET /api/backup-schedule's envelope
+// (max_upload_bytes) — null until that read succeeds, and then only ever used to
+// refuse locally. It matters because the server answers an over-cap upload with 413
+// *without reading the body* and then closes the connection: for a genuinely large
+// file the browser is still sending, so what the operator sees is browser- and
+// timing-dependent and is often "Failed to fetch" rather than the server's message.
+// Refusing here, naming both numbers, is the only way that message is reliable.
+let MAX_UPLOAD_BYTES=null;
 const SCHEDULE_FIELDS=[
   {key:'BACKUP_ENABLED', id:'sched-enabled', bool:true},
   {key:'BACKUP_INTERVAL_HOURS', id:'sched-interval', min:1, max:720},
@@ -314,8 +321,15 @@ function formatBytes(n){
 function formatWhen(epochSeconds){
   const v=Number(epochSeconds);
   if(!isFinite(v) || v<=0) return 'unknown date';
-  const iso=new Date(v*1000).toISOString();
-  return iso.slice(0,10)+' '+iso.slice(11,19)+'Z';
+  // A finite-but-absurd mtime (1e17, say) is outside the Date range and
+  // toISOString() throws RangeError for it. Unguarded, one such row would take the
+  // whole listing down to "could not list the archives".
+  try {
+    const iso=new Date(v*1000).toISOString();
+    return iso.slice(0,10)+' '+iso.slice(11,19)+'Z';
+  } catch(e) {
+    return 'unknown date';
+  }
 }
 
 // --- the three confirmation texts, as pure functions ------------------------
@@ -352,6 +366,18 @@ function deleteFinalMessage(entry, total){
 // rendered with textContent and nothing else: the API refuses a name that does not
 // match ARCHIVE_RE, but this renderer is the last line of defence and is tested
 // directly against a hostile name for exactly that reason.
+// Re-rendering the list destroys the button that was just activated, and the
+// browser drops focus to <body> when that happens — a keyboard operator loses their
+// place after every delete or refresh. Put focus somewhere sensible instead: the
+// Refresh list button, which is adjacent to the list and never disappears. Only
+// when focus really was lost, so a re-render triggered while the operator is typing
+// in the schedule card does not steal it.
+function restoreListFocus(){
+  const active=document.activeElement;
+  if(active && active!==document.body) return;
+  const back=el('btn-refresh');
+  if(back && typeof back.focus==='function') back.focus();
+}
 function renderArchives(list){
   const root=el('archives');
   root.textContent='';
@@ -360,6 +386,7 @@ function renderArchives(list){
     p.className='pw-empty';
     p.textContent='No backups yet';
     root.append(p);
+    restoreListFocus();
     return;
   }
   list.forEach(entry=>{
@@ -397,6 +424,7 @@ function renderArchives(list){
     row.append(nameCell, sizeCell, whenCell, actions);
     root.append(row);
   });
+  restoreListFocus();
 }
 
 async function loadArchives(){
@@ -456,6 +484,10 @@ async function loadSchedule(){
       throw new Error((json && json.error) ? json.error : ('GET /api/backup-schedule: HTTP '+res.status));
     }
     fillSchedule(json.data);
+    // Envelope field, not part of the schedule itself: this read is the one the page
+    // makes on load anyway, so it is where the upload ceiling is picked up.
+    const cap=Number(json.max_upload_bytes);
+    if(isFinite(cap) && cap>0){ MAX_UPLOAD_BYTES=cap; syncImport(); }
     setStatus('schedule-msg', 'Showing the schedule the next tick will use.', true);
   } catch(e) {
     setStatus('schedule-msg', 'could not read the schedule: '+errText(e), true);
@@ -573,6 +605,13 @@ function setBusy(busy){
   });
   if(!busy) syncImport();
 }
+// Belt-and-braces, and deliberately unfalsifiable: showModal() makes the rest of
+// the document inert, so a row button cannot in fact be clicked while any of these
+// is open and no test can make this return true through the UI. It is kept — rather
+// than dropped as dead code — because it is the one line that would stop a *second*
+// confirmation flow if some future edit ever opened one of these dialogs with
+// show() instead of showModal(). Noted here so the next reviewer does not spend the
+// afternoon trying to write the test that cannot exist.
 function dialogOpen(){
   return ['confirm-restore','confirm-delete-1','confirm-delete-2'].some(id=>el(id).open);
 }
@@ -749,6 +788,11 @@ function selectedFile(){
   const input=el('import-file');
   return (input.files && input.files.length) ? input.files[0] : null;
 }
+// True only when the ceiling is known and this file is over it. Unknown ceiling
+// means "let the server decide", which is the pre-existing behaviour.
+function overCap(file){
+  return MAX_UPLOAD_BYTES!==null && Number(file.size)>MAX_UPLOAD_BYTES;
+}
 function syncImport(){
   const file=selectedFile();
   el('btn-upload').disabled = !file;
@@ -759,13 +803,31 @@ function syncImport(){
       'palworld-save-<UTC stamp>.tar.gz, not '+file.name, false);
     return;
   }
+  if(overCap(file)){
+    el('btn-upload').disabled=true;
+    // Both numbers, in bytes as well as scaled: the operator has to decide whether
+    // to raise PALWARDEN_MAX_UPLOAD_BYTES or find a smaller archive, and "2.0 GiB"
+    // alone does not say which side of the boundary they are on.
+    setStatus('import-msg', file.name+' is '+formatBytes(file.size)+' ('+file.size+
+      ' bytes) and this server accepts at most '+formatBytes(MAX_UPLOAD_BYTES)+' ('+
+      MAX_UPLOAD_BYTES+' bytes), so nothing was sent. Raise PALWARDEN_MAX_UPLOAD_BYTES '+
+      'on the server or import this archive by hand.', false);
+    return;
+  }
   setStatus('import-msg', file.name+' — '+formatBytes(file.size)+' ready to upload.', true);
 }
 
 // Streams the File as the raw request body. There is no upload-progress event on
-// fetch(), so progress is reported as elapsed time on a ticker: an operator
-// pushing a multi-gigabyte archive over a slow link must be able to tell "still
-// going" from "hung".
+// fetch(), so the only thing this page can honestly report is elapsed time: the
+// ticker distinguishes "the request is still outstanding" from "the request
+// finished", and nothing more. It does NOT distinguish progress from a stall — a
+// connection that has stopped moving bytes emits exactly the same rising counter.
+//
+// There is also no cancel: setBusy(true) disables every control in the cards for
+// the life of the upload, so a 2 GiB archive chosen by mistake cannot be abandoned
+// from the page. Rather than add an AbortController and a control that has to stay
+// enabled while everything around it is disabled, the ticker line says what the
+// escape hatch actually is — reload the page.
 //
 // Returns {ok, staged} or {ok:false, error}. The failure message is handed back
 // rather than written to #import-msg here, because setBusy(false) in the finally
@@ -774,12 +836,18 @@ function syncImport(){
 async function stageUpload(file){
   setBusy(true);
   let ticker=null;
+  // Cleared to true the moment fetch() resolves. If it is still false in the catch,
+  // the request never produced a response at all, which is the one failure whose
+  // message ("Failed to fetch") tells the operator nothing.
+  let answered=false;
   try {
     const tok=await token();
     log('uploading '+file.name+' ('+formatBytes(file.size)+') to the staging area…');
     const started=Date.now();
     ticker=setInterval(()=>{
-      log('still uploading '+file.name+' — '+Math.round((Date.now()-started)/1000)+'s elapsed');
+      log('still uploading '+file.name+' — '+Math.round((Date.now()-started)/1000)+
+        's elapsed (elapsed time only: this cannot tell a slow link from a stalled '+
+        'one). Reload the page to abandon it.');
     }, 5000);
     const res=await fetch('/api/backups/upload', {
       method:'POST',
@@ -787,6 +855,7 @@ async function stageUpload(file){
                'X-Palwarden-Token':tok,'X-Palwarden-Filename':file.name},
       body: file,
     });
+    answered=true;
     let json=null;
     try { json=await res.json(); } catch(e) { json=null; }
     if(res.status===403) sessionStorage.removeItem(TOKEN_KEY);
@@ -801,7 +870,18 @@ async function stageUpload(file){
     log('staged as '+staged+' ('+formatBytes(file.size)+' sent)');
     return {ok:true, staged: staged};
   } catch(e) {
-    const msg=errText(e);
+    let msg=errText(e);
+    if(!answered){
+      // The server refuses an over-cap or won't-fit upload *before* reading the
+      // body and then closes the connection, so a browser that is still sending
+      // reports a transport error and never shows the 413/507 sentence. Name that
+      // case here: without it the least actionable message lands on the most
+      // confusing action.
+      msg += ' — the request never got a reply. Besides the obvious (the server is '+
+        'down, the network dropped), this is also what a refused upload looks like '+
+        'when the server rejects it before the file has finished sending: too large, '+
+        'or not enough free space for it.';
+    }
     log('upload failed: '+msg);
     toast(false, msg);
     return {ok:false, error:msg};
@@ -815,6 +895,10 @@ async function importArchive(){
   const file=selectedFile();
   if(!file){ setStatus('import-msg', 'Choose an archive file first.', false); return; }
   if(!ARCHIVE_RE.test(file.name)){ syncImport(); return; }
+  // Refused locally, before a byte goes out: an over-cap POST is answered 413
+  // without the body being read, which the browser may well surface as
+  // "Failed to fetch" instead of the server's sentence.
+  if(overCap(file)){ syncImport(); return; }
   const upload=await stageUpload(file);
   if(!upload.ok){ setStatus('import-msg', upload.error, false); return; }
   const staged=upload.staged;

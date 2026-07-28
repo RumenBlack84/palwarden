@@ -363,7 +363,7 @@ unpacks.
 | `/api/backups` | GET | Basic | Existing listing |
 | `/api/backups/<name>/download` | GET | Basic | Stream one archive |
 | `/api/backups/upload` | POST | Basic + token + Origin | Stage an archive |
-| `/api/backup-schedule` | GET | Basic | Current schedule + retention, so the form can show real values |
+| `/api/backup-schedule` | GET | Basic | Current schedule + retention, so the form can show real values, plus `max_upload_bytes` beside `data` so the page can refuse an over-cap import locally |
 
 Status codes follow the existing scheme: `401` missing/bad Basic · `403`
 missing/bad token or bad Origin · `400` validation failure (bad name, oversized,
@@ -414,7 +414,13 @@ performance, using only the documented component vocabulary.
   green; the 403 body reflects the request `Origin`, and job output is
   attacker-influenceable.
 * The token comes from `GET /api/token`, cached in `sessionStorage`, as on the
-  Engine editor. No prompt.
+  Engine editor. No prompt on the normal path: the operator is never asked to paste
+  a token when the endpoint answers. `window.prompt` is kept — on this page and on
+  the Engine editor, identically — only as the fallback for a server without
+  `/api/token` (an older palwarden), which would otherwise be unable to mutate
+  anything at all. `tests/unit/test_webui_jobs.sh` executes `token()` and pins both
+  halves: the happy path prompts zero times, the 404/network path prompts once, and
+  a 401 (a dead Basic session, which no token can fix) refuses to prompt.
 
 ## Error handling
 

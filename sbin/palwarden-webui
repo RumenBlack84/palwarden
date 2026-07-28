@@ -677,8 +677,19 @@ def ep_backup_schedule(_query: dict) -> dict:
     already applies the defaults, the ranges and the "a bad value falls back to the
     default" rule, and the panel must show what the tick will actually do, not a
     second interpretation of the same file.
+
+    Also carries the upload ceiling, as `max_upload_bytes` beside `data` rather than
+    inside it: `data` is exactly what the tool printed (the four schedule keys, and
+    the panel's tests pin that), while the ceiling belongs to this server. The
+    Backups page needs it because an over-cap POST is answered 413 *without the body
+    being read* and the connection is then closed — a browser still streaming a
+    multi-gigabyte file often surfaces that as a transport error instead of our
+    message, so the page has to be able to refuse locally and name the number. This
+    read is the one the page makes on load anyway.
     """
-    return run_tool_json([str(SBIN / "palworld-backups"), "--show-schedule"])
+    result = run_tool_json([str(SBIN / "palworld-backups"), "--show-schedule"])
+    result["max_upload_bytes"] = MAX_UPLOAD_BYTES
+    return result
 
 
 # `[^/]+` and then percent-decoded, in that order: a name containing a real slash

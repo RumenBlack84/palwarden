@@ -202,7 +202,11 @@ Read endpoints (Basic auth is enough): `/api/health`, `/api/fps`, `/api/events`,
 `{"ok": false, "error": ...}` rather than a `500`, so one broken tool cannot blank
 the dashboard. `/api/backups` lists only names matching the archive pattern, so a
 `palworld-restore --import` copy that is still in flight is never shown as a
-backup.
+backup. `/api/backup-schedule` also carries `max_upload_bytes` *beside* `data` (the
+server's upload ceiling, not part of the schedule): an over-cap upload is answered
+`413` without the body being read and the connection is then closed, so a browser
+still streaming a large file often sees only a transport error — the Backups page
+uses this number to refuse such a file before sending it, naming both sizes.
 
 `GET /api/backups/<name>/download` streams one archive
 (`Content-Type: application/gzip`, `Content-Disposition: attachment`,

@@ -629,6 +629,15 @@ assert_eq "$(printf '%s' "$shape" | sed -n 2p)" "bool,int,int,int" \
   "the schedule's types are bool,int,int,int"
 assert_eq "$(printf '%s' "$shape" | sed -n 3p)" "6" \
   "the schedule reflects the file, not the defaults"
+# The upload ceiling rides along on this read, beside `data` rather than inside it
+# (the four-keys assertion above is what "beside" protects). The page needs it to
+# refuse an over-cap file locally: the server answers an over-cap POST 413 without
+# reading the body and closes the connection, so a browser still streaming a large
+# file may only ever see a transport error.
+assert_eq "$(printf '%s' "$sched" | python3 -c '
+import json, sys
+print(json.load(sys.stdin).get("max_upload_bytes"))')" "200000" \
+  "the schedule read carries the server's upload ceiling"
 
 # --- nothing sensitive, and no traceback, in any log ----------------------
 for log in "$WORK/server.log" "$WORK/server-slow.log" "$WORK/server-full.log" \
@@ -732,31 +741,60 @@ assert_file_not_contains "$PAGE" "WEBUI_PASSWORD" "no credential baked into the 
 #    autofocus, so the destructive button is never the default target.
 # 4. every runJob payload carries only params the *worker* recognises, read out of
 #    palwarden-jobd's own ACTIONS table rather than duplicated here.
-structural="$(python3 - "$PAGE" "$DASH" "$EDITOR" "$REPO/sbin/palwarden-jobd" <<'PY'
+# 5. the page's copy of the archive-name rule is character-identical to the
+#    server's. It is hand-copied from lib/palwarden_archive.py, and a server-side
+#    change would otherwise silently disable this page's own Upload button — every
+#    valid name would fail the page's stale pattern and never reach the API that
+#    accepts it.
+structural="$(python3 - "$PAGE" "$DASH" "$EDITOR" "$REPO/sbin/palwarden-jobd" \
+  "$REPO/lib/palwarden_archive.py" <<'PY'
 import re
 import sys
 
-page_path, dash_path, editor_path, jobd_path = sys.argv[1:5]
+page_path, dash_path, editor_path, jobd_path, archive_path = sys.argv[1:6]
 src = open(page_path, encoding="utf-8").read()
 bad = []
 
 # 1. sinks / colours / inline styles
+# Kept character-for-character identical to the copy in tests/unit/test_webui_jobs.sh
+# (which applies it to all three pages): the guard's whole value is that the same
+# spellings are refused everywhere. An earlier version required `=` immediately
+# after the property and so could not see `innerHTML +=` — the append form, which is
+# how this page's job log would grow the hole. Eight bypasses passed it.
 SINKS = (
-    (r"\.innerHTML\s*=\s*([^;\n]*)", "innerHTML"),
-    (r"\.outerHTML\s*=\s*([^;\n]*)", "outerHTML"),
-    (r"\.insertAdjacentHTML\s*\(([^;\n]*)", "insertAdjacentHTML"),
+    # `+=` as well as `=`. The `= ""` clearing idiom is exempted below; `+= ""` is
+    # not, because it is not a clear.
+    (r"\.innerHTML\s*(?:\+?=)\s*([^;\n]*)", "innerHTML"),
+    (r"\.outerHTML\s*(?:\+?=)\s*([^;\n]*)", "outerHTML"),
+    # The bracketed spelling reaches the same setter without a dotted access.
+    (r"\[\s*['\"](?:inner|outer)HTML['\"]\s*\]\s*\+?=", "bracketed HTML property"),
+    # Bare names, not dotted calls: a bound alias
+    # (`const ins = node.insertAdjacentHTML.bind(node)`) hides the dot.
+    (r"\binsertAdjacentHTML\b", "insertAdjacentHTML"),
     (r"\bdocument\.write(?:ln)?\s*\(([^;\n]*)", "document.write"),
     (r"\.setHTMLUnsafe\s*\(([^;\n]*)", "setHTMLUnsafe"),
+    # Range.createContextualFragment and DOMParser both parse a string into nodes
+    # that are then inserted with append() — no HTML property is ever assigned.
+    (r"\bcreateContextualFragment\s*\(", "createContextualFragment"),
+    (r"\bDOMParser\b", "DOMParser"),
+    # An <iframe srcdoc="…"> is a document built from a string, attribute or
+    # property.
+    (r"\bsrcdoc\b", "srcdoc"),
+    # A <template> is only useful once its content is cloned into the document,
+    # and its content is markup by construction. No page has one; if one is
+    # ever wanted, revisit this guard rather than deleting it.
     (r"<template\b", "template element"),
 )
 COLOR_PATTERNS = (
     r"#[0-9a-fA-F]{3,8}\b",
     r"\b(?:rgb|rgba|hsl|hsla|hwb|lab|lch|oklab|oklch|color|color-mix)\s*\(",
 )
+# The clear-idiom exemption is keyed to the `=` form only: `innerHTML += ""` is an
+# append, not a clear.
 for pattern, label in SINKS:
     for m in re.finditer(pattern, src):
         arg = (m.group(1).strip() if m.groups() else "")
-        if label == "innerHTML" and arg in ('""', "''"):
+        if label == "innerHTML" and "+=" not in m.group(0) and arg in ('""', "''"):
             continue
         bad.append("HTML sink used: %s (%r)" % (label, arg or m.group(0)))
 style = re.search(r"<style>(.*?)</style>", src, re.S)
@@ -862,10 +900,47 @@ if seen != expected_actions:
     bad.append("the page enqueues %s, expected %s"
                % (sorted(seen), sorted(expected_actions)))
 
+# 5. the mirrored archive-name pattern
+page_re = re.search(r"^const ARCHIVE_RE=/(.*)/;$", src, re.M)
+server_re = re.search(r'^ARCHIVE_RE = re\.compile\(r"(.*)"\)$',
+                      open(archive_path, encoding="utf-8").read(), re.M)
+if not page_re:
+    bad.append("could not find the page's ARCHIVE_RE literal")
+if not server_re:
+    bad.append("could not find lib/palwarden_archive.py's ARCHIVE_RE literal")
+if page_re and server_re and page_re.group(1) != server_re.group(1):
+    bad.append("the page's ARCHIVE_RE (%s) is not the server's (%s)"
+               % (page_re.group(1), server_re.group(1)))
+
 print("OK" if not bad else "; ".join(bad))
 PY
 )"
 assert_eq "$structural" "OK" "the Backups page's DOM/CSS/dialog/payload invariants hold"
+
+# The sink guard exists twice — here and in tests/unit/test_webui_jobs.sh, which
+# applies it to all three pages — and its whole value is that the same spellings are
+# refused everywhere. Two copies drift; this is what stops them, and it is why the
+# block is kept character-identical rather than "morally the same".
+assert_eq "$(python3 - "$DIR/test_webui_backups.sh" "$DIR/test_webui_jobs.sh" <<'PY'
+import re
+import sys
+
+
+def sinks(path):
+    src = open(path, encoding="utf-8").read()
+    found = re.search(r"^SINKS = \((.*?)^\)", src, re.S | re.M)
+    return found.group(1) if found else None
+
+
+here, there = (sinks(p) for p in sys.argv[1:3])
+if here is None or there is None:
+    print("could not find a SINKS block in both suites")
+elif here != there:
+    print("the two SINKS blocks have drifted apart")
+else:
+    print("OK")
+PY
+)" "OK" "the HTML-sink guard is identical in both suites"
 
 # --- node: the three-step delete, driven for real --------------------------
 # Extracts the page's own deleteArchive() and the two message builders, then runs
@@ -911,6 +986,10 @@ const ENTRY = { name: "palworld-save-20260101T000000Z.tar.gz", bytes: 150020, mo
   check("a missing size is named, not NaN", formatBytes(undefined) === "unknown size");
   check("the date is rendered in UTC", formatWhen(1767225600) === "2026-01-01 00:00:00Z");
   check("a missing date is named", formatWhen(0) === "unknown date");
+  // Finite, positive, and far outside the Date range: new Date(1e17*1000)
+  // .toISOString() throws RangeError, and an unguarded throw here takes the whole
+  // listing down to "could not list the archives" over one bad mtime.
+  check("an absurd but finite date does not throw", formatWhen(1e17) === "unknown date");
 
   // STEP 1 -> cancel: nothing is sent, and only the first dialog was opened.
   reset([false]);
@@ -973,6 +1052,7 @@ EOF
     js_block "$PAGE" '^function formatBytes' '^}'
     js_block "$PAGE" '^function formatWhen' '^}'
     grep '^function el(' "$PAGE"
+    js_block "$PAGE" '^function restoreListFocus' '^}'
     js_block "$PAGE" '^function renderArchives' '^}'
   } > "$REN_JS"
   cat >> "$REN_JS" <<'EOF'
@@ -995,7 +1075,16 @@ function node(tag) {
     append(...kids) { for (const k of kids) self.children.push(k); },
     appendChild(k) { self.children.push(k); },
     setAttribute(k, v) { self.attrs[k] = String(v); },
-    addEventListener() { self.listeners++; },
+    // The handler is kept, not just counted: what the row's Delete button passes to
+    // deleteArchive is a requirement (the "ONLY archive" sentence depends on it) and
+    // counting listeners cannot see it.
+    handlers: {},
+    addEventListener(type, fn) {
+      self.listeners++;
+      (self.handlers[type] = self.handlers[type] || []).push(fn);
+    },
+    focused: 0,
+    focus() { self.focused++; global.document.activeElement = self; },
   };
   Object.defineProperty(self, "textContent", {
     get() { return self._text; },
@@ -1011,7 +1100,20 @@ function node(tag) {
   return self;
 }
 const ROOT = node("div");
-global.document = { createElement: node, getElementById: (id) => (id === "archives" ? ROOT : null) };
+const REFRESH = node("button");
+const BODY = node("body");
+global.document = {
+  createElement: node,
+  body: BODY,
+  activeElement: BODY,
+  getElementById: (id) => (id === "archives" ? ROOT : (id === "btn-refresh" ? REFRESH : null)),
+};
+// The row handlers' collaborators. renderArchives must not call either of them
+// while merely rendering, and must pass the right arguments when a row is clicked.
+let deleted = [], restored = [];
+function deleteArchive(entry, total) { deleted.push({ entry: entry, total: total }); }
+function restoreArchive(entry) { restored.push(entry); }
+function dialogOpen() { return false; }
 function walk(n, out) {
   out.push(n);
   for (const k of n.children) walk(k, out);
@@ -1055,6 +1157,61 @@ check("Restore and Delete are marked destructive",
 check("every row control is wired to a handler", buttons.every(b => b.listeners === 1));
 check("the row labels are plain text",
       buttons.map(b => b._text).join(",") === "Restore,Delete,Restore,Delete");
+check("rendering alone opens nothing", deleted.length === 0 && restored.length === 0);
+
+// --- what the row handlers actually pass ----------------------------------
+// The "this is the ONLY archive" sentence in the final delete dialog is driven by
+// the total renderArchives hands to deleteArchive. deleteFinalMessage's own
+// total<=1 branch is tested elsewhere; nothing tested this half, so
+// `deleteArchive(entry, list.length + 1)` used to pass and an operator deleting
+// their last backup would never have been told.
+function rowHandlers(n) {
+  const rows = walk(ROOT, []).filter(x => x.tag === "button");
+  return { restore: rows[2 * n], del: rows[2 * n + 1] };
+}
+function clickDelete(list, row) {
+  deleted = []; restored = [];
+  renderArchives(list);
+  rowHandlers(row).del.handlers.click[0]();
+  return deleted;
+}
+const ONE = [{ name: "palworld-save-20260101T000000Z.tar.gz", bytes: 10, modified: 1767225600 }];
+const TWO = ONE.concat([{ name: "palworld-save-20260102T000000Z.tar.gz", bytes: 10, modified: 1767225600 }]);
+let got = clickDelete(ONE, 0);
+check("a one-element list's Delete passes total 1", got.length === 1 && got[0].total === 1);
+check("...and the entry it was rendered from", got[0].entry === ONE[0]);
+got = clickDelete(TWO, 0);
+check("a two-element list's Delete passes total 2", got.length === 1 && got[0].total === 2);
+got = clickDelete(TWO, 1);
+check("the second row passes total 2 as well, with its own entry",
+      got.length === 1 && got[0].total === 2 && got[0].entry === TWO[1]);
+// Restore takes the entry and nothing else.
+deleted = []; restored = [];
+renderArchives(TWO);
+rowHandlers(1).restore.handlers.click[0]();
+check("Restore is handed the row's entry", restored.length === 1 && restored[0] === TWO[1]);
+check("Restore does not delete", deleted.length === 0);
+
+// --- focus survives a re-render ------------------------------------------
+// root.textContent='' removes the button that was just activated, and the browser
+// drops focus to <body>. Without the restore, a keyboard operator loses their place
+// after every delete and every Refresh.
+global.document.activeElement = BODY;
+REFRESH.focused = 0;
+renderArchives(TWO);
+check("a re-render that lost focus puts it back on Refresh list", REFRESH.focused === 1);
+check("...and the focus really moved there", global.document.activeElement === REFRESH);
+global.document.activeElement = BODY;
+REFRESH.focused = 0;
+renderArchives([]);
+check("the empty re-render restores focus too", REFRESH.focused === 1);
+// ...but a re-render while the operator is somewhere else must not steal it.
+const ELSEWHERE = node("input");
+global.document.activeElement = ELSEWHERE;
+REFRESH.focused = 0;
+renderArchives(TWO);
+check("a re-render does not steal focus from another control", REFRESH.focused === 0);
+check("...and leaves it where it was", global.document.activeElement === ELSEWHERE);
 
 console.log(failures === 0 ? "OK" : "FAIL");
 EOF
@@ -1214,22 +1371,531 @@ function reset(r) { logs.length = 0; toasts.length = 0; busy = []; seen = null; 
   check("an unparseable response is reported, not thrown", res.ok === false && /502/.test(res.error));
   check("the controls are re-enabled after a parse failure", busy[busy.length - 1] === false);
 
-  // a hard network failure
+  // a hard network failure. This is also what an over-cap or won't-fit upload looks
+  // like from the browser when the server refuses it (413/507) *before* the body has
+  // finished sending and closes the connection: fetch() rejects and the server's
+  // sentence is never read. "Failed to fetch" on the most confusing action in the
+  // panel has to say so.
   reset(() => { throw new Error("network down"); });
   res = await stageUpload(FILE);
   check("a network failure is reported", res.ok === false && /network down/.test(res.error));
   check("the controls are re-enabled after a network failure", busy[busy.length - 1] === false);
+  check("a reply-less failure names the refused-upload case",
+        /finished sending/.test(res.error) && /free space/.test(res.error));
+  check("...and says the request got no reply at all", /never got a reply/.test(res.error));
+  // ...and a failure the server DID answer must not get that hint bolted on: it
+  // already carries the server's own reason, and guessing over it is noise.
+  reset(() => json(400, { ok: false, error: "an archive name this project wrote" }));
+  res = await stageUpload(FILE);
+  check("an answered refusal carries no reply-less hint",
+        !/never got a reply/.test(res.error));
 
   console.log(failures === 0 ? "OK" : "FAIL");
 })();
 EOF
   up_out="$(node "$UP_JS" 2>&1)"
   assert_eq "$up_out" "OK" "stageUpload() streams the File with the validated name and recovers from every failure"
+
+  # --- node: openConfirm() really leaves Cancel focused --------------------
+  # The markup half (Cancel first, Cancel carries autofocus) is asserted
+  # structurally above. That is only half the answer, and the two halves shield
+  # each other: with autofocus present, changing this function's cancel.focus() to
+  # ok.focus() makes "Delete permanently" the default target in EVERY browser (an
+  # explicit .focus() after showModal() wins), and the markup assertions do not
+  # notice. So the function is driven against a <dialog> stub, twice:
+  #
+  #   honour=true  — showModal() focuses whichever button carries autofocus in the
+  #                  real markup, as a browser does. Catches ok.focus().
+  #   honour=false — showModal() focuses nothing, which is the case the page's own
+  #                  comment gives for focusing explicitly (a browser ignoring
+  #                  autofocus on a dialog already shown once). Catches deleting
+  #                  cancel.focus().
+  #
+  # Both must end with focus on the button whose id ends in -cancel.
+  CONF_JS="$WORK/open-confirm.js"
+  # Which button ids carry autofocus, read out of the page's own markup rather than
+  # assumed: if autofocus ever moves, this stub moves with it and the honour=false
+  # run is what still fails.
+  python3 - "$PAGE" > "$CONF_JS" <<'PY'
+import json
+import re
+import sys
+
+src = open(sys.argv[1], encoding="utf-8").read()
+out = {}
+for dlg_id, body in re.findall(r"<dialog\b[^>]*id=\"([^\"]+)\"[^>]*>(.*?)</dialog>", src, re.S):
+    focused = []
+    for attrs in re.findall(r"<button\b([^>]*)>", body):
+        m = re.search(r'id="([^"]+)"', attrs)
+        if m and "autofocus" in attrs:
+            focused.append(m.group(1))
+    out[dlg_id] = focused
+print("const AUTOFOCUS = %s;" % json.dumps(out))
+PY
+  js_block "$PAGE" '^function openConfirm' '^}' >> "$CONF_JS"
+  cat >> "$CONF_JS" <<'EOF'
+
+let failures = 0;
+function check(desc, cond) { if (!cond) { failures++; console.log("FAIL: " + desc); } }
+
+let FOCUS = null, STATE = {}, HONOUR_AUTOFOCUS = true;
+function el(id) { return STATE[id]; }
+function node(id) {
+  const self = {
+    id: id, _text: "", focused: 0, listeners: {},
+    focus() { self.focused++; FOCUS = self; },
+    addEventListener(type, fn) { (self.listeners[type] = self.listeners[type] || []).push(fn); },
+    removeEventListener(type, fn) {
+      const a = self.listeners[type] || [];
+      const i = a.indexOf(fn);
+      if (i !== -1) a.splice(i, 1);
+    },
+    fire(type) { for (const fn of (self.listeners[type] || []).slice()) fn(); },
+    live() { return Object.keys(self.listeners).reduce((n, k) => n + self.listeners[k].length, 0); },
+  };
+  Object.defineProperty(self, "textContent", {
+    get() { return self._text; },
+    set(v) { self._text = String(v); },
+  });
+  return self;
+}
+function build(id) {
+  const dlg = node(id);
+  dlg.open = false;
+  dlg.showModal = () => {
+    dlg.open = true;
+    if (!HONOUR_AUTOFOCUS) return;
+    for (const bid of (AUTOFOCUS[id] || [])) if (STATE[bid]) STATE[bid].focus();
+  };
+  dlg.close = () => { dlg.open = false; dlg.fire("close"); };
+  STATE = {};
+  for (const suffix of ["-ok", "-cancel", "-title", "-body"]) STATE[id + suffix] = node(id + suffix);
+  STATE[id] = dlg;
+  return dlg;
+}
+
+const IDS = Object.keys(AUTOFOCUS);
+
+(async () => {
+  check("the page has exactly three confirm dialogs", IDS.length === 3);
+  for (const honour of [true, false]) {
+    for (const id of IDS) {
+      for (const path of ["cancel", "ok", "close"]) {
+        FOCUS = null;
+        HONOUR_AUTOFOCUS = honour;
+        const dlg = build(id);
+        const promise = openConfirm(id, "T:" + id, "M:" + id, "GO");
+        const ok = STATE[id + "-ok"], cancel = STATE[id + "-cancel"];
+        const where = id + " [autofocus=" + honour + ", " + path + "]";
+        check(where + ": the dialog was opened modally", dlg.open === true);
+        check(where + ": the message went in via textContent",
+              STATE[id + "-body"]._text === "M:" + id);
+        check(where + ": the confirm label was applied", ok._text === "GO");
+        // THE assertion: whatever the browser does with autofocus, the control that
+        // Enter or Space would activate is Cancel.
+        check(where + ": focus ends on the cancel button",
+              FOCUS !== null && /-cancel$/.test(String(FOCUS.id)));
+        check(where + ": the destructive button was never focused", ok.focused === 0);
+        if (path === "cancel") cancel.fire("click");
+        else if (path === "ok") ok.fire("click");
+        else dlg.close();
+        const result = await promise;
+        check(where + ": resolves " + (path === "ok"), result === (path === "ok"));
+        check(where + ": the dialog is closed afterwards", dlg.open === false);
+        // Cleanup on EVERY resolve path: three dialogs are reused for the whole
+        // life of the page, so a listener left behind resolves a *later* promise.
+        check(where + ": every listener was removed",
+              ok.live() === 0 && cancel.live() === 0 && dlg.live() === 0);
+        // ...and a stray later event cannot re-resolve or re-close anything.
+        cancel.fire("click"); ok.fire("click");
+        check(where + ": a late click does nothing", dlg.open === false);
+      }
+    }
+  }
+  console.log(failures === 0 ? "OK" : "FAIL");
+})();
+EOF
+  conf_out="$(node "$CONF_JS" 2>&1)"
+  assert_eq "$conf_out" "OK" \
+    "openConfirm() leaves Cancel focused whether or not the browser honours autofocus"
+
+  # --- node: runJob() + pollJob(), executed ---------------------------------
+  # Neither had any executed coverage, and all three of these mutations survived:
+  # deleting setBusy(false) from the finally (which leaves the panel permanently
+  # dead after the first job — every control disabled until a reload),
+  # POLL_MAX_ATTEMPTS = Infinity, and deleting the POLL_MAX_STATUS_FAILURES
+  # bail-out. So: every outcome, with `busy` and the attempt count asserted.
+  JOB_JS="$WORK/run-job.js"
+  {
+    grep '^const TOKEN_KEY' "$PAGE"
+    grep '^const POLL_' "$PAGE"
+    grep '^const TERMINAL' "$PAGE"
+    js_block "$PAGE" '^function errText' '^}'
+    js_block "$PAGE" '^async function postJob' '^}'
+    js_block "$PAGE" '^async function pollJob' '^}'
+    js_block "$PAGE" '^async function runJob' '^}'
+  } > "$JOB_JS"
+  cat >> "$JOB_JS" <<'EOF'
+
+let failures = 0;
+function check(desc, cond) { if (!cond) { failures++; console.log("FAIL: " + desc); } }
+
+// The bound must be a real number before anything below loops on it: with
+// POLL_MAX_ATTEMPTS = Infinity the expiry scenario would hang forever rather than
+// fail, so it is asserted directly as well as exercised.
+check("POLL_MAX_ATTEMPTS is a finite bound", Number.isFinite(POLL_MAX_ATTEMPTS) && POLL_MAX_ATTEMPTS > 0);
+check("POLL_MAX_STATUS_FAILURES is a finite bound",
+      Number.isFinite(POLL_MAX_STATUS_FAILURES) && POLL_MAX_STATUS_FAILURES > 0);
+
+const logs = [], toasts = [];
+let busy = [], slept = 0, posts = 0, statusCalls = 0;
+function log(l) { logs.push(String(l)); }
+function toast(ok, m) { toasts.push({ ok: ok, message: String(m) }); }
+function setBusy(b) { busy.push(b); }
+function dismissToast() {}
+async function sleep() { slept++; }            // no real waiting: 450 attempts run instantly
+async function token() { return "T-tok"; }
+let store = { "palwarden-token": "T-tok" };
+global.sessionStorage = {
+  getItem(k) { return Object.prototype.hasOwnProperty.call(store, k) ? store[k] : null; },
+  setItem(k, v) { store[k] = String(v); },
+  removeItem(k) { delete store[k]; },
+};
+function json(status, body) {
+  return { status: status, ok: status >= 200 && status < 300, json: async () => body };
+}
+let onPost = null, onStatus = null;
+global.fetch = async (url, opts) => {
+  if (url === "/api/jobs" && opts && opts.method === "POST") { posts++; return onPost(); }
+  statusCalls++;
+  // A hard ceiling so a broken bound cannot hang this test: 450 attempts is the
+  // whole budget, and anything past it plus slack is a bug, not a slow poll.
+  if (statusCalls > 600) throw new Error("the poll exceeded POLL_MAX_ATTEMPTS");
+  return onStatus();
+};
+function reset(post, status) {
+  logs.length = 0; toasts.length = 0; busy = []; slept = 0; posts = 0; statusCalls = 0;
+  store = { "palwarden-token": "T-tok" };
+  onPost = post; onStatus = status;
+}
+const ACCEPTED = () => json(202, { id: "job-7" });
+function ended(state, extra) {
+  return () => json(200, { ok: true, data: Object.assign({ state: state }, extra || {}) });
+}
+// Every scenario ends the same way: the controls come back. That is the single
+// assertion whose absence leaves the whole panel dead after one job.
+function freed(where) {
+  check(where + ": setBusy(true) came first", busy[0] === true);
+  check(where + ": the controls are re-enabled", busy[busy.length - 1] === false);
+  check(where + ": busy is balanced", busy.filter(b => b).length === busy.filter(b => !b).length);
+}
+
+(async () => {
+  // 1. succeeded
+  reset(ACCEPTED, ended("succeeded", { exit_code: 0, output: "made an archive" }));
+  let res = await runJob("backup", {});
+  check("a succeeded job reports ok", res.ok === true && res.id === "job-7");
+  check("the job output is logged", logs.some(l => l.indexOf("made an archive") !== -1));
+  check("a success toasts ok", toasts.length === 1 && toasts[0].ok === true);
+  check("the first status GET goes out without sleeping first", slept === 0);
+  freed("succeeded");
+
+  // 2. failed: not ok, and the exit code is named
+  reset(ACCEPTED, ended("failed", { exit_code: 3, output: "no space left" }));
+  res = await runJob("backup", {});
+  check("a failed job reports not-ok", res.ok === false);
+  check("the failure names the exit code", /exit 3/.test(res.error));
+  check("a failure toasts not-ok", toasts.length === 1 && toasts[0].ok === false);
+  freed("failed");
+
+  // 3. POST 403: the token is dropped, and the panel still comes back
+  reset(() => json(403, { ok: false, error: "cross-origin request refused" }), ended("succeeded"));
+  res = await runJob("backup_delete", { backup: "a", confirm: true });
+  check("a 403 POST reports not-ok", res.ok === false);
+  check("a 403 POST never polls", statusCalls === 0);
+  check("a 403 discards the cached token", !("palwarden-token" in store));
+  check("a 403 says the token was discarded", /discarded/.test(res.error));
+  freed("403 POST");
+
+  // 4. a POST body that is not JSON at all
+  reset(() => ({ status: 502, ok: false, json: async () => { throw new Error("not json"); } }),
+        ended("succeeded"));
+  res = await runJob("backup", {});
+  check("an unparseable POST reply is reported, not thrown", res.ok === false && /502/.test(res.error));
+  freed("unparseable POST");
+
+  // 5. fetch itself throwing
+  reset(() => { throw new Error("network down"); }, ended("succeeded"));
+  res = await runJob("backup", {});
+  check("a network failure is reported", res.ok === false && /network down/.test(res.error));
+  freed("network failure");
+
+  // 6. the status endpoint failing exactly POLL_MAX_STATUS_FAILURES times in a row
+  reset(ACCEPTED, () => { throw new Error("status gone"); });
+  res = await runJob("backup_restore", { backup: "a", confirm: true });
+  check("a lost status endpoint reports not-ok", res.ok === false);
+  check("it bails out after POLL_MAX_STATUS_FAILURES tries",
+        statusCalls === POLL_MAX_STATUS_FAILURES);
+  check("the message says the job may still be running", /may still be running/.test(res.error));
+  check("the message does NOT claim the job failed", !/failed/.test(res.error));
+  check("the message names the job id", res.error.indexOf("job-7") !== -1);
+  freed("status unreachable");
+
+  // 6b. a run of failures that recovers is not a bail-out: the counter resets
+  let fails = POLL_MAX_STATUS_FAILURES - 1;
+  reset(ACCEPTED, () => {
+    if (fails-- > 0) throw new Error("transient");
+    return json(200, { ok: true, data: { state: "succeeded", exit_code: 0 } });
+  });
+  res = await runJob("backup", {});
+  check("a recovered run of status failures still succeeds", res.ok === true);
+  freed("recovered status failures");
+
+  // 7. the poll running out: bounded, and the wording is "we stopped watching"
+  reset(ACCEPTED, ended("running"));
+  res = await runJob("backup_import", { staged: "a" });
+  check("an expired poll reports not-ok", res.ok === false);
+  check("it polls exactly POLL_MAX_ATTEMPTS times", statusCalls === POLL_MAX_ATTEMPTS);
+  check("it never polls more than POLL_MAX_ATTEMPTS times", statusCalls <= POLL_MAX_ATTEMPTS);
+  check("it slept between attempts, not before the first",
+        slept === POLL_MAX_ATTEMPTS - 1);
+  check("the expiry says this page stopped polling", /stopped polling/.test(res.error));
+  check("the expiry says the job is unaffected", /unaffected/.test(res.error));
+  freed("expired poll");
+
+  // 8. a status reply with no data at all is a status failure, not a crash
+  reset(ACCEPTED, () => json(200, { ok: true }));
+  res = await runJob("backup", {});
+  check("a data-less status reply ends as unreachable", res.ok === false);
+  check("...after the same bounded run of failures", statusCalls === POLL_MAX_STATUS_FAILURES);
+  freed("data-less status");
+
+  console.log(failures === 0 ? "OK" : "FAIL");
+})();
+EOF
+  job_out="$(node "$JOB_JS" 2>&1)"
+  assert_eq "$job_out" "OK" \
+    "runJob()/pollJob() re-enable the panel on every outcome and keep the poll bounded"
+
+  # --- node: the two read endpoints' failure shapes -------------------------
+  # do_GET answers a read-endpoint failure as HTTP 200 with ok:false, while a
+  # handler exception is a 500 (and a proxy in front of us can answer JSON with no
+  # `ok` at all). Both terms of `!res.ok || !json || json.ok===false` are load
+  # bearing, and dropping either one used to pass.
+  READ_JS="$WORK/read-endpoints.js"
+  {
+    grep '^let MAX_UPLOAD_BYTES' "$PAGE"
+    js_block "$PAGE" '^function errText' '^}'
+    js_block "$PAGE" '^async function loadArchives' '^}'
+    js_block "$PAGE" '^async function loadSchedule' '^}'
+  } > "$READ_JS"
+  cat >> "$READ_JS" <<'EOF'
+
+let failures = 0;
+function check(desc, cond) { if (!cond) { failures++; console.log("FAIL: " + desc); } }
+
+let rendered = [], filled = [], status = [], synced = 0;
+function renderArchives(list) { rendered.push(list); }
+function fillSchedule(data) { filled.push(data); }
+function setStatus(id, message, empty) { status.push({ id: id, message: message, empty: empty }); }
+function syncImport() { synced++; }
+const ROOT = { _text: "", children: [], append(...k) { for (const x of k) this.children.push(x); } };
+Object.defineProperty(ROOT, "textContent", {
+  get() { return ROOT._text; },
+  set(v) { ROOT._text = String(v); ROOT.children = []; },
+});
+function el(id) { return id === "archives" ? ROOT : null; }
+global.document = {
+  createElement: () => {
+    const n = { _text: "", className: "" };
+    Object.defineProperty(n, "textContent", { get() { return n._text; }, set(v) { n._text = String(v); } });
+    return n;
+  },
+};
+let responder = null;
+global.fetch = async () => responder();
+function json(status, body) {
+  return { status: status, ok: status >= 200 && status < 300, json: async () => body };
+}
+function reset(r) {
+  rendered = []; filled = []; status = []; synced = 0;
+  ROOT.textContent = ""; responder = r;
+}
+function shown() { return ROOT.children.length ? String(ROOT.children[0]._text) : ""; }
+
+(async () => {
+  // --- loadArchives ------------------------------------------------------
+  reset(() => json(200, { ok: true, data: [{ name: "a" }] }));
+  await loadArchives();
+  check("a good listing is rendered", rendered.length === 1 && rendered[0].length === 1);
+
+  // HTTP 200 with ok:false — how do_GET reports a *tool* failure. Only the
+  // json.ok===false term catches this.
+  reset(() => json(200, { ok: false, error: "palworld-backups exited 1: nope" }));
+  await loadArchives();
+  check("a 200 ok:false listing is NOT rendered", rendered.length === 0);
+  check("the 200 ok:false error is shown verbatim",
+        shown().indexOf("palworld-backups exited 1: nope") !== -1);
+  check("the failed listing is left empty, not stale", ROOT.children.length === 1);
+
+  // A 500/502 whose body carries no `ok` at all (a handler exception, or a proxy's
+  // own JSON error page). Only the !res.ok term catches this.
+  reset(() => json(502, { message: "bad gateway" }));
+  await loadArchives();
+  check("a 502 without ok:false is NOT rendered", rendered.length === 0);
+  check("the 502 is named in the message", /502/.test(shown()));
+
+  reset(() => json(500, { ok: false, error: "internal error: boom" }));
+  await loadArchives();
+  check("a 500 listing is not rendered", rendered.length === 0);
+  check("the 500's error is shown", shown().indexOf("internal error: boom") !== -1);
+
+  reset(() => ({ status: 200, ok: true, json: async () => { throw new Error("not json"); } }));
+  await loadArchives();
+  check("an unparseable listing is not rendered", rendered.length === 0);
+  check("an unparseable listing still says something", shown().length > 0);
+
+  reset(() => { throw new Error("network down"); });
+  await loadArchives();
+  check("a network failure is reported in the list region", /network down/.test(shown()));
+
+  // --- loadSchedule ------------------------------------------------------
+  reset(() => json(200, { ok: true, data: { BACKUP_ENABLED: true }, max_upload_bytes: 12345 }));
+  await loadSchedule();
+  check("a good schedule fills the form", filled.length === 1);
+  check("the upload ceiling is picked up from the envelope", MAX_UPLOAD_BYTES === 12345);
+  check("learning the ceiling re-syncs the import card", synced === 1);
+  check("the success message names the next tick",
+        /next tick/.test(status[status.length - 1].message));
+
+  reset(() => json(200, { ok: false, error: "palworld-backups exited 2: bad schedule" }));
+  await loadSchedule();
+  check("a 200 ok:false schedule does not fill the form", filled.length === 0);
+  check("the 200 ok:false schedule error is shown",
+        status[status.length - 1].message.indexOf("bad schedule") !== -1);
+
+  reset(() => json(502, { message: "bad gateway" }));
+  await loadSchedule();
+  check("a 502 schedule does not fill the form", filled.length === 0);
+  check("the 502 is named", /502/.test(status[status.length - 1].message));
+
+  // ok:true but no data at all: there is nothing to fill from.
+  reset(() => json(200, { ok: true }));
+  await loadSchedule();
+  check("a data-less schedule does not fill the form", filled.length === 0);
+
+  // The two shapes that isolate the other terms of the same condition, because
+  // `!json.data` alone would otherwise carry every case above and both of the
+  // others could be deleted unnoticed. Neither is a shape this server produces
+  // today; both are shapes the page must not believe. An envelope that says it
+  // failed must not be read for its data, and a transport that says 500 must not
+  // be overridden by a body that looks fine — that is how a stale or foreign
+  // payload becomes the schedule the operator then saves back.
+  reset(() => json(200, { ok: false, error: "refused", data: { BACKUP_INTERVAL_HOURS: 99 } }));
+  await loadSchedule();
+  check("ok:false is honoured even when data is present", filled.length === 0);
+  check("...and the error is shown", /refused/.test(status[status.length - 1].message));
+  reset(() => json(500, { ok: true, data: { BACKUP_INTERVAL_HOURS: 99 } }));
+  await loadSchedule();
+  check("a 500 is honoured even when the body looks fine", filled.length === 0);
+  check("...and the status is named", /500/.test(status[status.length - 1].message));
+
+  reset(() => { throw new Error("network down"); });
+  await loadSchedule();
+  check("a network failure is reported in the schedule card",
+        /network down/.test(status[status.length - 1].message));
+  check("a failed schedule read does not invent a ceiling", MAX_UPLOAD_BYTES === 12345);
+
+  console.log(failures === 0 ? "OK" : "FAIL");
+})();
+EOF
+  read_out="$(node "$READ_JS" 2>&1)"
+  assert_eq "$read_out" "OK" \
+    "loadArchives()/loadSchedule() refuse both failure shapes and pick up the upload ceiling"
+
+  # --- node: an over-cap file is refused locally, before any request --------
+  # The server answers an over-cap upload 413 without reading the body and closes
+  # the connection, so a browser still streaming a 3 GiB file may only ever show
+  # "Failed to fetch". The page refuses it itself, naming both sizes.
+  CAP_JS="$WORK/upload-cap.js"
+  {
+    grep '^const ARCHIVE_RE' "$PAGE"
+    grep '^let MAX_UPLOAD_BYTES' "$PAGE"
+    js_block "$PAGE" '^function formatBytes' '^}'
+    js_block "$PAGE" '^function selectedFile' '^}'
+    js_block "$PAGE" '^function overCap' '^}'
+    js_block "$PAGE" '^function syncImport' '^}'
+    js_block "$PAGE" '^async function importArchive' '^}'
+  } > "$CAP_JS"
+  cat >> "$CAP_JS" <<'EOF'
+
+let failures = 0;
+function check(desc, cond) { if (!cond) { failures++; console.log("FAIL: " + desc); } }
+
+let status = [], uploads = [], jobs = [], logs = [];
+const BTN = { disabled: false };
+let FILES = [];
+function el(id) { return id === "btn-upload" ? BTN : { files: FILES }; }
+function setStatus(id, message, empty) { status.push({ id: id, message: message, empty: empty }); }
+function log(l) { logs.push(String(l)); }
+async function stageUpload(file) { uploads.push(file); return { ok: true, staged: file.name }; }
+async function runJob(action, params) { jobs.push({ action: action, params: params }); return { ok: true }; }
+async function loadArchives() {}
+function pick(size) {
+  FILES = [{ name: "palworld-save-20260101T000000Z.tar.gz", size: size }];
+  status = []; uploads = []; jobs = []; logs = []; BTN.disabled = false;
+}
+function last() { return status[status.length - 1].message; }
+
+(async () => {
+  // With no ceiling known yet the server stays the authority: nothing is refused.
+  MAX_UPLOAD_BYTES = null;
+  pick(3 * 1024 * 1024 * 1024);
+  syncImport();
+  check("an unknown ceiling refuses nothing", BTN.disabled === false);
+  await importArchive();
+  check("an unknown ceiling still uploads", uploads.length === 1);
+
+  MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024;
+  pick(MAX_UPLOAD_BYTES);
+  syncImport();
+  check("a file exactly at the ceiling is allowed", BTN.disabled === false);
+  check("...and says it is ready", /ready to upload/.test(last()));
+
+  pick(MAX_UPLOAD_BYTES + 1);
+  syncImport();
+  check("one byte over the ceiling disables Upload", BTN.disabled === true);
+  check("the refusal names the file's size", last().indexOf("2147483649 bytes") !== -1);
+  check("the refusal names the limit", last().indexOf("2147483648 bytes") !== -1);
+  check("the refusal says nothing was sent", /nothing was sent/.test(last()));
+  check("the refusal is not styled as an empty placeholder",
+        status[status.length - 1].empty === false);
+
+  // ...and Upload and import, if it is somehow reached, sends nothing at all.
+  pick(MAX_UPLOAD_BYTES + 1);
+  await importArchive();
+  check("an over-cap import uploads nothing", uploads.length === 0);
+  check("an over-cap import enqueues no job", jobs.length === 0);
+  check("an over-cap import explains itself", /at most/.test(last()));
+
+  // A bad name is still refused first, and by name rather than by size.
+  FILES = [{ name: "evil.tar.gz", size: 10 }];
+  status = []; uploads = []; jobs = [];
+  await importArchive();
+  check("a bad name is still refused before anything is sent", uploads.length === 0);
+  check("the bad-name refusal is about the name", /palworld-save-/.test(last()));
+
+  console.log(failures === 0 ? "OK" : "FAIL");
+})();
+EOF
+  cap_out="$(node "$CAP_JS" 2>&1)"
+  assert_eq "$cap_out" "OK" "an over-cap file is refused in the browser, naming both sizes"
 elif [ -n "${CI:-}" ]; then
-  # These three are the only checks that execute the page's own code. Silently
-  # skipping them when a runner image changes would delete the panel's behavioural
-  # coverage — the three-step delete above all — without anyone noticing.
-  fail "node is required in CI to execute the Backups page's delete flow, renderer and schedule form"
+  # These are the only checks that execute the page's own code. Silently skipping
+  # them when a runner image changes would delete the panel's behavioural coverage —
+  # the three-step delete, the focus of every confirmation dialog and runJob's
+  # re-enabling of the controls above all — without anyone noticing.
+  fail "node is required in CI to execute the Backups page's delete flow, renderer, schedule form, confirmation focus, job runner, read endpoints and upload cap"
 else
   echo "  (skipping the node checks of the Backups page: node not found)" >&2
 fi
