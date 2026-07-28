@@ -64,7 +64,8 @@ in two halves: `palwarden-webui` (unprivileged, parses HTTP, only ever *queues* 
 job) and `palwarden-jobd` (root, re-validates each job against its own allowlist
 and runs it). World saves get the same treatment on their own page: archives are
 taken on a schedule (`palworld-backup-auto.timer`, whose interval and retention
-live in `/etc/palworld/backup.env` and are editable from the browser), and can be
+live in `/etc/palworld/backup.env` — `/var/lib/palworld/backup.env` in the
+container — and are editable from the browser), and can be
 downloaded, uploaded back, restored over the live world and deleted from there —
 each of those a job root runs, never something the web process does itself.
 
@@ -87,6 +88,15 @@ diagram and file/directory map.
   cd docker && cp .env.example .env
   COMPOSE_PROFILES=embedded docker compose up -d --build
   ```
+
+  > [!WARNING]
+  > **Already running a stack from before the backups volume? Do not run that
+  > `up` yet.** World-save archives, config snapshots and config backups used to
+  > live in the container's writable layer; the first `up` on the new image
+  > deletes that layer and mounts empty volumes over those paths, so **every
+  > existing archive is lost**. Copy them out of the old container first —
+  > [`docker/README.md`](docker/README.md#upgrading-from-a-pre-volume-image-do-this-before-the-first-up)
+  > has the recipe. Fresh installs are unaffected.
 
 ---
 
@@ -169,7 +179,7 @@ the repository (see `.gitignore`). Create them on the host:
 | `/var/lib/palworld/metrics.sqlite3` | FPS/player telemetry + event markers. |
 | `/var/lib/palworld/jobs/` | The control plane's job queue (mode 0700). Owned by the **service account**, not root, by design: the unprivileged web UI writes job files here and `palwarden-jobd` only reads and updates them. |
 | `/var/lib/palworld/uploads/` | Upload staging for the Backups page (mode 0700). Service-account-owned for the same reason the queue is — the web UI is its only writer. |
-| `/etc/palworld/backup.env` | Scheduled-backup settings (enabled, interval, retention, minimum kept). Live state, not just a template: the Backups page rewrites it, so `install.sh` never overwrites an existing copy. A commented template ships in `config/backup.env`. |
+| `/etc/palworld/backup.env` | Scheduled-backup settings (enabled, interval, retention, minimum kept). Live state, not just a template: the Backups page rewrites it, so `install.sh` never overwrites an existing copy. A commented template ships in `config/backup.env`. The **container** keeps this at `/var/lib/palworld/backup.env` instead (`PALWORLD_BACKUP_SCHEDULE`), because `/etc/palworld` is not persisted there. |
 
 The Palworld REST API authenticates with **`ADMIN_PASSWORD`**, not
 `SERVER_PASSWORD`. If `ADMIN_PASSWORD` is blank in the live config, the API
@@ -191,7 +201,10 @@ helpers cannot authenticate.
   the service account and are therefore writable by the unprivileged web process.
   Moving it under `/var/lib/palworld` (which that account owns) would let a
   substituted archive be restored while reporting success. Both installers create
-  it correctly; the tool refuses to run if it is not.
+  it correctly; the tool checks the directory **and every ancestor** and refuses
+  otherwise — which is why `/opt/palworld` itself must stay `root:root`, and why a
+  `chown -R` over it breaks every restore
+  ([runbook](docs/palworld-service-runbook.md) §3 and §15).
 - **`WEBUI_PASSWORD` is printed once, at generation, and is not recoverable.**
   To rotate it (or `WEBUI_TOKEN`), edit `/etc/palworld/webui.env` as root,
   `systemctl restart palworld-config-webui.service`, and reload the browser tab —

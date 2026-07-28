@@ -155,7 +155,12 @@ Scheduled backups are a third path that involves neither: `palworld-backups
 --if-due --prune`, run as root on a short fixed tick by
 `palworld-backup-auto.timer` or the container's `backup-auto` service. The
 *schedule* is a file the panel writes through `backup_schedule_save`, so the web
-process never has to be given control of a timer.
+process never has to be given control of a timer. That file is
+`/etc/palworld/backup.env` on bare metal and `/var/lib/palworld/backup.env` in the
+container (`PALWORLD_BACKUP_SCHEDULE`): it holds operator state the panel rewrites,
+so on each platform it has to live somewhere that survives a restart of the
+tooling — in the container that means the `palwarden-state` volume, because
+`/etc/palworld` there is re-rendered into the writable layer.
 
 **Why the two new directories have opposite ownership.** This is the panel's whole
 security argument, and getting either one backwards is silent on the happy path:
@@ -191,7 +196,7 @@ Ordinary recovery procedures — a failed restore, changing the schedule — are
 | `/opt/palworld/config-backups` | `palworld` | Timestamped `PalWorldSettings.ini` / `Engine.ini` backups. |
 | `/opt/palworld/config-snapshots` | `root` (0755) | Labeled config+state snapshots. Root-owned deliberately — see the note below. |
 | `/etc/palworld` | mixed | `settings.env`, `notify.env`, `engine.env`, templates. |
-| `/var/lib/palworld` | root/palworld | `metrics.sqlite3`, `public-info.env`, `service-events.json` (last observed service state). |
+| `/var/lib/palworld` | root/palworld | `metrics.sqlite3`, `public-info.env`, `service-events.json` (last observed service state), and in the container `backup.env` (the schedule; `/etc/palworld/backup.env` on bare metal). |
 | `/var/lib/palworld/jobs` | `palworld` (0700) | Control-plane job queue: `<id>.json` per job. Written by the web UI, executed by `palwarden-jobd`. |
 | `/var/lib/palworld/uploads` | `palworld` (0700) | Upload staging for the backup panel. Written by the web UI, read (and emptied) by `palworld-restore --import`. |
 | `/opt/palworld/restore-scratch` | `root` (0700) | Where `palworld-restore` copies an archive to validate it. Root-owned *and* under a root-owned parent — see below. |
@@ -201,8 +206,10 @@ Ordinary recovery procedures — a failed restore, changing the schedule — are
 
 **Why `backups` and `config-snapshots` are root-owned.** Only root ever writes
 them — `palwarden-jobd`'s `backup` and `snapshot_create` actions, the timers, or a
-hand-run command. The web UI only *lists* them, which `0755` already permits, and
-nothing prunes them. When they were service-account-owned, the unprivileged web
+hand-run command. The web UI only *lists* them, which `0755` already permits;
+world-save archives are pruned by `palworld-backups --prune` (also root, from the
+scheduled tick), while `config-snapshots` still has no retention at all. When they
+were service-account-owned, the unprivileged web
 process could rename a directory root had just created and drop a symlink in its
 place, redirecting root's writes — and its `chown` — anywhere on the filesystem.
 `config-backups` stays service-account-owned because `palworld-engine-config

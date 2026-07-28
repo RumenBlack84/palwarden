@@ -34,7 +34,9 @@ from `PALWARDEN_MODE` + config:
 
 `backup-auto` is enabled on every embedded boot and is **not** gated on a
 `BACKUP_*` variable: whether a backup actually happens is decided per tick by
-`palworld-backups`, from `/etc/palworld/backup.env`. That is what lets the Backups
+`palworld-backups`, from **`/var/lib/palworld/backup.env`** (the `palwarden-state`
+volume — the bare-metal default is `/etc/palworld/backup.env`, which is not
+persisted here). That is what lets the Backups
 page switch scheduled backups off and on with nothing to restart. It runs as root
 because `/opt/palworld/backups` is root-owned and the tool reads the whole world
 tree. `BACKUP_TICK_SECONDS` (default 900) is the tick, not the backup interval.
@@ -147,18 +149,24 @@ container.
 
 ## Quick start — embedded (self-contained server)
 
+> [!WARNING]
+> **Upgrading an existing stack from a release before the backups volume? STOP —
+> do this first.** Those releases kept `/opt/palworld/backups`,
+> `/opt/palworld/config-snapshots` and `/opt/palworld/config-backups` in the
+> container's **writable layer**. The first `up` on the new image recreates the
+> container, deletes that layer, and mounts empty volumes in its place: **every
+> existing archive and snapshot is gone**, with nothing left to recover from once
+> the old container is removed. Copy them out **before** you run any `up`,
+> `down` or `--force-recreate` — see
+> [Upgrading from a pre-volume image](#upgrading-from-a-pre-volume-image-do-this-before-the-first-up).
+> A fresh install is unaffected.
+
 ```bash
 cd docker
 cp .env.example .env          # set ADMIN_PASSWORD (+ DISCORD_WEBHOOK) if wanted
 COMPOSE_PROFILES=embedded docker compose up -d --build
 docker compose logs -f palwarden
 ```
-
-> **Upgrading an existing stack from a release before the backups volume?** Copy
-> `/opt/palworld/backups` out of the **old** container *before* the first `up` —
-> a recreate deletes the writable layer those archives were in and replaces it
-> with an empty volume. See
-> [Upgrading from a pre-volume image](#upgrading-from-a-pre-volume-image-do-this-before-the-first-up).
 
 Players connect on `UDP 8211`. Stop gracefully with
 `docker compose down` (server saves via SIGINT).
@@ -198,7 +206,7 @@ never the public Internet).
 |--------|-----------|-------|
 | `palworld-server` | `/opt/palworld/server` | Game install (embedded) |
 | `palworld-saved` | `/opt/palworld/server/Pal/Saved` | Worlds + config (embedded) |
-| `palwarden-state` | `/var/lib/palworld` | `metrics.sqlite3` telemetry, the job queue, upload staging (both modes) |
+| `palwarden-state` | `/var/lib/palworld` | `metrics.sqlite3` telemetry, the job queue, upload staging, `backup.env` (the backup schedule) (both modes) |
 | `palwarden-backups` | `/opt/palworld/backups` | World-save archives (embedded) |
 | `palwarden-config-snapshots` | `/opt/palworld/config-snapshots` | Config snapshots / rollback material (embedded) |
 | `palwarden-config-backups` | `/opt/palworld/config-backups` | `Engine.ini` pre-rollback copies (embedded) |
@@ -213,11 +221,16 @@ runtime `chown`. `docker compose down -v` deletes your backups along with
 everything else; copy them off the host (the Backups page's download button, or
 `docker cp`) before you do that.
 
-**`/opt/palworld` as a whole is *not* persisted** — only the three paths named in
+**`/opt/palworld` as a whole is *not* persisted** — only the paths named in
 the table above are. `/opt/palworld/restore-scratch` and `/opt/palworld/tools`
 live in the writable layer and are recreated on every start, which is correct:
-the scratch directory holds one archive for the duration of a single import and
-the web root ships in the image. The two config directories got volumes of their
+the web root ships in the image, and the scratch directory holds one archive only
+for the duration of a single **`palworld-restore --restore`** (not `--import`,
+which copies into the backups volume). It does mean a restore needs room for a
+whole compressed archive — up to `PALWARDEN_RESTORE_MAX_BYTES`, **8 GiB** — in the
+container's **unvolumed writable layer**, i.e. in Docker's storage, not on any
+volume you sized for saves. The copy is deleted on both success and failure. The
+two config directories got volumes of their
 own because they are recovery material with the same exposure as the backups —
 `config-snapshots` is what you roll a bad config change back from, and a recreate
 is exactly when you want it.
@@ -239,23 +252,32 @@ While the **old** container still exists (before any `up`, `down` or
 ```bash
 cd docker
 docker compose cp palwarden:/opt/palworld/backups ./backups-migrate
-docker compose cp palwarden:/opt/palworld/config-snapshots ./snapshots-migrate   # optional
+docker compose cp palwarden:/opt/palworld/config-snapshots ./snapshots-migrate
+docker compose cp palwarden:/opt/palworld/config-backups ./config-backups-migrate
 ```
 
-Then bring the new image up and copy the archives back into the volume:
+Then bring the new image up and copy everything back into the volumes:
 
 ```bash
 COMPOSE_PROFILES=embedded docker compose up -d --build
 docker compose cp ./backups-migrate/. palwarden:/opt/palworld/backups
-docker compose exec palwarden chown -R root:root /opt/palworld/backups
-docker compose exec palwarden chown steam:steam /opt/palworld/backups/palworld-save-*.tar.gz
-docker compose exec palwarden ls -l /opt/palworld/backups     # dir root 0755, files steam
+docker compose cp ./snapshots-migrate/. palwarden:/opt/palworld/config-snapshots
+docker compose cp ./config-backups-migrate/. palwarden:/opt/palworld/config-backups
+docker compose exec palwarden chown root:root /opt/palworld/backups
+docker compose exec palwarden chmod 0755 /opt/palworld/backups
+docker compose exec palwarden stat -c '%U %G %a %n' /opt/palworld/backups   # root root 755
 ```
 
-The ownership matters: the directory must stay **root-owned `0755`** (that is
-what stops the unprivileged web process substituting an archive) and the archives
-themselves are handed to `steam`. `palworld-restore` refuses outright if that is
-wrong, so a mistake here is a clean refusal rather than a bad restore.
+Only the **directory's** ownership matters: root-owned `0755` is what stops the
+unprivileged web process substituting an archive, and `palworld-restore` refuses
+outright when it is wrong, so a mistake there is a clean refusal rather than a bad
+restore. Do **not** check the archives themselves against one owner — the mix is
+by design. `palworld-backup` hands each archive it writes to `steam`, while an
+archive promoted by `palworld-restore --import` is left `root:root 0644`; both
+download, prune and restore identically, because every reader either runs as root
+or only needs the world-readable bit. The three destination directories are
+pre-created with the right ownership in the image, so a fresh volume inherits it —
+copy files *into* them, and never recursively `chown` a mounted volume.
 
 If you have already upgraded and the archives are gone, the container says so on
 start: `WARNING: /opt/palworld/backups is empty but this world already has
@@ -284,11 +306,33 @@ saves`.
 `BACKUP_INTERVAL_HOURS`, `BACKUP_RETENTION_DAYS`, `BACKUP_KEEP_MIN`,
 `BACKUP_TICK_SECONDS`.
 
-The four `BACKUP_*` schedule variables **seed `/etc/palworld/backup.env` on the
-first start only**. The Backups page rewrites that file when the operator saves
-the schedule form, so re-rendering it on every start would revert their change;
+The four `BACKUP_*` schedule variables **seed `/var/lib/palworld/backup.env` if it
+does not exist yet**. The Backups page rewrites that file when the operator saves
+the schedule form, so re-rendering it on every start would revert their change —
+and the file is on the `palwarden-state` volume rather than in `/etc/palworld`
+(which is *not* persisted here) for exactly that reason: on the writable layer, a
+recreate reverted the saved schedule and the next prune then ran with the reverted
+retention. `PALWORLD_BACKUP_SCHEDULE` names the path; the bare-metal default is
+`/etc/palworld/backup.env`, which is genuinely persistent on a real host.
 `BACKUP_TICK_SECONDS` is read from the environment on every start because it is
 this container's tick, not part of the schedule.
+
+Coming from a release that kept the schedule in `/etc/palworld`: the entrypoint
+copies an existing `/etc/palworld/backup.env` onto the volume once (before it would
+seed a new one) and logs that it did — which covers the case where `/etc/palworld`
+was bind-mounted or otherwise survived. A schedule that only ever lived in the
+writable layer is deleted with it by the recreate, and the file is re-seeded from
+the `BACKUP_*` values in your `.env`; check it with
+`docker compose exec palwarden palworld-backups --show-schedule` after upgrading.
+That reverting-schedule bug is exactly why the file moved.
+
+To re-seed from `.env`, delete the file and restart the stack:
+
+```bash
+docker compose exec palwarden rm /var/lib/palworld/backup.env
+docker compose restart palwarden
+docker compose exec palwarden palworld-backups --show-schedule   # what the tick will do
+```
 
 ## Image internals
 

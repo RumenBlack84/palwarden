@@ -100,8 +100,18 @@ sudo id -u palworld >/dev/null 2>&1 || \
     palworld
 
 sudo mkdir -p /opt/palworld /opt/palworld/Steam /var/log/palworld
-sudo chown -R palworld:palworld /opt/palworld /var/log/palworld
+sudo chown -R palworld:palworld /opt/palworld/Steam /var/log/palworld
 ```
+
+`/opt/palworld` itself stays **`root:root`**, and the `chown -R` is deliberately
+narrowed to `Steam` (SteamCMD's own state) rather than the whole tree. Several
+directories under it are root-owned on purpose — `backups`, `config-snapshots`,
+and above all `restore-scratch`, whose *parent chain* `palworld-restore` verifies.
+Handing `/opt/palworld` to the service account makes **every restore refuse** with
+`the restore scratch parent /opt/palworld is owned by uid <n> ... refusing`.
+`install.sh` repairs it on its next run (`install -d` re-applies owner and mode),
+but do not create the problem. Ownership per directory is in
+[`architecture.md`](architecture.md#data--state-directories).
 
 ### Docker/Podman note
 
@@ -717,17 +727,22 @@ cd docker
 # 1. while the OLD container still exists:
 docker compose cp palwarden:/opt/palworld/backups ./backups-migrate
 docker compose cp palwarden:/opt/palworld/config-snapshots ./snapshots-migrate
-# 2. bring the new image up, then copy back into the volume:
+docker compose cp palwarden:/opt/palworld/config-backups ./config-backups-migrate
+# 2. bring the new image up, then copy back into the volumes:
 COMPOSE_PROFILES=embedded docker compose up -d --build
 docker compose cp ./backups-migrate/. palwarden:/opt/palworld/backups
-docker compose exec palwarden chown -R root:root /opt/palworld/backups
-docker compose exec palwarden chown steam:steam /opt/palworld/backups/palworld-save-*.tar.gz
-docker compose exec palwarden ls -l /opt/palworld/backups   # dir root 0755, files steam
+docker compose cp ./snapshots-migrate/. palwarden:/opt/palworld/config-snapshots
+docker compose cp ./config-backups-migrate/. palwarden:/opt/palworld/config-backups
+docker compose exec palwarden chown root:root /opt/palworld/backups
+docker compose exec palwarden chmod 0755 /opt/palworld/backups
+docker compose exec palwarden stat -c '%U %G %a %n' /opt/palworld/backups   # root root 755
 ```
 
-The directory must end up **root-owned `0755`** with the archives owned by the
-service account — that split is what stops the unprivileged web process
-substituting an archive, and `palworld-restore` refuses outright when it is wrong.
+The **directory** must end up root-owned `0755` — that is what stops the
+unprivileged web process substituting an archive, and `palworld-restore` refuses
+outright when it is wrong. Do not check the archives against a single owner: ones
+`palworld-backup` wrote are `steam`-owned, ones `palworld-restore --import`
+promoted are `root:root 0644`, and both restore fine.
 
 If the upgrade already happened, the entrypoint says so on every start:
 `WARNING: /opt/palworld/backups is empty but this world already has saves`. It is
@@ -740,7 +755,9 @@ and `install.sh` never removes it.
 
 ### Changing the schedule or retention
 
-The schedule is a **file**, not a unit: `/etc/palworld/backup.env`. The timer
+The schedule is a **file**, not a unit: `/etc/palworld/backup.env` on bare metal,
+`/var/lib/palworld/backup.env` in the container (`/etc/palworld` is not persisted
+there, so a schedule kept in it was reverted by every recreate). The timer
 (`palworld-backup-auto.timer`, or the container's `backup-auto` service) fires on a
 short fixed tick and `palworld-backups` decides whether anything is due. So nothing
 needs a reload after a change.
@@ -750,6 +767,10 @@ needs a reload after a change.
 # or by hand:
 sudo $EDITOR /etc/palworld/backup.env
 palworld-backups --show-schedule      # what the tick will actually do
+
+# container: use the Backups page, or read the file and copy an edited one back
+docker compose exec palwarden cat /var/lib/palworld/backup.env
+docker compose exec palwarden palworld-backups --show-schedule
 ```
 
 `--show-schedule` is the authority, and it is worth reading after an edit: a bad
@@ -773,6 +794,78 @@ Retention deletes by **age** (`BACKUP_RETENTION_DAYS`), keeps the newest
 whatever the settings say. If the directory is growing anyway, it is usually
 because every restore also takes a pre-restore safety archive; those are ordinary
 backups and are pruned like any other.
+
+### Disaster recovery: take an archive off the host and bring it back
+
+This is the loop the panel exists for, and it is four steps in two sittings. The
+first two are the part you do *before* anything goes wrong.
+
+**1. Get an archive off the host.** Backups page → the archive's **Download** link
+(it streams the file to your browser and changes nothing), or from a shell:
+
+```bash
+# bare metal
+scp <host>:/opt/palworld/backups/palworld-save-<stamp>.tar.gz .
+# container
+docker compose cp palwarden:/opt/palworld/backups/palworld-save-<stamp>.tar.gz .
+```
+
+Keep the filename exactly as it is. Do not rename it, do not let a browser
+de-duplicate it to `...tar (1).gz`, and do not re-tar it.
+
+**2. On the rebuilt host, upload it back.** Install the tooling (and, in the
+container, bring the stack up) so the Backups page is reachable through the tunnel,
+then: **Import an archive** → choose the file → **Upload and import**. That one
+button does both halves — it streams the body into the staging directory
+(`POST /api/backups/upload`) and then queues the `backup_import` job that root
+runs. Importing restores nothing; the archive simply appears in the Archives list.
+
+By hand instead of by browser:
+
+```bash
+# stage it: the whole request body is the archive (no multipart), and the
+# endpoint needs a real Content-Length -- chunked is refused -- so -T, not
+# --data-binary, which would buffer gigabytes in curl.
+curl -sS -X POST -T palworld-save-<stamp>.tar.gz \
+  -u admin:"$WEBUI_PASSWORD" -H "X-Palwarden-Token: $WEBUI_TOKEN" \
+  -H 'Content-Type: application/octet-stream' \
+  -H 'X-Palwarden-Filename: palworld-save-<stamp>.tar.gz' \
+  http://127.0.0.1:8088/api/backups/upload      # 202 {"staged": "..."}
+
+# then promote it (this is what the backup_import job runs)
+sudo palworld-restore --import palworld-save-<stamp>.tar.gz   # prints the promoted path
+
+# or skip HTTP entirely: root can read a file you put in the staging dir yourself
+sudo cp palworld-save-<stamp>.tar.gz /var/lib/palworld/uploads/
+sudo palworld-restore --import palworld-save-<stamp>.tar.gz
+```
+
+**The failure you will hit first is a renamed archive.** Import is **round-trip
+only**: the name must be exactly `palworld-save-<8 digits>T<6 digits>Z.tar.gz`, and
+anything else is refused before a byte is read — by the page, by the upload
+endpoint (`400 X-Palwarden-Filename must be an archive name this project wrote
+(palworld-save-<UTC stamp>.tar.gz), not '...'`), and again by root:
+
+```text
+palworld-restore: 'worldsave.tar.gz' is not a name palworld-backup could have written; refused
+```
+
+Rename the file back to the stamp it was written with and it imports. This is
+**not** a migration tool: an arbitrary Palworld save, someone else's archive, or a
+tarball you rolled yourself will not be accepted no matter what you call it — every
+member must also sit under `SaveGames/` or `Config/`. To move a world in from
+outside, put the files in place under `Pal/Saved` by hand and take a
+`palworld-backup` of it.
+
+**3. Restore it.** Archives list → **Restore** on that row → confirm. Or
+`sudo palworld-restore --restore palworld-save-<stamp>.tar.gz`. On a fresh host
+with no `ADMIN_PASSWORD` set yet, expect the *successful* ending that could not
+confirm readiness — it keeps a full copy of the previous world beside the new one;
+see the exit-code table in [`tools.md`](tools.md#palworld-restore) and the cleanup
+note at the end of this section.
+
+**4. Then set the server up as usual** (`settings.env`, `ADMIN_PASSWORD`, apply,
+restart), and take a fresh backup once it is known good.
 
 ### Recovering from a failed or wrong restore
 
@@ -810,16 +903,34 @@ that could not be taken — nothing was touched at all. That is the design: the 
 world is only ever replaced by two `rename` calls after the new tree is fully
 extracted beside it.
 
-Two things to check when a restore keeps failing:
+Three things to check when a restore keeps failing — the **parent** matters as much
+as the directory, and it is the one most likely to be wrong:
 
 ```bash
 stat -c '%U %a' /opt/palworld/restore-scratch     # must be root 700
+stat -c '%U %a' /opt/palworld                     # must be root 755 (every ancestor is checked)
 stat -c '%U %a' /var/lib/palworld/uploads         # must be <service account> 700
 ```
 
-`palworld-restore` verifies the scratch directory and its whole parent chain and
-refuses otherwise, so a wrong owner here shows up as a clean refusal in the job
-output rather than as a bad restore. `--restore` is also **refused entirely in
+`palworld-restore` verifies the scratch directory **and its whole parent chain**
+and refuses otherwise, so a wrong owner here shows up as a clean refusal in the job
+output rather than as a bad restore. The three refusals read:
+
+```text
+the restore scratch directory /opt/palworld/restore-scratch is owned by uid 1000,
+  not by uid 0 that this tool runs as; refusing to stage a restore in a directory
+  another account can rewrite
+the restore scratch parent /opt/palworld is owned by uid 1000, which could rename
+  the scratch directory aside; refusing
+the restore scratch parent /opt/palworld is mode 0777 and so is writable by other
+  accounts, which could rename the scratch directory aside; refusing
+```
+
+The last two are what a `sudo chown -R palworld:palworld /opt/palworld` (or a
+world-writable ancestor) produces, and they refuse **every** restore, not just the
+one you tried. Fix the ownership — or simply re-run `sudo ./install.sh`, which
+re-applies `root:root 0755` to `/opt/palworld` and `root:root 0700` to
+`restore-scratch`. `--restore` is also **refused entirely in
 `PALWARDEN_MODE=external`**: the game runs on another host, so "is the server
 running?" has no truthful answer locally and the world could be replaced under a
 live server. Restore on the host that runs the server.

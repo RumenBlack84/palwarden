@@ -86,15 +86,22 @@ one ages out in the same tick. Pruning happens even when the create failed — a
 volume is the likeliest cause, and retention is what frees space for the next
 attempt. `--delete` and `--show-schedule` combine with nothing.
 
-The schedule lives in a **file** (`PALWORLD_BACKUP_SCHEDULE`, default
-`/etc/palworld/backup.env`), not in a unit, and the services fire on a short fixed
-tick that asks this tool whether anything is due. That is what lets one
-implementation serve systemd and s6, lets the interval be changed from the browser
-with nothing to reload, and lets a host that was powered off back up on the first
-tick after boot instead of missing a window. A bad value in that file is therefore
-**never fatal**: it warns on stderr and falls back to that key's default (the
-default, not the nearest bound — `BACKUP_RETENTION_DAYS=3560` where `356` was meant
-gives 14 days and a warning, not a silently accepted decade).
+The schedule lives in a **file** (`PALWORLD_BACKUP_SCHEDULE`), not in a unit, and
+the services fire on a short fixed tick that asks this tool whether anything is
+due. That is what lets one implementation serve systemd and s6, lets the interval
+be changed from the browser with nothing to reload, and lets a host that was
+powered off back up on the first tick after boot instead of missing a window. A bad
+value in that file is therefore **never fatal**: it warns on stderr and falls back
+to that key's default (the default, not the nearest bound —
+`BACKUP_RETENTION_DAYS=3560` where `356` was meant gives 14 days and a warning, not
+a silently accepted decade).
+
+The default is `/etc/palworld/backup.env`, which is where it stays on bare metal;
+**the container points the variable at `/var/lib/palworld/backup.env`** (its state
+volume) instead, because `/etc/palworld` there is rendered into the writable layer,
+so a `docker compose up` reverted a schedule the operator had saved and the next
+prune then applied the reverted retention. See
+[`../docker/README.md`](../docker/README.md).
 
 ### `palworld-restore`
 `/usr/local/sbin/palworld-restore {--import ARCHIVE | --restore ARCHIVE [--wait S] [--startup-timeout S]}`
@@ -133,10 +140,20 @@ or `Config/` — see [`palwarden_archive`](#libraries).
   REST readiness (`--startup-timeout`, default 180s — the same check
   `graceful-restart` uses).
 
-  The replaced tree is **deleted only on a confirmed startup**. If the start
-  fails, readiness times out, **or the REST API is not configured so readiness
-  cannot be verified at all**, it is kept and its path is printed alongside the
-  safety archive's name, so there are two routes back.
+  The replaced tree is **deleted only on a confirmed startup**, and the three
+  endings are distinct — two of them succeed:
+
+  | Ending | Exit | Replaced tree | Means |
+  |--------|:----:|---------------|-------|
+  | `started: ... the REST API is healthy.` | 0 | **deleted** | `palworld-api info` answered, so the world is restored *and* the server is confirmed up. The safety archive stays. |
+  | `readiness could NOT be verified` | 0 | **kept** | The REST API is not configured (`palworld-api` exit 2 — no `ADMIN_PASSWORD`, API disabled), so nothing could confirm the startup. The world **was** restored; the previous world stays at `Pal/Saved.replaced-<stamp>` precisely because the startup is unconfirmed. |
+  | `the startup is not confirmed` / start failed | 1 | **kept** | REST *was* configured and never became ready within `--startup-timeout`, or `systemctl start` failed. The world has already been replaced. |
+
+  The middle row is the normal ending of a disaster-recovery restore on a rebuilt
+  host, where nothing has set `ADMIN_PASSWORD` yet. It is a success, but it leaves
+  **a full second copy of the world** on disk (printed as `kept: ...`); remove it
+  by hand once the server is known good. Both keeping cases print the replaced
+  tree's path alongside the safety archive's name, so there are two routes back.
 
   The scratch dir lives under `/opt/palworld` and not next to the uploads dir
   because `/var/lib/palworld` is 0755 **service-account-owned** on both
@@ -156,7 +173,42 @@ and the world would be replaced underneath it. Stop and restore on the host that
 runs the server.
 
 Designed for disaster recovery, so it never assumes existing state: a missing or
-empty `Pal/Saved` and a server that is already down are both normal.
+empty `Pal/Saved` and a server that is already down are both normal. The operator
+procedure for the whole loop — download an archive off the host, upload it back,
+import, restore — is
+[`palworld-service-runbook.md`](palworld-service-runbook.md) §15.
+
+### Backup-family environment overrides
+
+Defaults are the installed bare-metal paths; the container overrides the ones it
+needs in `docker/compose.yaml` and `docker/entrypoint.sh`. All are read by `palworld-backup`,
+`palworld-backups`, `palworld-restore`, `palwarden-webui` or
+[`palwarden_archive`](#libraries) — one variable moves every tool that touches the
+same directory.
+
+| Variable | Default | What |
+|----------|---------|------|
+| `PALWARDEN_SAVE_BACKUP_DIR` | `/opt/palworld/backups` | The archives directory, root-owned `0755`. Moves the writer, the lister, the importer and the pruner together. (`PALWORLD_BACKUP_DIR` is a different thing — *config* backups.) |
+| `PALWARDEN_UPLOAD_DIR` | `/var/lib/palworld/uploads` | Upload staging, service-account-owned `0700`. |
+| `PALWARDEN_RESTORE_SCRATCH` | `/opt/palworld/restore-scratch` | The root-only `0700` scratch dir `--restore` validates from. Must be root-owned **under a root-owned parent**, or the restore refuses. |
+| `PALWORLD_BACKUP_SCHEDULE` | `/etc/palworld/backup.env` | The schedule file. `/var/lib/palworld/backup.env` in the container. |
+| `PALWORLD_SAVED_DIR` / `PALWORLD_INSTALL_DIR` | `/opt/palworld/server` + `/Pal/Saved` | The live world tree, resolved identically by `palworld-backup` and `palworld-restore`. A *set but empty* `PALWORLD_SAVED_DIR` is honoured. |
+| `PALWORLD_USER` / `PALWORLD_GROUP` | `palworld` (container: `steam`) | Who the restored tree is chowned to. An unresolvable name warns and leaves ownership alone rather than failing the restore. |
+| `PALWARDEN_IMPORT_MAX_BYTES` | 8 GiB | Ceiling on the *compressed* size one `--import` may promote. |
+| `PALWARDEN_IMPORT_FREE_HEADROOM` | 64 MiB | Free space required on the backups filesystem *beyond* the archive, so a promotion cannot leave `palworld-backup` no room. |
+| `PALWARDEN_RESTORE_MAX_BYTES` | 8 GiB | Ceiling on the compressed size copied into the scratch dir. |
+| `PALWARDEN_RESTORE_STARTUP_TIMEOUT` | 180 | Readiness bound after the restart, when `--startup-timeout` is not given. |
+| `PALWARDEN_RESTORE_POLL_SECONDS` | 3 | Readiness poll interval. |
+| `PALWARDEN_MODE` | *(unset)* | `embedded` / `external`, set by the compose stack. Unset on bare metal. `--restore` refuses in `external`. |
+
+A malformed or non-positive value for any of the byte/second limits is **ignored
+with the default used**, never treated as "no limit" or as zero
+([`palwarden_archive.env_int`](#libraries)).
+
+`PALWARDEN_SBIN_DIR`, `PALWARDEN_SYSTEMCTL_BIN`, `PALWARDEN_JOBD_BIN`,
+`PALWARDEN_PARSER_BIN`, `PALWARDEN_WEBUI_ENV` and `PALWARDEN_WEBUI_ROOT` exist so
+the suites can point a tool at stubs and so packaging can relocate it; they are
+**not operator knobs** and are not documented per-tool.
 
 ---
 
@@ -233,7 +285,9 @@ be running or queued actions never execute. See
 ### `palwarden-webui`
 `/usr/local/sbin/palwarden-webui {--serve|--init-credentials}`
 
-Serves the web UI and the JSON API on `127.0.0.1:8088`. **Every path requires
+Serves the web UI and the JSON API on `127.0.0.1:8088`
+(`PALWARDEN_WEBUI_BIND`/`PALWARDEN_WEBUI_PORT`; keep the bind loopback — see the
+tunnel note below). **Every path requires
 HTTP Basic auth**, including the vendored editor, using credentials in
 `/etc/palworld/webui.env` (`--init-credentials` generates them once, as root, and
 never overwrites an existing file; `install.sh` and the container entrypoint call
@@ -294,7 +348,11 @@ The bytes are streamed to `PALWARDEN_UPLOAD_DIR` (default
 process never unpacks or promotes an upload. Extra status codes: `413` over
 `PALWARDEN_MAX_UPLOAD_BYTES` (default 2 GiB) · `507` too little free space
 (`PALWARDEN_UPLOAD_FREE_MARGIN`, default 64 MiB, is kept free for the job queue and
-the telemetry DB). The upload path uses its own socket timeout
+the telemetry DB). That `413` is the **HTTP request** cap and is not the only one
+in the loop: root refuses to promote a staged file over `PALWARDEN_IMPORT_MAX_BYTES`
+(default 8 GiB, compressed) when the `backup_import` job runs, and neither is the
+decompression-bomb cap ([`palwarden_archive`](#libraries), on the *uncompressed*
+size). The upload path uses its own socket timeout
 (`PALWARDEN_UPLOAD_TIMEOUT`, default 600s) for that request only, because the
 10-second request timeout would abort a real upload mid-flight.
 
@@ -467,6 +525,24 @@ Installed to `/usr/local/lib`, not run directly.
   webhook. Silently no-ops if the file or webhook is missing, so every caller
   works with or without Discord. Callers also define a no-op fallback so they keep
   working when the helper itself isn't installed.
+- **`palwarden_archive`** — Python module (`palwarden_archive.py`) holding the
+  **one** copy of the world-save archive rules, imported by `palwarden-webui`,
+  `palwarden-jobd`, `palworld-backups` and `palworld-restore` so the name the web
+  process will stage and the name root will unpack cannot drift apart. Import is
+  **round-trip only**: `ARCHIVE_RE` accepts nothing but
+  `palworld-save-<8 digits>T<6 digits>Z.tar.gz`, and every member must be a plain
+  file or directory under `SaveGames/` or `Config/` — no absolute paths, no `..`,
+  no symlinks, hardlinks, devices or FIFOs; extraction additionally runs under
+  tarfile's `filter="data"`. Archives are opened `O_NOFOLLOW|O_NONBLOCK` and must
+  be regular files, so a symlink or a planted FIFO cannot choose what root reads
+  or block it forever. The **decompression-bomb caps** live here and are checked
+  while reading headers, before anything is written:
+  `PALWARDEN_ARCHIVE_MAX_MEMBERS` (default 200000 members) and
+  `PALWARDEN_ARCHIVE_MAX_BYTES` (default 20 GiB *uncompressed*) — distinct from
+  the compressed-size caps in
+  [Backup-family environment overrides](#backup-family-environment-overrides).
+  `env_int` is its public reader for all of them: a malformed or non-positive
+  override falls back to the default, so a typo can never lower a ceiling to zero.
 - **`palworld-config-diff`** — Python; prints a non-secret diff between two
   `PalWorldSettings.ini` files (`--discord` formats for chat). Redacts secret keys.
 - **`palworld-config-summary`** — Python; prints a summary of the
