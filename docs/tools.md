@@ -197,9 +197,19 @@ it for you). With no arguments it prints help and exits — the service uses
 
 Read endpoints (Basic auth is enough): `/api/health`, `/api/fps`, `/api/events`,
 `/api/service-events`, `/api/engine`, `/api/config` (passwords redacted),
-`/api/backups`, `/api/snapshots`, `/api/jobs`, `/api/jobs/<id>`, `/api/token`. A
-failing tool answers `200` with `{"ok": false, "error": ...}` rather than a `500`,
-so one broken tool cannot blank the dashboard.
+`/api/backups`, `/api/snapshots`, `/api/backup-schedule`, `/api/jobs`,
+`/api/jobs/<id>`, `/api/token`. A failing tool answers `200` with
+`{"ok": false, "error": ...}` rather than a `500`, so one broken tool cannot blank
+the dashboard. `/api/backups` lists only names matching the archive pattern, so a
+`palworld-restore --import` copy that is still in flight is never shown as a
+backup.
+
+`GET /api/backups/<name>/download` streams one archive
+(`Content-Type: application/gzip`, `Content-Disposition: attachment`,
+`Cache-Control: no-store`). Basic auth only — it is a read. The name must match
+`palworld-save-<UTC stamp>.tar.gz`; anything else, and anything that is not a
+regular file (a symlink or FIFO planted in the backups directory under a valid
+name), is `404`.
 
 `GET /api/token` returns `{"ok": true, "data": {"token": "..."}}` — the `WEBUI_TOKEN` value
 needed to mutate. The Engine.ini editor fetches it on first Save (cached in
@@ -224,6 +234,20 @@ actions additionally need `"confirm": true` in the body. Status codes: `401`
 bad/missing Basic · `403` missing/bad token or refused Origin · `400` validation
 failure · `409` a disruptive job is already queued or running (the body carries
 `blocked_by` with its `id`/`action`/`state`) · `500` internal.
+
+`POST /api/backups/upload` stages a world-save archive for a later `backup_import`
+job. Same gate as any mutation (Basic + `X-Palwarden-Token` + loopback
+`Origin`/`Sec-Fetch-Site`). The **whole request body is the archive** —
+`Content-Type: application/octet-stream`, no multipart — with the intended name in
+**`X-Palwarden-Filename`**, which must match `palworld-save-<UTC stamp>.tar.gz`.
+The bytes are streamed to `PALWARDEN_UPLOAD_DIR` (default
+`/var/lib/palworld/uploads`, created 0700) and nothing else happens to them: this
+process never unpacks or promotes an upload. Extra status codes: `413` over
+`PALWARDEN_MAX_UPLOAD_BYTES` (default 2 GiB) · `507` too little free space
+(`PALWARDEN_UPLOAD_FREE_MARGIN`, default 64 MiB, is kept free for the job queue and
+the telemetry DB). The upload path uses its own socket timeout
+(`PALWARDEN_UPLOAD_TIMEOUT`, default 600s) for that request only, because the
+10-second request timeout would abort a real upload mid-flight.
 
 ```bash
 # the token can be read out of webui.env, or simply fetched with Basic auth

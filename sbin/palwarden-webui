@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import errno
 import hmac
 import http.server
 import importlib.machinery
@@ -52,6 +53,11 @@ from pathlib import Path
 sys.path.insert(0, "/usr/local/lib")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import palwarden_jobs as jobs  # noqa: E402
+# The archive rules live in one module for the same reason the job validators do:
+# this process decides which *names* it will stage, download and list, and root
+# (palworld-restore, palwarden-jobd) decides the same thing again about the same
+# bytes. Two copies of ARCHIVE_RE would drift and only one would get the next fix.
+import palwarden_archive as archive  # noqa: E402
 
 WEBUI_ENV = Path(os.environ.get("PALWARDEN_WEBUI_ENV", "/etc/palworld/webui.env"))
 
@@ -74,6 +80,11 @@ CONFIG_FILE = Path(os.environ.get(
 # so world-save backups get their own variable.
 SAVE_BACKUP_DIR = Path(os.environ.get("PALWARDEN_SAVE_BACKUP_DIR", "/opt/palworld/backups"))
 SNAPSHOT_DIR = Path(os.environ.get("PALWARDEN_SNAPSHOT_DIR", "/opt/palworld/config-snapshots"))
+# Staging for in-flight uploads: the same variable palworld-restore --import reads
+# and palwarden-jobd validates against, so one override moves writer and reader
+# together. This process only ever *writes* here; promoting a staged archive into
+# SAVE_BACKUP_DIR is root's job.
+UPLOAD_DIR = Path(os.environ.get("PALWARDEN_UPLOAD_DIR", "/var/lib/palworld/uploads"))
 
 # Keys ep_config replaces with "<redacted>". Read the honest scope of that in
 # ep_config and allowed_roots: it is hygiene for diffs, logs and screenshots, not
@@ -105,6 +116,46 @@ MAX_BODY_BYTES = 65536
 # knob on purpose — a typo in a unit file would become a traceback at import,
 # and 10s is generous for a loopback listener even over an SSH tunnel.
 REQUEST_TIMEOUT = 10.0
+
+# --- the upload path's own limits -------------------------------------------
+# These exist because neither constant above may apply to an archive upload, and
+# both are correct for their current callers:
+#
+#   * MAX_BODY_BYTES (64 KiB) is sized for a job body; a world save is gigabytes.
+#   * REQUEST_TIMEOUT (10s) would abort any real upload mid-flight. It stays the
+#     handler-wide value; the upload path raises it for the duration of that one
+#     request and puts it back (see _upload).
+#
+# Do not merge either pair. tests/unit/test_webui_backups.sh pins both directions:
+# a job body over 64 KiB is still refused, and a trickled upload that outlives
+# UPLOAD_TIMEOUT is cut off (which only happens if the local timeout is real).
+UPLOAD_HEADER = "X-Palwarden-Filename"
+# 2 GiB is well above any world save this project has seen and well below anything
+# that could exhaust a data volume in one request. env_int is reused from the
+# archive module so a malformed override is the default rather than "no limit".
+MAX_UPLOAD_BYTES = archive.env_int("PALWARDEN_MAX_UPLOAD_BYTES", 2 * 1024**3)
+# Read and written a MiB at a time: the archive must never be buffered in memory,
+# and 1 MiB is large enough that a 2 GiB upload is not two million syscalls.
+UPLOAD_CHUNK = 1024 * 1024
+# Free space demanded *on top of* the upload itself. UPLOAD_DIR usually shares a
+# volume with the job queue and the telemetry DB, so an upload that fits exactly
+# would still break the rest of the control plane; leave the queue room to work.
+UPLOAD_FREE_MARGIN = archive.env_int("PALWARDEN_UPLOAD_FREE_MARGIN", 64 * 1024**2)
+# 10 minutes is enough for a gigabyte over a slow SSH tunnel while still bounding
+# a thread held open by a client that stops sending.
+UPLOAD_TIMEOUT = 600.0
+_raw_upload_timeout = os.environ.get("PALWARDEN_UPLOAD_TIMEOUT")
+if _raw_upload_timeout:
+    try:
+        # A bad or non-positive override is the default, not a traceback at import
+        # and not "no timeout": a typo in a unit file must not be able to make this
+        # process hold threads forever. Same rule as archive.env_int, which cannot
+        # be reused here because this one is a float.
+        _parsed = float(_raw_upload_timeout)
+        UPLOAD_TIMEOUT = _parsed if _parsed > 0 else UPLOAD_TIMEOUT
+    except ValueError:
+        pass
+
 # One limit for both "which jobs does GET /api/jobs show" and "which jobs can
 # block a disruptive POST with a 409". They must be the same number: a job the
 # operator cannot see in the listing must not be able to block them forever
@@ -559,11 +610,17 @@ def ep_config(_query: dict) -> dict:
     return {"ok": True, "data": settings}
 
 
-def _list_dir(path: Path, limit: int = 50) -> dict:
+def _list_dir(path: Path, limit: int = 50, name_ok=None) -> dict:
+    """List a directory newest-name-first, optionally keeping only some names.
+
+    `name_ok` filters *before* the limit is applied, so debris cannot push a real
+    entry out of the listing.
+    """
     if not path.is_dir():
         return {"ok": True, "data": []}
+    names = [p for p in path.iterdir() if name_ok is None or name_ok(p.name)]
     entries = []
-    for item in sorted(path.iterdir(), key=lambda p: p.name, reverse=True)[:limit]:
+    for item in sorted(names, key=lambda p: p.name, reverse=True)[:limit]:
         try:
             stat = item.stat()
         except OSError:
@@ -574,12 +631,44 @@ def _list_dir(path: Path, limit: int = 50) -> dict:
 
 
 def ep_backups(_query: dict) -> dict:
-    return _list_dir(SAVE_BACKUP_DIR)
+    """List the archives, and only the archives.
+
+    Filtered by the shared name rule because this directory has a *second* writer
+    with in-flight state: palworld-restore --import copies into
+    `.palworld-save-….import.<hex>` before renaming, so an unfiltered listing shows
+    a row whose size grows and then vanishes. Not exploitable (nothing prunes by
+    enumeration, and the temp name could never pass valid_archive_name on the way
+    back in), but it is a misleading row in the panel and it consumes a listing
+    slot that a real archive should have.
+
+    Deliberately not applied to ep_snapshots: config snapshots are written only by
+    root tools that rename into place from elsewhere, their names carry an
+    operator-chosen label so there is no pattern to filter by, and nothing in the
+    snapshot flow takes a name back from this listing.
+    """
+    return _list_dir(SAVE_BACKUP_DIR, name_ok=archive.valid_archive_name)
 
 
 def ep_snapshots(_query: dict) -> dict:
     return _list_dir(SNAPSHOT_DIR)
 
+
+def ep_backup_schedule(_query: dict) -> dict:
+    """The effective backup schedule, as the tool that enforces it reports it.
+
+    Shelled out to rather than parsed here: palworld-backups --show-schedule
+    already applies the defaults, the ranges and the "a bad value falls back to the
+    default" rule, and the panel must show what the tick will actually do, not a
+    second interpretation of the same file.
+    """
+    return run_tool_json([str(SBIN / "palworld-backups"), "--show-schedule"])
+
+
+# `[^/]+` and then percent-decoded, in that order: a name containing a real slash
+# never matches (it falls through to the unknown-endpoint 404), and an *encoded*
+# one decodes to something valid_archive_name refuses. The raw path is matched
+# before unquoting so that "%2f" can never widen the route.
+DOWNLOAD_RE = re.compile(r"^/api/backups/([^/]+)/download$")
 
 READ_ENDPOINTS = {
     "/api/health": ep_health,
@@ -590,6 +679,7 @@ READ_ENDPOINTS = {
     "/api/config": ep_config,
     "/api/backups": ep_backups,
     "/api/snapshots": ep_snapshots,
+    "/api/backup-schedule": ep_backup_schedule,
 }
 
 
@@ -757,6 +847,257 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._send_json(200, {"ok": True, "data": {"token": self.credentials["WEBUI_TOKEN"]}},
                         extra_headers=(("Pragma", "no-cache"),))
 
+    def _upload_length(self) -> tuple[int | None, int, str | None]:
+        """Content-Length for an upload: (length, status, error).
+
+        Same framing rules as `_read_body` — one header, ASCII digits only, no PEP
+        515 underscores and no leading sign, because `int()` takes both and a proxy
+        in front of us would frame such a request differently. What differs is the
+        ceiling (MAX_UPLOAD_BYTES, not MAX_BODY_BYTES) and that going over it is a
+        413 rather than a 400: the request is well-formed, it is simply too large.
+        Not folded into `_read_body`, which reads the body into memory — the one
+        thing this path must never do.
+        """
+        if self.headers.get("Transfer-Encoding"):
+            # No chunked decoder here on purpose: this process should not contain
+            # one. Refused rather than left to stall waiting for a length.
+            return None, 400, "chunked transfer encoding is not supported; send Content-Length"
+        raw = self.headers.get_all("Content-Length") or []
+        if len(raw) != 1:
+            return None, 400, "exactly one Content-Length header is required"
+        value = raw[0].strip()
+        if not (value.isascii() and value.isdigit()):
+            return None, 400, "Content-Length must be a decimal, non-negative integer"
+        length = int(value)
+        if length == 0:
+            return None, 400, "the request body is empty; send the archive as the body"
+        if length > MAX_UPLOAD_BYTES:
+            return None, 413, f"the upload must be at most {MAX_UPLOAD_BYTES} bytes"
+        return length, 200, None
+
+    def _upload(self) -> None:
+        """POST /api/backups/upload: stream a raw archive body into UPLOAD_DIR.
+
+        This is a mutation, so it takes the full gate — Basic (already established
+        by the caller), then the token, then Origin/Sec-Fetch-Site — and it takes it
+        *before* looking at the filename, the length or the disk. Nothing here
+        unpacks, validates the contents of, or promotes the archive: the file lands
+        in the staging directory and stops there until the operator queues a
+        `backup_import` job that root runs. Even a completely bogus body is
+        therefore only ever a file in a 0700 directory.
+
+        The body is the archive itself rather than multipart/form-data: Python 3.13
+        removed the `cgi` module, so there is no stdlib multipart parser, and
+        hand-writing one inside the unprivileged HTTP process is exactly the parser
+        this design should not contain. `fetch()` sends a `File` as a body directly.
+        """
+        if not check_token(self.headers, self.credentials):
+            self._reject(403, f"missing or invalid {TOKEN_HEADER} header")
+            return
+        if not origin_ok(self.headers):
+            # Named, like the enqueue path's refusal, so an operator who bound to a
+            # routable address can see why their page cannot upload.
+            origin = (self.headers.get("Origin") or "").strip()
+            detail = f" (Origin {origin!r})" if origin else ""
+            self._reject(403, f"cross-origin request refused{detail}")
+            return
+        names = self.headers.get_all(UPLOAD_HEADER) or []
+        if len(names) != 1:
+            # Exactly one, for check_token's reason: with two, "which one counts"
+            # becomes a question the caller gets to answer.
+            self._reject(400, f"exactly one {UPLOAD_HEADER} header is required")
+            return
+        name = names[0].strip()
+        # Before any file exists, and before the length is even parsed: the only
+        # archives this project accepts back are ones it wrote, so a name
+        # palworld-backup could not have produced is refused outright. The pattern
+        # holds no path separator, so nothing below can traverse.
+        if not archive.valid_archive_name(name):
+            self._reject(400, f"{UPLOAD_HEADER} must be an archive name this project "
+                              f"wrote (palworld-save-<UTC stamp>.tar.gz), not {name!r}")
+            return
+        length, status, error = self._upload_length()
+        if error is not None:
+            self._reject(status, error)
+            return
+        try:
+            UPLOAD_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        except OSError as exc:
+            self._reject(500, f"upload staging directory {UPLOAD_DIR} cannot be "
+                              f"created: {exc.strerror}. Create it owned by the web "
+                              "UI user, mode 0700.")
+            return
+        try:
+            vfs = os.statvfs(UPLOAD_DIR)
+        except OSError as exc:
+            self._reject(500, f"cannot check free space on {UPLOAD_DIR}: {exc.strerror}")
+            return
+        # f_bavail, not f_bfree: the reserved blocks are not ours to spend.
+        free = vfs.f_bavail * vfs.f_frsize
+        if free < length + UPLOAD_FREE_MARGIN:
+            # 507 before a byte is written, rather than discovering ENOSPC halfway.
+            # This volume also carries the job queue and the telemetry DB, so
+            # filling it would take the rest of the control plane down with it.
+            self._reject(507, f"not enough free space to accept {length} bytes: "
+                              f"{free} bytes available on {UPLOAD_DIR} and "
+                              f"{UPLOAD_FREE_MARGIN} must stay free for the job "
+                              "queue and the telemetry database")
+            return
+        self._stream_upload(name, length)
+
+    def _stream_upload(self, name: str, length: int) -> None:
+        """Write `length` body bytes to a temp file and rename it to `name`.
+
+        `name` is already ARCHIVE_RE-validated and `length` already capped by the
+        caller; this half owns only the file handling.
+        """
+        # Unique per request, so two uploads of the same archive never write to one
+        # file: whoever loses the race loses only their own temp. The leading dot
+        # and the `.upload.` infix keep it out of the ARCHIVE_RE-filtered listing
+        # and out of anything root will import (valid_archive_name refuses it).
+        tmp = UPLOAD_DIR / f".{name}.upload.{secrets.token_hex(8)}"
+        try:
+            # O_EXCL: never write through a name that already exists. O_NOFOLLOW:
+            # never write through a symlink someone else planted at that name. Mode
+            # 0600 from creation, so the file is never briefly group-readable.
+            #
+            # Only the mode is testable: with 64 bits of entropy in the name nothing
+            # can pre-create it, so no test can make either flag fire (removing both
+            # leaves the suite green — recorded as a known-unfalsifiable check rather
+            # than dressed up with a test that would pass either way). They stay for
+            # the refactor that makes this name predictable; the concurrency check in
+            # tests/unit/test_webui_backups.sh is what catches losing the entropy.
+            fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+        except OSError as exc:
+            self._reject(500, f"cannot create the staging file in {UPLOAD_DIR}: "
+                              f"{exc.strerror}")
+            return
+        error: str | None = None
+        status = 500
+        # REQUEST_TIMEOUT is right for every other path in this file and would abort
+        # a real upload mid-flight, so raise it for this request only and put the
+        # old value back below. socketserver sets the timeout per connection, so the
+        # restore matters the moment protocol_version becomes HTTP/1.1 and a
+        # connection carries a second request — until then it is unobservable (every
+        # connection here serves exactly one request and is then closed), so no test
+        # can pin the restore itself. The *raise* is pinned: a trickled upload that
+        # outlives PALWARDEN_UPLOAD_TIMEOUT is cut off, which cannot happen if this
+        # path silently inherited REQUEST_TIMEOUT.
+        previous_timeout = self.connection.gettimeout()
+        self.connection.settimeout(UPLOAD_TIMEOUT)
+        try:
+            remaining = length
+            while remaining > 0:
+                # Bounded by the *framing*: reading past Content-Length would eat
+                # the start of whatever follows on the connection. Together with the
+                # pre-read cap this is also what makes an over-cap stream
+                # impossible, so there is no second in-loop size check to go stale.
+                try:
+                    chunk = self.rfile.read(min(UPLOAD_CHUNK, remaining))
+                except OSError as exc:
+                    # Includes the socket timeout above: a client that stops sending
+                    # loses its temp file and its connection, not a worker thread.
+                    error, status = f"could not read the request body: {exc}", 400
+                    break
+                if not chunk:
+                    error, status = "request body was shorter than Content-Length", 400
+                    break
+                remaining -= len(chunk)
+                try:
+                    written = 0
+                    while written < len(chunk):
+                        written += os.write(fd, memoryview(chunk)[written:])
+                except OSError as exc:
+                    # A volume that filled up despite the check above (another
+                    # writer, or a lying statvfs on an overlay) is still a 507.
+                    # Not reachable from the suite — no unit test fills a
+                    # filesystem — so this branch is knowingly unfalsifiable; the
+                    # pre-flight check is the one the tests pin.
+                    status = 507 if exc.errno == errno.ENOSPC else 500
+                    error = f"cannot write the staging file: {exc.strerror}"
+                    break
+        finally:
+            self.connection.settimeout(previous_timeout)
+            os.close(fd)
+            # Every failure path, including a short read and an exception on the way
+            # out (CLIENT_GONE, a kill): a partial upload must leave no debris for
+            # the operator to wonder about or for root to be handed later.
+            if error is not None:
+                tmp.unlink(missing_ok=True)
+        if error is not None:
+            self._reject(status, error)
+            return
+        try:
+            # Atomic promotion into the staged name. A re-upload of the same archive
+            # therefore replaces it wholesale — never a half-old, half-new file that
+            # root would then import.
+            os.replace(tmp, UPLOAD_DIR / name)
+        except OSError as exc:
+            tmp.unlink(missing_ok=True)
+            self._send_json(500, {"ok": False,
+                                  "error": f"cannot stage the upload as {name}: "
+                                           f"{exc.strerror}"})
+            return
+        # 202, not 201: the archive is *accepted for import*, and importing it is a
+        # separate job the operator queues next. Nothing has been restored yet.
+        self._send_json(202, {"ok": True, "data": {"staged": name, "bytes": length}})
+
+    def _send_archive(self, name: str) -> None:
+        """GET /api/backups/<name>/download: stream one archive to the browser.
+
+        A dedicated endpoint rather than adding SAVE_BACKUP_DIR to `allowed_roots`:
+        static serving would expose the directory and bypass name validation
+        entirely. Basic auth is enough — this is a read, and a read of bytes the
+        same caller could already obtain by other means.
+        """
+        if not archive.valid_archive_name(name):
+            # 404, not 400: as far as the caller is concerned an off-pattern name is
+            # indistinguishable from an absent one, and a distinct status would
+            # confirm which names exist in a shape the pattern accepts.
+            self._send_json(404, {"ok": False, "error": "unknown backup"})
+            return
+        try:
+            # The same open the root worker uses (O_RDONLY|O_NOFOLLOW|O_NONBLOCK,
+            # then S_ISREG), and needed here for the same reason: this directory is
+            # chowned to the service account, so a symlink or a FIFO planted under a
+            # name that passes the pattern would otherwise let whoever can write
+            # there choose what we read — or block this thread forever inside open().
+            fd = archive.open_archive_fd(SAVE_BACKUP_DIR / name)
+        except archive.ArchiveError:
+            # Missing, a symlink, a directory, a FIFO: all one generic 404. The
+            # refusal deliberately does not narrate the filesystem back to the
+            # caller, and it never becomes a traceback.
+            self._send_json(404, {"ok": False, "error": "unknown backup"})
+            return
+        try:
+            size = os.fstat(fd).st_size
+            self.send_response(200)
+            self.send_header("Content-Type", "application/gzip")
+            # From fstat, on the descriptor we are about to read — not from a second
+            # stat of the name.
+            self.send_header("Content-Length", str(size))
+            # Safe unquoted-in-quotes: ARCHIVE_RE admits no quote, backslash,
+            # newline or non-ASCII byte, so the name cannot break out of the
+            # quoted-string or inject a header.
+            self.send_header("Content-Disposition", f'attachment; filename="{name}"')
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            sent = 0
+            while sent < size:
+                chunk = os.read(fd, min(UPLOAD_CHUNK, size - sent))
+                if not chunk:
+                    # Truncated under us (a concurrent prune). We already promised
+                    # Content-Length bytes, so the only honest end is to close the
+                    # connection rather than send a short body a client would
+                    # believe.
+                    self.close_connection = True
+                    self.log_message("archive %s shrank while being sent", name)
+                    break
+                self.wfile.write(chunk)
+                sent += len(chunk)
+        finally:
+            os.close(fd)
+
     def _enqueue(self) -> None:
         """POST /api/jobs: validate, then write a job file. Nothing else, ever."""
         # Basic auth is already established by the caller. It is not enough on
@@ -875,6 +1216,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self._send_json_safely(
                         500, {"ok": False, "error": f"internal error: {exc}"})
                 return
+            # Before the READ_ENDPOINTS lookup: this one is not a
+            # `(query) -> dict` JSON wrapper but a streamed binary response, so it
+            # cannot be dispatched through that table.
+            match = DOWNLOAD_RE.match(parsed.path)
+            if match is not None:
+                try:
+                    self._send_archive(urllib.parse.unquote(match.group(1)))
+                except CLIENT_GONE as exc:
+                    # A cancelled browser download is routine, not an error.
+                    self._note_client_gone("streaming a backup archive", exc)
+                except Exception as exc:  # never leak a traceback to the browser
+                    self._send_json_safely(
+                        500, {"ok": False, "error": f"internal error: {exc}"})
+                return
             handler = READ_ENDPOINTS.get(parsed.path)
             if handler is None:
                 self._send_json(404, {"ok": False, "error": "unknown endpoint"})
@@ -931,7 +1286,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         if not self._authenticated():
             return
-        if urllib.parse.urlparse(self.path).path != "/api/jobs":
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/api/backups/upload":
+            try:
+                self._upload()
+            except CLIENT_GONE as exc:
+                self._note_client_gone("staging an upload", exc)
+            except Exception as exc:  # never leak a traceback to the browser
+                self._send_json_safely(500, {"ok": False,
+                                             "error": f"internal error: {exc}"})
+            return
+        if path != "/api/jobs":
             self._reject(404, "unknown endpoint")
             return
         try:
