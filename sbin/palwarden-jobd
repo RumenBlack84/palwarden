@@ -350,6 +350,11 @@ def validate_schedule(params: dict) -> dict[str, str]:
         # int or the digit string a form field sends, nothing else.
         if isinstance(value, bool) or not isinstance(value, (int, str)):
             raise ValueError(f"{key} must be an integer {low}-{high}, got {value!r}")
+        # int() is more permissive than a form field can be: int("6_0") is 60 and
+        # int(" 6 ") is 6, so a client posting "6_0" would silently save 60 hours
+        # rather than being refused. Require plain digits from the string branch.
+        if isinstance(value, str) and not re.fullmatch(r"[0-9]+", value):
+            raise ValueError(f"{key} must be an integer {low}-{high}, got {value!r}")
         try:
             number = int(value)
         except ValueError:

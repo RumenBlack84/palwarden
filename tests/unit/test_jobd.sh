@@ -645,6 +645,45 @@ for hostile in '../../etc/palworld/settings.env' 'sub/palworld-save-20260726T031
   assert_eq "$(wc -c < "$WORK/argv.log" | tr -d ' ')" "0" "hostile backup value never reached a command: '$hostile'"
 done
 
+# Non-string / non-int values: these guards are the only thing between a JSON null
+# and a TypeError that validate_params' `except ValueError` would NOT catch -- it
+# would escape to poll_once and surface as "worker hit an internal error", which is
+# exactly the symptom the disabled unknown-key check produced. Pin the messages so
+# the guards cannot be dropped as redundant.
+for bad in 'null' 'true' '6.5' '[]' '{}'; do
+  id="$(enqueue backup_schedule_save "{\"settings\": {\"BACKUP_ENABLED\": true, \"BACKUP_INTERVAL_HOURS\": $bad, \"BACKUP_RETENTION_DAYS\": 14, \"BACKUP_KEEP_MIN\": 3}}")"
+  jobd --once >/dev/null 2>&1
+  assert_eq "$(state_of "$id")" "failed" "a $bad interval is refused"
+  assert_contains "$(output_of "$id")" "must be an integer 1-720" \
+    "a $bad interval is refused as a number, not as an internal error"
+  assert_not_contains "$(output_of "$id")" "internal error" \
+    "a $bad interval never escapes as an uncaught TypeError"
+done
+
+# PEP-515 underscores and padding are not what a form field posts: int("6_0") is 60,
+# so accepting the string shape would silently save an interval nobody asked for.
+for bad in '"6_0"' '" 6 "' '"+6"'; do
+  id="$(enqueue backup_schedule_save "{\"settings\": {\"BACKUP_ENABLED\": true, \"BACKUP_INTERVAL_HOURS\": $bad, \"BACKUP_RETENTION_DAYS\": 14, \"BACKUP_KEEP_MIN\": 3}}")"
+  jobd --once >/dev/null 2>&1
+  assert_eq "$(state_of "$id")" "failed" "interval $bad is refused rather than reinterpreted"
+done
+
+# The same guard on the archive-name path: a non-string must be refused by name,
+# not crash on `"/" in 123`.
+id="$(enqueue backup_import '{"staged": 123}')"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "failed" "a non-string staged name is refused"
+assert_contains "$(output_of "$id")" "staged must be a bare file name" \
+  "a non-string staged name is refused by name, not as an internal error"
+assert_not_contains "$(output_of "$id")" "internal error" \
+  "a non-string staged name never escapes as an uncaught TypeError"
+
+# the `backup` key shares _validate_archive_in, so pin its separator message too
+id="$(enqueue backup_delete '{"backup": "../../etc/passwd", "confirm": true}')"
+jobd --once >/dev/null 2>&1
+assert_contains "$(output_of "$id")" "backup must be a bare file name" \
+  "the backup key's separator refusal says what is wrong too"
+
 # a separator is refused as a *separator*, by its own message, before any pattern or
 # filesystem reasoning happens
 id="$(enqueue backup_import '{"staged": "../../etc/passwd"}')"

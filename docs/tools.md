@@ -268,11 +268,16 @@ live worker legitimately owns. Must run as root (it cannot even open the lock
 otherwise).
 
 Actions: `config_apply`, `engine_apply`, `config_pretty`, `snapshot_create`,
-`backup`, `mark`, `engine_save` (file-only) and `graceful_restart`,
-`graceful_stop`, `update_check`, `update_apply`, `engine_rollback`, `api_save`,
-`engine_save_apply_restart` (disruptive, `confirm: true` required). Composite
-actions stop at the first failure — a failed save or apply never reaches the
-restart. Output is captured combined and capped.
+`backup`, `mark`, `engine_save`, `backup_import`, `backup_schedule_save`
+(file-only) and `graceful_restart`, `graceful_stop`, `update_check`,
+`update_apply`, `engine_rollback`, `api_save`, `engine_save_apply_restart`,
+`backup_restore`, `backup_delete` (disruptive, `confirm: true` required).
+Composite actions stop at the first failure — a failed save or apply never reaches
+the restart. Output is captured combined and capped.
+
+`backup_delete` is disruptive despite stopping no service: the classification gates
+*irreversible* actions, and deleting the archive that would have recovered the
+world is the least reversible thing here.
 
 Platform wiring: `palwarden-jobd.service` on bare metal, the `jobd` s6 service in
 the container (both run it as root; see
