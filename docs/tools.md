@@ -110,13 +110,20 @@ or `Config/` — see [`palwarden_archive`](#libraries).
   root-owned backups dir, 0644, **refusing to overwrite** an existing archive.
   It **copies first and validates the copy**, because the staging file's owner
   (the web process) can rewrite it in place between two reads. Prints the
-  promoted path; deletes the upload only on success.
+  promoted path; deletes the upload only on success. The promotion is capped at
+  `PALWARDEN_IMPORT_MAX_BYTES` (**default 8 GiB**, compressed) — a *different*
+  limit from the HTTP one below (`PALWARDEN_MAX_UPLOAD_BYTES`, default 2 GiB,
+  which bounds the request body the web process will accept). Both are real: the
+  web server refuses a body over 2 GiB, and root refuses to promote a staged file
+  over 8 GiB. Neither is the decompression-bomb cap, which
+  [`palwarden_archive`](#libraries) applies to the *uncompressed* size.
 - `--restore ARCHIVE`: replace the live world with the archive's contents.
   In order, stopping at the first failure: copy the archive into a root-only
   scratch dir (`PALWARDEN_RESTORE_SCRATCH`, default
   `/opt/palworld/restore-scratch`, 0700) and **validate that copy** — every
   archive in the backups dir is writable by the web process, so validating one
-  in place would guarantee the name and not the bytes; a **conditional** safety
+  in place would guarantee the name and not the bytes (bounded by
+  `PALWARDEN_RESTORE_MAX_BYTES`, default 8 GiB compressed); a **conditional** safety
   backup via `palworld-backup` (skipped with a printed note when there is no
   world to preserve); `palworld-graceful-stop [--wait S]`, where an
   already-stopped server is success but a stop that leaves the server *running*
@@ -344,6 +351,17 @@ the restart. Output is captured combined and capped.
 `backup_delete` is disruptive despite stopping no service: the classification gates
 *irreversible* actions, and deleting the archive that would have recovered the
 world is the least reversible thing here.
+
+The four backup-family actions (`backup`, `backup_import`, `backup_restore`,
+`backup_delete`) additionally take **`/run/palworld-backups.lock`** — the same lock
+the scheduled tick holds (`palworld-backup-auto.service` on bare metal, the
+`backup-auto` s6 service in the container). The jobd lock alone only makes the
+*worker* single, which says nothing about the timer. This side **waits** for the
+lock (`PALWARDEN_BACKUP_LOCK_WAIT`, default 1800s, then the job fails saying so)
+while the tick takes it with `-n` and skips: a missed tick is recovered by the next
+one, an action the operator is watching must not be dropped. If the lock file
+cannot be opened at all the action still runs, unserialised, with a warning on the
+service log — a lock must never be the thing that stops backups.
 
 Platform wiring: `palwarden-jobd.service` on bare metal, the `jobd` s6 service in
 the container (both run it as root; see

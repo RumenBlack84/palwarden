@@ -42,7 +42,8 @@ cleanup() {
   dc down -v --remove-orphans >/dev/null 2>&1 || true
   # Volumes seeded with `docker run -v` lack compose's labels, so `down -v` skips
   # them; remove by name so the test never leaks state.
-  for v in palworld-server palworld-saved palwarden-state; do
+  for v in palworld-server palworld-saved palwarden-state palwarden-backups \
+           palwarden-config-snapshots palwarden-config-backups; do
     docker volume rm -f "${PROJECT}_${v}" >/dev/null 2>&1 || true
   done
   rm -rf "$WORK"
@@ -108,6 +109,42 @@ assert_rc 0 docker exec "$C" test -x /opt/palworld/server/PalServer.sh
 logs="$(docker logs "$C" 2>&1)"
 assert_not_contains "$logs" "Operation not permitted" "no permission error on re-apply"
 assert_not_contains "$logs" "Traceback" "no traceback on the second boot"
+
+# ------------------------------------------- backups survive --force-recreate --
+# The bug the palwarden-backups volume exists to fix, pinned. /opt/palworld/backups
+# used to live in the container's writable layer, so `docker compose up
+# --force-recreate` — an ordinary upgrade — destroyed every archive. A scheduled
+# backup that cannot survive a recreate is not a backup.
+#
+# A REAL archive, written by the real tool as root, not a file dropped in with
+# `docker exec`: the ownership split is part of what has to survive.
+bk_out="$(docker exec --user root "$C" palworld-backup 2>&1 | tail -1)"
+bk_name="$(basename "$bk_out")"
+assert_contains "$bk_name" "palworld-save-" "an archive was created before the recreate ($bk_out)"
+bk_sum="$(docker exec "$C" sh -c "sha256sum < '/opt/palworld/backups/$bk_name'" | awk '{print $1}')"
+if [ "${#bk_sum}" -eq 64 ]; then pass; else fail "could not hash the archive before the recreate"; fi
+
+# --force-recreate replaces the container (and its writable layer) while keeping
+# the named volumes — exactly what `git pull && docker compose up -d` does.
+dc up -d --force-recreate >/dev/null 2>&1 || fail "compose up --force-recreate failed"
+wait_ready "$C" || fail "server did not come up after --force-recreate"
+assert_rc 0 docker exec "$C" test -f "/opt/palworld/backups/$bk_name"
+after_sum="$(docker exec "$C" sh -c "sha256sum < '/opt/palworld/backups/$bk_name' 2>/dev/null" | awk '{print $1}')"
+assert_eq "$after_sum" "$bk_sum" "the archive survived --force-recreate byte for byte"
+# The directory's ownership is the other half: palworld-backup writes into it as
+# root and palworld-restore refuses to work from a directory (or parent) any lesser
+# account can write. A volume seeded with the wrong ownership would break both
+# while the archive itself still sat there.
+assert_eq "$(docker exec "$C" stat -c '%U %a' /opt/palworld/backups)" "root 755" \
+  "...and the backups directory is still root-owned 0755"
+assert_eq "$(docker exec "$C" stat -c '%U' /opt/palworld)" "root" \
+  "...and so is its parent, which is what palworld-restore checks"
+# The archive itself belongs to the service account, as palworld-backup left it.
+assert_eq "$(docker exec "$C" stat -c '%U' "/opt/palworld/backups/$bk_name")" "steam" \
+  "...and the archive still belongs to the service account"
+# The backups volume's two siblings are volumes for the same reason.
+assert_rc 0 docker volume inspect "${PROJECT}_palwarden-config-snapshots"
+assert_rc 0 docker volume inspect "${PROJECT}_palwarden-config-backups"
 
 # a changed setting is picked up on reboot even though the file was locked
 dc down >/dev/null 2>&1

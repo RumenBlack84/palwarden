@@ -154,6 +154,12 @@ COMPOSE_PROFILES=embedded docker compose up -d --build
 docker compose logs -f palwarden
 ```
 
+> **Upgrading an existing stack from a release before the backups volume?** Copy
+> `/opt/palworld/backups` out of the **old** container *before* the first `up` —
+> a recreate deletes the writable layer those archives were in and replaces it
+> with an empty volume. See
+> [Upgrading from a pre-volume image](#upgrading-from-a-pre-volume-image-do-this-before-the-first-up).
+
 Players connect on `UDP 8211`. Stop gracefully with
 `docker compose down` (server saves via SIGINT).
 
@@ -194,6 +200,8 @@ never the public Internet).
 | `palworld-saved` | `/opt/palworld/server/Pal/Saved` | Worlds + config (embedded) |
 | `palwarden-state` | `/var/lib/palworld` | `metrics.sqlite3` telemetry, the job queue, upload staging (both modes) |
 | `palwarden-backups` | `/opt/palworld/backups` | World-save archives (embedded) |
+| `palwarden-config-snapshots` | `/opt/palworld/config-snapshots` | Config snapshots / rollback material (embedded) |
+| `palwarden-config-backups` | `/opt/palworld/config-backups` | `Engine.ini` pre-rollback copies (embedded) |
 
 `palwarden-backups` is deliberately its own volume and **not** a directory inside
 `palworld-saved`: a backup has to outlive the thing it backs up, and anything left
@@ -205,7 +213,53 @@ runtime `chown`. `docker compose down -v` deletes your backups along with
 everything else; copy them off the host (the Backups page's download button, or
 `docker cp`) before you do that.
 
+**`/opt/palworld` as a whole is *not* persisted** — only the three paths named in
+the table above are. `/opt/palworld/restore-scratch` and `/opt/palworld/tools`
+live in the writable layer and are recreated on every start, which is correct:
+the scratch directory holds one archive for the duration of a single import and
+the web root ships in the image. The two config directories got volumes of their
+own because they are recovery material with the same exposure as the backups —
+`config-snapshots` is what you roll a bad config change back from, and a recreate
+is exactly when you want it.
+
 Bind mounts work too; match host ownership to `steam` (uid/gid **1000**).
+
+### Upgrading from a pre-volume image (do this BEFORE the first `up`)
+
+Releases before the backups volume kept `/opt/palworld/backups` in the
+container's **writable layer**. `git pull && docker compose up -d` recreates the
+container, which deletes that layer, and the new empty `palwarden-backups` volume
+takes its place — **every existing archive is gone**, with nothing to recover
+from once the old container is removed. The same applies to
+`/opt/palworld/config-snapshots` and `/opt/palworld/config-backups`.
+
+While the **old** container still exists (before any `up`, `down` or
+`--force-recreate` on the new image):
+
+```bash
+cd docker
+docker compose cp palwarden:/opt/palworld/backups ./backups-migrate
+docker compose cp palwarden:/opt/palworld/config-snapshots ./snapshots-migrate   # optional
+```
+
+Then bring the new image up and copy the archives back into the volume:
+
+```bash
+COMPOSE_PROFILES=embedded docker compose up -d --build
+docker compose cp ./backups-migrate/. palwarden:/opt/palworld/backups
+docker compose exec palwarden chown -R root:root /opt/palworld/backups
+docker compose exec palwarden chown steam:steam /opt/palworld/backups/palworld-save-*.tar.gz
+docker compose exec palwarden ls -l /opt/palworld/backups     # dir root 0755, files steam
+```
+
+The ownership matters: the directory must stay **root-owned `0755`** (that is
+what stops the unprivileged web process substituting an archive) and the archives
+themselves are handed to `steam`. `palworld-restore` refuses outright if that is
+wrong, so a mistake here is a clean refusal rather than a bad restore.
+
+If you have already upgraded and the archives are gone, the container says so on
+start: `WARNING: /opt/palworld/backups is empty but this world already has
+saves`.
 
 ## Security notes
 

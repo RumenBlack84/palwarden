@@ -219,6 +219,11 @@ what keeps their names from being substituted), which is precisely why
 - `palwarden-jobd` takes its lock in **every** mode — the daemon loop, `--once`
   and `--reap` alike — so a hand-run one-shot can never race the service or
   mistake a live job for an orphan.
+- That lock makes the *worker* single, not the schedule, so the backup family
+  (`backup`, `backup_import`, `backup_restore`, `backup_delete`) also takes
+  `/run/palworld-backups.lock` — the scheduled tick's lock, on both platforms.
+  The tick takes it with `-n` and skips; jobd waits, because an action an operator
+  queued must not be dropped for a tar that happened to be running.
 - Every config mutation writes a timestamped backup first; `engine-config` and
   `config-snapshot` add rollback paths.
 - `needrestart` is configured so unattended `apt` upgrades **report** but never

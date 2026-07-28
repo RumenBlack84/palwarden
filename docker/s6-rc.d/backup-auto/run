@@ -22,6 +22,19 @@
 # applied to the collection *including* the archive just created, so the new
 # archive counts toward BACKUP_KEEP_MIN and an expired one ages out in the same
 # tick. palworld-backups composes these two flags deliberately; do not split them.
+#
+# flock, exactly as palworld-backup-auto.service does on bare metal, and on the
+# same path. It serialises the tick against (a) the previous tick, still tarring a
+# large world, and (b) the panel's own backup / backup_import / backup_restore /
+# backup_delete actions, which palwarden-jobd runs holding this same lock. Without
+# it the two schedulers were independent on both platforms: two backups started in
+# the same UTC second collide on one archive name, a prune can unlink the archive a
+# delete is unlinking, and a restore renames the world tree out from under a tick's
+# tar.
+#
+# -n, unlike jobd's side: an overlapping tick exits immediately rather than
+# queueing up behind a slow save — the next tick is the retry. A panel action, which
+# an operator is waiting on, waits instead.
 exec palwarden-run-periodic \
   "${BACKUP_TICK_SECONDS:-900}" backup-auto \
-  palworld-backups --if-due --prune
+  flock -n /run/palworld-backups.lock palworld-backups --if-due --prune

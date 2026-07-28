@@ -112,7 +112,8 @@ if [[ ! -e /etc/palworld/backup.env ]]; then
     _sched+="${_key}=${_value}"$'\n'
   done
   if [[ -n "$_sched" ]]; then
-    umask 022
+    # No umask here: it would leak into the rest of PID 1 (there is no subshell
+    # around this block), and the explicit chmod below already decides the mode.
     {
       printf '# Rendered by palwarden-entrypoint from BACKUP_* environment variables.\n'
       printf '# Seeded once: the backup panel (palwarden-jobd backup_schedule_save)\n'
@@ -241,6 +242,25 @@ if [[ "$MODE" == "embedded" ]]; then
   # decided per tick inside palworld-backups, so switching backups off from the
   # panel needs no service change and switching them back on needs no recreate.
   enable_service backup-auto
+
+  # Upgrade guard for the release that moved /opt/palworld/backups onto its own
+  # volume. Before it, archives lived in the container's writable layer, which
+  # `docker compose up --force-recreate` (or `up -d` after a `git pull`) destroys
+  # along with the old container — and the fresh, EMPTY palwarden-backups volume
+  # that replaces it looks exactly like a first boot. Losing the operator's whole
+  # backup history on the upgrade whose entire point is that backups survive a
+  # recreate is the worst possible ordering, so say so rather than start quietly.
+  #
+  # "Not a first boot" is inferred from the world: palworld-saved carrying a
+  # SaveGames tree while the backups directory is empty is the shape an upgraded
+  # stack has and a genuinely fresh one does not. It over-warns for one case (a
+  # pre-seeded world with no backups yet), which is the right way round — the line
+  # is advice, nothing acts on it.
+  BACKUPS_DIR="${PALWARDEN_SAVE_BACKUP_DIR:-/opt/palworld/backups}"
+  if [[ -d "$BACKUPS_DIR" && -z "$(ls -A "$BACKUPS_DIR" 2>/dev/null)" \
+        && -n "$(ls -A "$INSTALL_DIR/Pal/Saved/SaveGames" 2>/dev/null)" ]]; then
+    log "WARNING: $BACKUPS_DIR is empty but this world already has saves — if you just upgraded, older archives lived in the previous container's writable layer and are NOT in the palwarden-backups volume; they are recoverable only from a still-existing old container ('docker compose cp <old-container>:/opt/palworld/backups ./backups-migrate'). See docker/README.md, 'Upgrading from a pre-volume image'." >&2
+  fi
 fi
 
 if [[ "$TELEMETRY_READY" == "1" ]]; then

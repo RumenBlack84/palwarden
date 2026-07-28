@@ -19,8 +19,18 @@ webui.env
 # Docker local env
 docker/.env
 
-# Runtime state written into the test fixture by container runs
-tests/fixtures/fake-server/Pal/Saved/
+# Runtime state written into the test fixture by container runs — everything
+# except the one save the fixture genuinely ships. That file is tracked on
+# purpose: the scheduled backup tick tars `SaveGames` and `Config` out of this
+# tree on first boot, and with no SaveGames at all (a fresh clone) tar exits 2.
+# The suite used to pass only because an earlier run had written a SaveGames tree
+# in here, pre-seeding the next one.
+tests/fixtures/fake-server/Pal/Saved/*
+!tests/fixtures/fake-server/Pal/Saved/SaveGames/
+tests/fixtures/fake-server/Pal/Saved/SaveGames/*
+!tests/fixtures/fake-server/Pal/Saved/SaveGames/0/
+tests/fixtures/fake-server/Pal/Saved/SaveGames/0/*
+!tests/fixtures/fake-server/Pal/Saved/SaveGames/0/Level.sav
 
 # Claude Code local state (permission allowlists, temp files)
 .claude/

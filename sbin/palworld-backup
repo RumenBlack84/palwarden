@@ -24,6 +24,22 @@ SAVED_DIR="${PALWORLD_SAVED_DIR-${PALWORLD_INSTALL_DIR:-/opt/palworld/server}/Pa
 
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 dest="${BACKUP_DIR}/palworld-save-${stamp}.tar.gz"
+# tar writes to a dot-prefixed `.partial` name and the archive is renamed into
+# place only after tar exits 0. Writing straight to the final name meant that any
+# tar that died mid-write — and one *will*: the container's backup-auto tick is
+# killed on container stop (timeout-kill 3000ms, and palwarden-run-periodic
+# installs no TERM trap by design), a full volume, an OOM — left a truncated
+# `palworld-save-<stamp>.tar.gz` behind. That file is accepted by name: it makes
+# `palworld-backups --if-due` believe a backup was just taken, so nothing is
+# created for the whole interval (a silent backup outage), and the panel offers a
+# corrupt archive for restore.
+#
+# The `.partial` name is deliberately dot-prefixed: `valid_archive_name` matches
+# `palworld-save-<stamp>.tar.gz` and nothing else, so a leftover partial is
+# invisible to palworld-backups' listing, to retention, and to /api/backups. The
+# rename is within one directory, so it is atomic — the final name never exists
+# holding a partial archive.
+partial="${BACKUP_DIR}/.palworld-save-${stamp}.tar.gz.partial"
 palworld_notify start "backup started."
 # root-owned 0755, NOT handed to the service account: this script runs as root
 # (jobd's `backup` action, or a timer) and writes a path derived from the current
@@ -32,7 +48,8 @@ palworld_notify start "backup started."
 # chown below, follow it out of the tree. Only root writes backups; the web UI
 # only lists them, which 0755 allows. See sbin/palworld-config-snapshot's note.
 if install -d -m 0755 "$BACKUP_DIR" \
-  && tar -C "$SAVED_DIR" -czf "$dest" SaveGames Config 2>/dev/null; then
+  && tar -C "$SAVED_DIR" -czf "$partial" SaveGames Config 2>/dev/null \
+  && mv -f "$partial" "$dest"; then
   # Inside a root-owned directory nothing can substitute this name, so handing the
   # archive itself to the service account is safe — it lets the operator manage
   # and rotate backups without sudo. Never fatal: a backup owned by root still
@@ -45,6 +62,10 @@ if install -d -m 0755 "$BACKUP_DIR" \
   echo "$dest"
 else
   rc=$?
+  # Nothing half-written survives a failure: tar's own output is removed, and the
+  # final name was never created, so `--if-due` still sees the real newest archive
+  # and takes a backup at the next tick instead of standing down for an interval.
+  rm -f "$partial" 2>/dev/null || true
   palworld_notify error "backup failed with exit code ${rc}."
   exit "$rc"
 fi

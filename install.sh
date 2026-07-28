@@ -110,6 +110,22 @@ else
        "Create the group and 'chown root:$SVC_GROUP /etc/palworld/webui.env; chmod 0640 ...' before starting the service."
 fi
 
+# 4c. The root of the tooling's own tree, created explicitly and BEFORE anything
+# writes under it. It was root-owned only by accident: the first `install -d`
+# below happened to create it as root, so the `-o root -g root` lines further down
+# inherited a root-owned parent. Reorder those steps — or install onto a host where
+# someone ran `chown -R palworld /opt/palworld` after a manual game install — and
+# the parent is service-account-owned while the children still look right.
+#
+# That is not cosmetic. palworld-restore's `_refuse_writable_parents` walks the
+# whole parent chain of /opt/palworld/restore-scratch and refuses if any link is
+# writable by an account other than root, because a service account that owns the
+# parent can rename root's scratch directory aside and substitute its own. A
+# service-account-owned /opt/palworld therefore refuses EVERY restore. The
+# container pins this with an assertion (scenario L); this line is the systemd
+# side of the same property.
+run install -d -m 0755 -o root -g root /opt/palworld
+
 # 5. Web UI and reference docs under /opt/palworld/tools.
 install_files 0644 /opt/palworld/tools/config-webui "$REPO_DIR"/webui/*
 install_files 0644 /opt/palworld/tools "$REPO_DIR"/docs/config-tools.md "$REPO_DIR"/docs/backlog.md

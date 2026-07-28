@@ -81,6 +81,31 @@ assert_file_contains "$WORK/err3" "definitely-no-such-user" \
   "the warning names the account it could not use"
 assert_file_contains "$WORK/err3" "Warning" "and says it is a warning, not a failure"
 
+# --- a failed tar leaves nothing that looks like an archive ------------------
+# The whole reason the archive is written to a dot-prefixed `.partial` name and
+# renamed only on success. A tar that dies mid-write used to leave a truncated
+# `palworld-save-<stamp>.tar.gz` at the final name — and `palworld-backups
+# --if-due` accepts an archive *by name*, so that file made the tick believe a
+# backup had just been taken and create nothing for the whole interval, while the
+# panel offered the corrupt file for restore.
+#
+# The failure is provoked the way the container actually hit it: a Saved tree with
+# no SaveGames. tar prints "Cannot stat", exits 2, and (before this fix) still left
+# a valid Config-only archive at the final name.
+mkdir -p "$WORK/half/Config"
+printf 'cfg\n' > "$WORK/half/Config/PalWorldSettings.ini"
+out="$(env PALWARDEN_SAVE_BACKUP_DIR="$WORK/b4" PALWORLD_SAVED_DIR="$WORK/half" \
+        bash "$BACKUP" 2>"$WORK/err4")"
+rc=$?
+assert_ne "$rc" "0" "a tar that cannot read the world fails the backup"
+left="$(find "$WORK/b4" -maxdepth 1 -name 'palworld-save-*.tar.gz' | wc -l | tr -d ' ')"
+assert_eq "$left" "0" "...and leaves no archive at the final name"
+# Nor a stray partial: it is invisible to the tool either way (the dot prefix fails
+# valid_archive_name), but leaking one per failed tick would fill the volume the
+# next real backup needs.
+left="$(find "$WORK/b4" -maxdepth 1 -name '.palworld-save-*' | wc -l | tr -d ' ')"
+assert_eq "$left" "0" "...and cleans up its own partial"
+
 # --- no hardcoded account name survives in the source ------------------------
 # A deletion tripwire: the assertions above run unprivileged, where `install -d -o`
 # is a no-op we cannot exercise, so pin the source directly. Any `-o palworld` or

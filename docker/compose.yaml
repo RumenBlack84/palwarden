@@ -75,6 +75,17 @@ services:
       # the ownership palworld-backup and palworld-restore both require — so this
       # never needs a runtime chown.
       - palwarden-backups:/opt/palworld/backups
+      # The backups volume's two siblings under /opt/palworld, on volumes for the
+      # same reason and not because /opt/palworld is persisted generally (it is
+      # not — /opt/palworld/restore-scratch is transient by design and stays in the
+      # writable layer). config-snapshots is rollback material: it is what an
+      # operator reaches for after a bad config change, and a recreate is exactly
+      # when they need it. config-backups holds palworld-engine-config's
+      # pre-rollback copies, which the Engine editor's rollback list reads.
+      # Ownership is seeded from the image path (root 0755 and steam 0755
+      # respectively), so neither needs a runtime chown.
+      - palwarden-config-snapshots:/opt/palworld/config-snapshots
+      - palwarden-config-backups:/opt/palworld/config-backups
     stop_grace_period: 120s
     ulimits:
       nofile:
@@ -112,3 +123,5 @@ volumes:
   palworld-saved:
   palwarden-state:
   palwarden-backups:
+  palwarden-config-snapshots:
+  palwarden-config-backups:

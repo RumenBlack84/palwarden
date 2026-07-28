@@ -129,8 +129,16 @@ assert_not_contains "$svcA" "public-info-watch" "F: public-info-watch off by def
 # Palworld v1.0.1 rewrites both files but preserves every value, so protection is
 # unnecessary. engine-config apply must work regardless (it used to crash here on
 # a missing lsattr).
+# A private copy of the fixture, like scenarios L and M. pw-it-g is the container
+# scenarios H-K all reuse, and scenario K writes a SaveGames tree into the server
+# path: with the repo's fixture bind-mounted that landed in the *working tree*, so
+# every run pre-seeded the next one and the suite passed only on a polluted
+# checkout (on a fresh clone Pal/Saved does not exist at all — it is gitignored
+# apart from the one tracked save).
+GWORK="$(mktemp -d)"; TMPDIRS+=("$GWORK")
+cp -r "$FAKE" "$GWORK/server"
 run_c pw-it-g -e PALWARDEN_MODE=embedded -e UPDATE_ON_START=false -e ADMIN_PASSWORD=x \
-  -v "$FAKE":/opt/palworld/server "$IMG"
+  -v "$GWORK/server":/opt/palworld/server "$IMG"
 wait_up pw-it-g palworld-server || fail "G: server did not come up"
 docker exec pw-it-g sh -c 'sleep 1'
 # nothing should be immutable (and the image no longer even ships chattr)
@@ -286,15 +294,33 @@ assert_eq "$(docker exec pw-it-g stat -c '%U %a' /opt/palworld/backups)" "root 7
 # it is asserted here because it means the directory is NOT empty when the explicit
 # `backup` action below runs — the assertions after it therefore name one archive
 # instead of globbing, which used to match exactly one file.
+#
+# Counting files is not enough, and that is not hypothetical: a tar run against a
+# Saved tree with no SaveGames exits 2 and — before palworld-backup wrote through a
+# `.partial` — still left a Config-only archive at the final name. The count was
+# green over a *failed* backup, and the archive was root-owned because the chown
+# only happens on the success path. So assert what the tick actually reported: the
+# if-due decision and the path palworld-backup printed on success.
+bk_logs="$(docker logs pw-it-g 2>&1)"
+assert_contains "$bk_logs" "[periodic:backup-auto]" "K: the scheduled tick is running"
+assert_contains "$bk_logs" "if-due: due - no archive exists" \
+  "K: ...and found a backup due on first boot (no archive yet)"
+assert_contains "$bk_logs" "/opt/palworld/backups/palworld-save-" \
+  "K: ...and palworld-backup printed the archive it finished writing"
+assert_not_contains "$bk_logs" "backup failed with exit code" "K: the boot tick did not fail"
 bk_boot="$(docker exec pw-it-g sh -c 'ls -1 /opt/palworld/backups | wc -l')"
 if [ "${bk_boot:-0}" -ge 1 ]; then pass; else
   fail "K: the scheduled tick should have made a backup on first boot, found $bk_boot"
 fi
+# No half-written archive is left in the directory either — the partial is
+# dot-prefixed, so a plain `ls -1` above would not have counted one.
+assert_eq "$(docker exec pw-it-g sh -c 'ls -1A /opt/palworld/backups | grep -c "^\." || true')" "0" \
+  "K: and no .partial is left behind"
 
-# Seed a SaveGames tree: the tool tars exactly SaveGames + Config, and the fake
-# server fixture ships neither (Pal/Saved is gitignored precisely because the tests
-# write into it), so without this the tar would fail for an unrelated reason and
-# hide whatever the action actually does.
+# Refresh the SaveGames tree the tick just archived. The fixture ships
+# SaveGames/0/Level.sav (tracked, so a fresh clone has it — that is what the boot
+# tick tarred); this only re-states it as steam-owned for the explicit job below,
+# and never touches the repository: pw-it-g mounts a private copy.
 docker exec pw-it-g sh -c 'install -d -o steam -g steam /opt/palworld/server/Pal/Saved/SaveGames/0 \
   && printf "fake level data\n" > /opt/palworld/server/Pal/Saved/SaveGames/0/Level.sav'
 
@@ -442,10 +468,14 @@ dl_code="$(docker exec pw-it-l sh -c "curl -s -o /tmp/dl.tar.gz -w '%{http_code}
 assert_eq "$dl_code" "200" "L2: GET /api/backups/<name>/download answers 200"
 # Byte-identical, not merely non-empty: a truncated download would still import and
 # still restore *something*, and the failure would surface as a corrupt world.
-dl_sums="$(docker exec pw-it-l sh -c \
-  "sha256sum < /tmp/dl.tar.gz; sha256sum < '/opt/palworld/backups/$l_name'" \
-  | awk '{print $1}' | sort -u | wc -l)"
-assert_eq "$dl_sums" "1" "L2: the downloaded bytes are identical to the archive"
+# Both hashes are captured and compared as values. The earlier form piped the two
+# through `sort -u | wc -l` and asserted "1", which cannot tell "the two hashes
+# agree" from "only one hash was produced" — a sha256sum that failed outright would
+# have passed it.
+dl_sum="$(docker exec pw-it-l sh -c "sha256sum < /tmp/dl.tar.gz" | awk '{print $1}')"
+ar_sum="$(docker exec pw-it-l sh -c "sha256sum < '/opt/palworld/backups/$l_name'" | awk '{print $1}')"
+if [ "${#dl_sum}" -eq 64 ]; then pass; else fail "L2: no hash for the downloaded copy (got '$dl_sum')"; fi
+assert_eq "$dl_sum" "$ar_sum" "L2: the downloaded bytes are identical to the archive"
 
 # 3. Delete the archive through the API. Disruptive, so it needs confirm: true —
 #    and after this the downloaded bytes are the only copy in existence.

@@ -153,16 +153,22 @@ POLL_SECONDS = archive.env_int("PALWARDEN_RESTORE_POLL_SECONDS", 3)
 # /opt/palworld, where the backups themselves and the config snapshots live.
 MAX_RESTORE_BYTES = archive.env_int("PALWARDEN_RESTORE_MAX_BYTES", 8 * 1024**3)
 
-# Ceiling on the *compressed* size of a single upload. This is not the
+# Ceiling on the *compressed* size of a single import. This is not the
 # decompression-bomb cap (palwarden_archive owns that, on the uncompressed size);
 # it bounds what one promotion can cost in copy time and disk. A real save
 # archive is tens to hundreds of MiB.
+#
+# Named for its own env var (`PALWARDEN_IMPORT_MAX_BYTES`), and deliberately NOT
+# `MAX_UPLOAD_BYTES`: palwarden-webui has a local of that name for a *different*
+# limit — `PALWARDEN_MAX_UPLOAD_BYTES`, 2 GiB, the cap on the HTTP request body —
+# and the shared name has already cost one review cycle a false "doc drift"
+# finding. Two caps, two files, two values, two env vars.
 #
 # Both caps below reuse palwarden_archive's own public env-int reader rather
 # than growing a second copy of "positive int or default" with its own bugs —
 # the exact helper whose whole purpose is that a malformed override cannot
 # lower a ceiling to zero.
-MAX_UPLOAD_BYTES = archive.env_int("PALWARDEN_IMPORT_MAX_BYTES", 8 * 1024**3)
+MAX_IMPORT_BYTES = archive.env_int("PALWARDEN_IMPORT_MAX_BYTES", 8 * 1024**3)
 # Free space required on the backups filesystem *beyond* the archive itself. A
 # web process that can fill that volume by uploading is a denial of service
 # against palworld-backup, which is the thing the operator will need next. Kept
@@ -224,9 +230,9 @@ def _check_capacity(fd: int) -> int:
     and it is the backups volume that must survive this.
     """
     size = os.fstat(fd).st_size
-    if size > MAX_UPLOAD_BYTES:
+    if size > MAX_IMPORT_BYTES:
         raise archive.ArchiveError(
-            f"staged upload is {size} bytes, over the {MAX_UPLOAD_BYTES}-byte "
+            f"staged upload is {size} bytes, over the {MAX_IMPORT_BYTES}-byte "
             f"import limit; refused")
     try:
         st = os.statvfs(BACKUP_DIR)
@@ -385,12 +391,12 @@ def import_staged(staged: str) -> Path:
         # something already at that name) then that file is not ours to remove.
         #
         # Bounded by `size`, the size the free-space decision above was actually
-        # made on, not by MAX_UPLOAD_BYTES: the staging file is web-writable, so
+        # made on, not by MAX_IMPORT_BYTES: the staging file is web-writable, so
         # a stat taken before the copy can grow stale, and licensing the copy up
         # to the (much larger) ceiling would let exactly that growth write past
         # the space statvfs approved — the same in-place-growth primitive the
         # capacity check exists to defend against, just moved a few lines later.
-        _copy_fd_to_temp(fd, tmp, min(MAX_UPLOAD_BYTES, size))
+        _copy_fd_to_temp(fd, tmp, min(MAX_IMPORT_BYTES, size))
         try:
             # THE authoritative check. `tmp` is in a directory the web process
             # cannot write, so from here "what was validated" and "what is on

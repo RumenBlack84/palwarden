@@ -53,6 +53,28 @@ else
   fail "--dry-run changed /opt/palworld: before='$OPT_BEFORE' after='$(opt_listing)'"
 fi
 
+# --- /opt/palworld itself is root-owned, and created FIRST --------------------
+# It used to be root-owned only incidentally: whichever `install -d` ran first
+# happened to create it as root. On a host where someone ran
+# `chown -R palworld /opt/palworld` after a manual game install — or after any
+# reordering of the steps below — the parent ends up service-account-owned while
+# the children still read correctly. palworld-restore's `_refuse_writable_parents`
+# walks the whole chain above /opt/palworld/restore-scratch, so that host refuses
+# EVERY restore. Pinned as an exact line, and as an ordering.
+if grep -qx 'DRY-RUN: install -d -m 0755 -o root -g root /opt/palworld' "$PLAN"; then
+  pass
+else
+  fail "/opt/palworld is not created explicitly root-owned"
+fi
+parent_ln="$(grep -n -x 'DRY-RUN: install -d -m 0755 -o root -g root /opt/palworld' "$PLAN" \
+  | head -1 | cut -d: -f1)"
+child_ln="$(grep -n '/opt/palworld/' "$PLAN" | head -1 | cut -d: -f1)"
+if [ -n "$parent_ln" ] && [ -n "$child_ln" ] && [ "$parent_ln" -lt "$child_ln" ]; then
+  pass
+else
+  fail "/opt/palworld is created at line ${parent_ln:-none}, after the first write under it at line ${child_ln:-none}"
+fi
+
 # --- the snapshot and save-backup roots are root-owned ------------------------
 assert_file_contains "$PLAN" "install -d -m 0755 -o root -g root /opt/palworld/backups" \
   "the save-backup root is created root-owned"

@@ -18,6 +18,7 @@ into a string that reaches one.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
 import importlib.machinery
 import importlib.util
@@ -65,6 +66,27 @@ ENGINE_CONFIG_BIN = Path(os.environ.get(
     "PALWARDEN_ENGINE_CONFIG_BIN", str(Path(__file__).resolve().parent / "palworld-engine-config")))
 JOBD_LOCK = Path(os.environ.get("PALWARDEN_JOBD_LOCK", "/run/palwarden-jobd.lock"))
 JOBD_INTERVAL_DEFAULT = 2.0
+
+# The *save-backup* lock, shared with the scheduled tick — the same path
+# palworld-backup-auto.service already flocks, and (as of this release) the
+# container's backup-auto service too. jobd's own lock only makes the worker
+# single, which says nothing about the timer: a panel-driven backup, delete or
+# restore could run straight through a scheduled `--if-due --prune`. That is not
+# benign. Two backups started in the same UTC second collide on one archive name;
+# a prune can unlink the archive a delete is unlinking; and a restore renames the
+# whole world tree out from under a tick's tar.
+#
+# So the four actions that write in the backups directory or move the world take
+# this lock for the duration of their command. The tick takes it with `-n` and
+# simply skips — a missed tick is recovered by the next one, whereas a panel action
+# the operator is watching must not be dropped, so this side WAITS.
+BACKUP_LOCK = Path(os.environ.get("PALWARDEN_BACKUP_LOCK", "/run/palworld-backups.lock"))
+BACKUP_LOCK_WAIT_DEFAULT = 1800.0
+# Only actions that mutate the collection or the world. backup_schedule_save writes
+# /etc/palworld/backup.env and is deliberately absent: it races nothing (the tick
+# re-reads the file each time), and holding a lock across it would let a slow tar
+# block the operator from switching backups off.
+BACKUP_LOCKED_ACTIONS = frozenset({"backup", "backup_import", "backup_restore", "backup_delete"})
 
 
 def _interval_from_env(raw: str | None) -> float:
@@ -869,6 +891,85 @@ def build_commands(action: str, params: dict) -> list[list[str]]:
     return spec["argv"](params)
 
 
+@contextlib.contextmanager
+def backup_lock(job_id: str):
+    """Hold the shared save-backup lock for a backup-family action.
+
+    Blocking (bounded), unlike every other flock in this project: the scheduled
+    tick takes the same lock with `-n` and skipping a tick costs nothing, but an
+    action the operator queued from the browser must not be silently dropped
+    because a tar happened to be running. `PALWARDEN_BACKUP_LOCK_WAIT` bounds the
+    wait so a wedged holder fails the job with a message instead of parking the
+    single worker forever.
+
+    Not fatal when the lock file cannot be opened at all (an unprivileged dev run,
+    a read-only /run): the action still runs, unserialised, with a warning on the
+    service log. Refusing instead would make the *lock* able to stop backups, which
+    is a worse failure than the race it prevents.
+    """
+    wait = BACKUP_LOCK_WAIT_DEFAULT
+    raw = os.environ.get("PALWARDEN_BACKUP_LOCK_WAIT")
+    if raw is not None:
+        try:
+            parsed = float(raw)
+            if parsed >= 0:
+                wait = parsed
+        except ValueError:
+            print(f"palwarden-jobd: ignoring PALWARDEN_BACKUP_LOCK_WAIT={raw!r}",
+                  file=sys.stderr)
+    try:
+        BACKUP_LOCK.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(BACKUP_LOCK, os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError as exc:
+        print(f"palwarden-jobd: cannot open {BACKUP_LOCK} ({exc.strerror}); running "
+              "this backup action without serialising it against the scheduled tick",
+              file=sys.stderr)
+        yield
+        return
+    started = time.monotonic()
+    announced = False
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                waited = time.monotonic() - started
+                if waited >= wait:
+                    raise TimeoutError(
+                        f"another backup operation has held {BACKUP_LOCK} for "
+                        f"{waited:.0f}s (the scheduled tick, most likely)")
+                if not announced:
+                    # Said once, and only when there is really something to wait
+                    # for: a job that sat behind a 40-minute tar must say why, and
+                    # an uncontended one must not add noise to its output.
+                    announced = True
+                    jobs.append_output(
+                        job_id, f"waiting for {BACKUP_LOCK} (a scheduled backup is running)\n")
+                time.sleep(1.0)
+        yield
+    finally:
+        os.close(fd)  # releases the flock
+
+
+def _run_commands(job_id: str, action: str, params: dict) -> int:
+    """Run an action's steps in order, stopping at the first failure."""
+    exit_code = 0
+    for argv in build_commands(action, params):
+        try:
+            result = subprocess.run(argv, capture_output=True, text=True, timeout=1800, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            jobs.append_output(job_id, f"failed to run {argv!r}: {exc}\n")
+            return 1
+        jobs.append_output(job_id, result.stdout)
+        if result.stderr:
+            jobs.append_output(job_id, result.stderr)
+        exit_code = result.returncode
+        if exit_code != 0:
+            break
+    return exit_code
+
+
 def run_job(job: dict) -> int:
     """Validate, then execute a job's steps in order, recording output/state.
 
@@ -908,20 +1009,20 @@ def run_job(job: dict) -> int:
             return 1
         jobs.append_output(job_id, "wrote the backup schedule\n")
 
-    exit_code = 0
-    for argv in build_commands(action, params):
-        try:
-            result = subprocess.run(argv, capture_output=True, text=True, timeout=1800, check=False)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            jobs.append_output(job_id, f"failed to run {argv!r}: {exc}\n")
-            exit_code = 1
-            break
-        jobs.append_output(job_id, result.stdout)
-        if result.stderr:
-            jobs.append_output(job_id, result.stderr)
-        exit_code = result.returncode
-        if exit_code != 0:
-            break
+    # The backup family runs under the shared save-backup lock, so a panel action
+    # and the scheduled `--if-due --prune` tick can never overlap; everything else
+    # is unaffected (nullcontext, not a second code path).
+    if action in BACKUP_LOCKED_ACTIONS:
+        guard: contextlib.AbstractContextManager = backup_lock(job_id)
+    else:
+        guard = contextlib.nullcontext()
+    try:
+        with guard:
+            exit_code = _run_commands(job_id, action, params)
+    except TimeoutError as exc:
+        jobs.append_output(job_id, f"gave up waiting for the backup lock: {exc}\n")
+        jobs.update_job(job_id, state="failed", exit_code=1, finished_at=int(time.time()))
+        return 1
 
     state = "succeeded" if exit_code == 0 else "failed"
     jobs.update_job(job_id, state=state, exit_code=exit_code, finished_at=int(time.time()))

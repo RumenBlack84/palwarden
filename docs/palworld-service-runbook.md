@@ -701,6 +701,43 @@ Command reference is in [`tools.md`](tools.md) (`palworld-backup`,
 `palworld-backups`, `palworld-restore`); the directory ownership and why it differs
 is in [`architecture.md`](architecture.md). This section is only the procedures.
 
+### Container upgrade: move the archives onto the volume first
+
+**Do this before the first `up` on the new image.** Releases before the
+`palwarden-backups` volume kept `/opt/palworld/backups` in the container's
+writable layer. `git pull && docker compose up -d` recreates the container, that
+layer is deleted with it, and the new — empty — volume takes its place. Every
+existing archive is gone, and once the old container is removed there is nothing
+to recover from. `/opt/palworld/config-snapshots` and
+`/opt/palworld/config-backups` moved onto volumes in the same release and have the
+same exposure.
+
+```bash
+cd docker
+# 1. while the OLD container still exists:
+docker compose cp palwarden:/opt/palworld/backups ./backups-migrate
+docker compose cp palwarden:/opt/palworld/config-snapshots ./snapshots-migrate
+# 2. bring the new image up, then copy back into the volume:
+COMPOSE_PROFILES=embedded docker compose up -d --build
+docker compose cp ./backups-migrate/. palwarden:/opt/palworld/backups
+docker compose exec palwarden chown -R root:root /opt/palworld/backups
+docker compose exec palwarden chown steam:steam /opt/palworld/backups/palworld-save-*.tar.gz
+docker compose exec palwarden ls -l /opt/palworld/backups   # dir root 0755, files steam
+```
+
+The directory must end up **root-owned `0755`** with the archives owned by the
+service account — that split is what stops the unprivileged web process
+substituting an archive, and `palworld-restore` refuses outright when it is wrong.
+
+If the upgrade already happened, the entrypoint says so on every start:
+`WARNING: /opt/palworld/backups is empty but this world already has saves`. It is
+detected from the world (`palworld-saved` has saves, backups has nothing), so it
+also fires on a first boot with a pre-seeded world — harmless, and preferable to
+silence.
+
+Bare metal is unaffected: `/opt/palworld/backups` is a real directory on the host
+and `install.sh` never removes it.
+
 ### Changing the schedule or retention
 
 The schedule is a **file**, not a unit: `/etc/palworld/backup.env`. The timer

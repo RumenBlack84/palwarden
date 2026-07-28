@@ -306,18 +306,18 @@ assert_contains "$out" "while copying" \
 assert_eq "$(bk_entries)" "0" "the growing upload left no temp file"
 
 # The load-bearing case above: the free-space check approves a size, and the
-# copy must be bounded by *that* size, not by MAX_UPLOAD_BYTES. Leave
-# MAX_UPLOAD_BYTES at its huge default (comfortably above the grown size too),
+# copy must be bounded by *that* size, not by MAX_IMPORT_BYTES. Leave
+# MAX_IMPORT_BYTES at its huge default (comfortably above the grown size too),
 # so the only thing that can still refuse the grown upload is the copy loop
 # being capped at the size _check_capacity actually stat'd and approved. If the
-# copy were bounded by MAX_UPLOAD_BYTES instead (as it was before this fix),
+# copy were bounded by MAX_IMPORT_BYTES instead (as it was before this fix),
 # this promotion would silently succeed with grown, unapproved bytes on disk.
 reset_dirs
 cp "$WORK/good.tar.gz" "$UP/$NAME"
 out="$(PYTHONPATH="$LIB" PALWARDEN_UPLOAD_DIR="$UP" PALWARDEN_SAVE_BACKUP_DIR="$BK" \
   python3 "$WORK/harness_grow.py" "$RESTORE" "$UP/$NAME" 2>&1)"
 assert_not_contains "$out" "rc=0" \
-  "with MAX_UPLOAD_BYTES left huge, growth past the size the free-space check approved is still refused"
+  "with MAX_IMPORT_BYTES left huge, growth past the size the free-space check approved is still refused"
 assert_contains "$out" "while copying" \
   "the growth is refused by the in-copy cap, bounded by the approved size"
 assert_eq "$(bk_entries)" "0" \
