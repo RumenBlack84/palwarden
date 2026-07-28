@@ -45,6 +45,12 @@ name: palwarden-live
 services:
   palwarden:
     container_name: palwarden-live
+    # Its own tag, not compose.yaml's `palwarden:latest`. Containers, volumes and the
+    # network are project-scoped and so already isolated, but an image tag is not: a
+    # live `up --build` on a feature branch would retag the image the real deployment
+    # then starts from. Not destructive, but it is the one mutable resource the two
+    # projects would otherwise share. `build:` is inherited from compose.yaml.
+    image: palwarden-live:latest
     environment:
       # Overrides compose.yaml's ${UPDATE_ON_START:-true}. See above: the install
       # is a deliberate one-time step, not part of a test run.

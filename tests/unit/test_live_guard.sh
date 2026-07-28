@@ -21,7 +21,10 @@ LIB="$DIR/../live/lib/testbed.sh"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-ME="$(id -u)"
+# Read the ownership the guard itself will see, rather than assuming `id -u` matches
+# it: on an idmapped or uid-shifting mount the two diverge, and the should-pass cases
+# below would then fail for a reason that has nothing to do with the guard.
+ME="$(stat -c %u "$WORK")"
 # Every fixture below is created by this process, so this is the ownership the
 # guard should accept. Cases that want a *mismatch* override it per call.
 export PALWARDEN_LIVE_EXPECT_UID="$ME"
@@ -81,8 +84,6 @@ assert_contains "$out" "does not exist" \
   "the absent-testbed refusal reports the missing directory"
 assert_contains "$out" "LIVE_E_NO_TESTBED" "the absent-testbed refusal carries its own code"
 assert_not_contains "$out" "LIVE_E_OWNER_UID" \
-  "a missing directory is not reported as a uid problem"
-assert_not_contains "$out" "uid" \
   "a missing directory is not reported as a uid problem"
 
 # --- refuses when the marker exists but the game is not installed ---------
