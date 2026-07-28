@@ -123,6 +123,21 @@ Update path when a new build exists:
 - Starts palworld.service again if it was active before update.
 - Waits for service/API readiness and posts completion/failure notifications.
 
+## Backup panel
+
+The browser page for the world-save archives is installed alongside the editors:
+
+- /opt/palworld/tools/config-webui/backups.html
+- http://127.0.0.1:8088/backups.html
+
+It lists the archives (name, size, UTC date) with Download, Restore and Delete per
+row, creates a backup, imports an uploaded archive in two steps (stage, then a
+separate import job), and edits the scheduled-backup settings. Every mutation is a
+job run by `palwarden-jobd`; the page itself only ever talks to the HTTP API.
+Delete asks for **two** confirmations after the row button, because it is the one
+action in the control plane with no undo, and Cancel is the default-focused control
+in both dialogs.
+
 ## Engine.ini performance tuning helper
 
 A curated Engine.ini performance editor is installed next to the server-settings editor:

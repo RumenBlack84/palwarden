@@ -645,4 +645,593 @@ assert_eq "$(code -u "$CREDS" "$U/api/jobs")" "200" "the job API still works"
 assert_eq "$(code -u "$CREDS" -X POST -H "$TOKHDR" -d '{}' "$U/api/nope")" "404" \
   "POST to an unknown endpoint is still 404"
 
+# ===========================================================================
+# The Backups page (Task 7)
+#
+# Everything above proves the server's half of the panel. This section proves the
+# browser page speaks it: the right actions with the right params, the token from
+# /api/token into sessionStorage, and — the reason this page exists in this suite
+# rather than only in test_webui_jobs.sh — that DELETE really is three steps.
+#
+# Preferring node-executed checks over greps: a grep that "Delete" appears twice
+# says nothing about *when* the request goes out, and the whole point of the flow
+# is that the first two steps send nothing.
+# ===========================================================================
+PAGE="$REPO/webui/backups.html"
+DASH="$REPO/webui/palwarden.html"
+EDITOR="$REPO/webui/EngineIniPerformanceEditor.html"
+
+assert_file_exists "$PAGE" "the Backups page exists"
+assert_file_contains "$PAGE" "SPDX-License-Identifier: AGPL-3.0-or-later" \
+  "the Backups page carries the AGPL identifier"
+assert_file_contains "$PAGE" "SPDX-FileCopyrightText: 2026 Brian Grant" \
+  "the Backups page carries our copyright"
+assert_file_contains "$PAGE" "CREDITS.md" "the Backups page notes its MIT derivation"
+# The vendored editor is MIT and byte-identical; it carries no palwarden nav at all
+# (it never had one), so it is deliberately NOT given the Backups tab. The two
+# first-party nav-bearing pages are.
+assert_rc 0 git -C "$REPO" diff --quiet -- webui/PalWorldSettingsEditor.html
+assert_file_not_contains "$REPO/webui/PalWorldSettingsEditor.html" "backups.html" \
+  "the vendored editor is untouched, nav included"
+for nav_page in "$PAGE" "$DASH" "$EDITOR"; do
+  assert_file_contains "$nav_page" 'href="backups.html"' \
+    "$(basename "$nav_page") links to the Backups tab"
+  assert_file_contains "$nav_page" 'href="palwarden.html"' \
+    "$(basename "$nav_page") links to the Dashboard tab"
+  assert_file_contains "$nav_page" 'href="PalWorldSettingsEditor.html"' \
+    "$(basename "$nav_page") links to the Server settings tab"
+  assert_file_contains "$nav_page" 'href="EngineIniPerformanceEditor.html"' \
+    "$(basename "$nav_page") links to the Engine.ini tab"
+done
+assert_file_contains "$PAGE" 'href="backups.html" aria-current="page"' \
+  "the Backups page marks its own tab as current"
+
+# the four actions this page is allowed to enqueue, and no other
+for action in "'backup'" "'backup_import'" "'backup_restore'" "'backup_delete'" \
+              "'backup_schedule_save'"; do
+  assert_file_contains "$PAGE" "runJob($action" "the page enqueues $action"
+done
+assert_file_not_contains "$PAGE" "'graceful_stop'" \
+  "the page does not stop the server behind the restore's back"
+assert_file_not_contains "$PAGE" "palworld-backups --delete" \
+  "the page never claims to run a tool itself"
+
+# token handling, identical to the Engine editor's
+assert_file_contains "$PAGE" "X-Palwarden-Token" "mutations send the token header"
+assert_file_contains "$PAGE" "sessionStorage.getItem" "the token is read from sessionStorage"
+assert_file_not_contains "$PAGE" "localStorage" "the token never lands in localStorage"
+assert_file_contains "$PAGE" "'/api/token'" "the token comes from /api/token"
+assert_file_not_contains "$PAGE" "document.cookie" "the token is never put in a cookie"
+assert_file_not_contains "$PAGE" "Authorization: Bearer" \
+  "the token does not try to share the Basic auth header"
+# the upload's own two requirements
+assert_file_contains "$PAGE" "'/api/backups/upload'" "the import uploads to the upload endpoint"
+assert_file_contains "$PAGE" "X-Palwarden-Filename" "the upload names the file in the header"
+assert_file_contains "$PAGE" "body: file" "the File is the raw request body"
+assert_file_contains "$PAGE" "/download" "each row can download its archive"
+# the vocabulary the design spec fixes
+assert_file_contains "$PAGE" 'class="pw-confirm"' "confirmations use pw-confirm"
+assert_file_contains "$PAGE" "showModal" "the dialogs are modal (focus-trapped, Esc cancels)"
+assert_file_contains "$PAGE" "confirm: true" "the irreversible bodies carry confirm: true"
+assert_file_contains "$PAGE" 'class="pw-log' "job progress goes in a pw-log region"
+assert_file_contains "$PAGE" 'aria-live="polite"' "the job log is announced politely"
+assert_file_contains "$PAGE" 'id="toast"' "outcomes go in a pw-toast"
+assert_file_contains "$PAGE" "No backups yet" "the empty list says so"
+assert_file_contains "$PAGE" "prefers-reduced-motion" "the transition respects reduced motion"
+assert_file_not_contains "$PAGE" "WEBUI_PASSWORD" "no credential baked into the page"
+
+# --- structural invariants a grep cannot express ---------------------------
+# 1. no HTML-parsing sink, no raw colour outside :root, no inline style (the same
+#    three the editor and the dashboard are held to, applied here as well; the
+#    guard in tests/unit/test_webui_jobs.sh covers all three pages together, this
+#    is the copy that fails in *this* suite when the page itself regresses).
+# 2. every class the page uses already exists in the two sibling pages: the design
+#    spec fixes the component vocabulary, and a new class here is a new component
+#    nobody reviewed.
+# 3. both delete dialogs (and the restore dialog) put Cancel first AND give it the
+#    autofocus, so the destructive button is never the default target.
+# 4. every runJob payload carries only params the *worker* recognises, read out of
+#    palwarden-jobd's own ACTIONS table rather than duplicated here.
+structural="$(python3 - "$PAGE" "$DASH" "$EDITOR" "$REPO/sbin/palwarden-jobd" <<'PY'
+import re
+import sys
+
+page_path, dash_path, editor_path, jobd_path = sys.argv[1:5]
+src = open(page_path, encoding="utf-8").read()
+bad = []
+
+# 1. sinks / colours / inline styles
+SINKS = (
+    (r"\.innerHTML\s*=\s*([^;\n]*)", "innerHTML"),
+    (r"\.outerHTML\s*=\s*([^;\n]*)", "outerHTML"),
+    (r"\.insertAdjacentHTML\s*\(([^;\n]*)", "insertAdjacentHTML"),
+    (r"\bdocument\.write(?:ln)?\s*\(([^;\n]*)", "document.write"),
+    (r"\.setHTMLUnsafe\s*\(([^;\n]*)", "setHTMLUnsafe"),
+    (r"<template\b", "template element"),
+)
+COLOR_PATTERNS = (
+    r"#[0-9a-fA-F]{3,8}\b",
+    r"\b(?:rgb|rgba|hsl|hsla|hwb|lab|lch|oklab|oklch|color|color-mix)\s*\(",
+)
+for pattern, label in SINKS:
+    for m in re.finditer(pattern, src):
+        arg = (m.group(1).strip() if m.groups() else "")
+        if label == "innerHTML" and arg in ('""', "''"):
+            continue
+        bad.append("HTML sink used: %s (%r)" % (label, arg or m.group(0)))
+style = re.search(r"<style>(.*?)</style>", src, re.S)
+if not style:
+    bad.append("no <style> block")
+else:
+    css = style.group(1)
+    root = re.search(r":root\s*\{.*?\}", css, re.S)
+    if not root:
+        bad.append("no :root token block")
+    outside = css.replace(root.group(0), "") if root else css
+    for pattern in COLOR_PATTERNS:
+        for m in re.finditer(pattern, outside):
+            bad.append("raw colour outside :root: %s" % m.group(0))
+if re.search(r"\sstyle=", src):
+    bad.append("inline style attribute")
+
+# 2. no new class names
+def classes(text):
+    found = set()
+    for m in re.finditer(r'class="([^"]*)"', text):
+        found.update(m.group(1).split())
+    for m in re.finditer(r"""\.className\s*=\s*['"]([^'"]*)['"]""", text):
+        found.update(m.group(1).split())
+    for m in re.finditer(r"""classList\.(?:add|remove|toggle)\(\s*['"]([^'"]*)['"]""", text):
+        found.update(m.group(1).split())
+    return found
+
+known = classes(open(dash_path, encoding="utf-8").read())
+known |= classes(open(editor_path, encoding="utf-8").read())
+for cls in sorted(classes(src)):
+    # A dynamic suffix ("pw-pill pw-pill--" + state) leaves a prefix token behind;
+    # accept it only when it really is the prefix of a class the vocabulary has.
+    if cls in known or any(k.startswith(cls) for k in known):
+        continue
+    bad.append("new class name: %s" % cls)
+
+# 3. the dialogs
+dialogs = re.findall(r"<dialog\b[^>]*id=\"([^\"]+)\"[^>]*>(.*?)</dialog>", src, re.S)
+if len(dialogs) != 3:
+    bad.append("expected 3 pw-confirm dialogs (restore + two delete steps), found %d"
+               % len(dialogs))
+for dlg_id, body in dialogs:
+    buttons = re.findall(r"<button\b([^>]*)>", body)
+    if len(buttons) != 2:
+        bad.append("%s has %d buttons, expected Cancel + one confirm" % (dlg_id, len(buttons)))
+        continue
+    first, second = buttons
+    autofocused = [attrs for attrs in buttons if "autofocus" in attrs]
+    if len(autofocused) != 1:
+        bad.append("%s has %d autofocus buttons, expected exactly 1" % (dlg_id, len(autofocused)))
+    for attrs in autofocused:
+        if "pw-btn--danger" in attrs:
+            bad.append("%s: the DESTRUCTIVE button carries autofocus" % dlg_id)
+        if "-cancel" not in attrs:
+            bad.append("%s: autofocus is not on the cancel button" % dlg_id)
+    # DOM order matters too: it decides the default target if a browser ever
+    # ignores autofocus on a dialog that has already been shown once.
+    if "pw-btn--danger" in first:
+        bad.append("%s: the destructive button comes first in DOM order" % dlg_id)
+    if "pw-btn--danger" not in second:
+        bad.append("%s: the confirming button is not marked pw-btn--danger" % dlg_id)
+    if "-cancel" not in first:
+        bad.append("%s: the first button is not the cancel button" % dlg_id)
+
+# 4. payload keys, against the worker's own table
+jobd = open(jobd_path, encoding="utf-8").read()
+table = re.search(r"^ACTIONS: dict\[str, dict\] = \{(.*?)^\}", jobd, re.S | re.M)
+if not table:
+    bad.append("could not find ACTIONS in palwarden-jobd")
+    allowed = {}
+else:
+    allowed = {}
+    for m in re.finditer(r'"([a-z_]+)":\s*\{(.*?)\},\n', table.group(1) + "\n", re.S):
+        action, spec = m.group(1), m.group(2)
+        params = re.search(r'"params":\s*\(([^)]*)\)', spec)
+        names = set(re.findall(r'"([a-z_]+)"', params.group(1))) if params else set()
+        if re.search(r'"disruptive":\s*True', spec):
+            names.add("confirm")
+        allowed[action] = names
+    for needed in ("backup", "backup_import", "backup_restore", "backup_delete",
+                   "backup_schedule_save"):
+        if needed not in allowed:
+            bad.append("ACTIONS parse missed %s" % needed)
+
+calls = re.findall(r"runJob\(\s*'([a-z_]+)'\s*,\s*\{([^}]*)\}", src)
+seen = set()
+for action, params in calls:
+    seen.add(action)
+    keys = set(re.findall(r"([A-Za-z_][A-Za-z0-9_]*)\s*:", params))
+    if action not in allowed:
+        bad.append("%s is not an action the worker knows" % action)
+        continue
+    for key in sorted(keys - allowed[action]):
+        bad.append("%s passes a param the worker does not recognise: %s" % (action, key))
+    if action in ("backup_delete", "backup_restore") and "confirm: true" not in params:
+        bad.append("%s is missing confirm: true" % action)
+    if action in ("backup", "backup_import", "backup_schedule_save") and "confirm" in keys:
+        bad.append("%s is not disruptive and must not send confirm" % action)
+expected_actions = {"backup", "backup_import", "backup_restore", "backup_delete",
+                    "backup_schedule_save"}
+if seen != expected_actions:
+    bad.append("the page enqueues %s, expected %s"
+               % (sorted(seen), sorted(expected_actions)))
+
+print("OK" if not bad else "; ".join(bad))
+PY
+)"
+assert_eq "$structural" "OK" "the Backups page's DOM/CSS/dialog/payload invariants hold"
+
+# --- node: the three-step delete, driven for real --------------------------
+# Extracts the page's own deleteArchive() and the two message builders, then runs
+# them against a stubbed openConfirm/runJob. This is the check that fails if the
+# flow ever collapses into "one dialog, then send".
+js_block() {  # js_block <file> <awk-start-regex> <awk-end-regex>
+  awk -v s="$2" -v e="$3" '$0 ~ s {f=1} f{print} f && $0 ~ e {exit}' "$1"
+}
+if command -v node >/dev/null 2>&1; then
+  DEL_JS="$WORK/delete-flow.js"
+  {
+    js_block "$PAGE" '^function formatBytes' '^}'
+    js_block "$PAGE" '^function formatWhen' '^}'
+    js_block "$PAGE" '^function deleteFirstMessage' '^}'
+    js_block "$PAGE" '^function deleteFinalMessage' '^}'
+    js_block "$PAGE" '^async function deleteArchive' '^}'
+  } > "$DEL_JS"
+  cat >> "$DEL_JS" <<'EOF'
+
+let failures = 0;
+function check(desc, cond) { if (!cond) { failures++; console.log("FAIL: " + desc); } }
+
+// Stubs. Anything that would reach the network or the DOM is recorded instead.
+let dialogs = [], answers = [], posted = [], logs = [], refreshed = 0;
+function log(line) { logs.push(String(line)); }
+async function loadArchives() { refreshed++; }
+async function runJob(action, params) { posted.push({ action: action, params: params }); return { ok: true, id: "job-1" }; }
+async function openConfirm(id, title, message, okLabel) {
+  dialogs.push({ id: id, title: title, message: message, okLabel: okLabel });
+  if (!answers.length) throw new Error("openConfirm called more often than the test allowed: " + id);
+  return answers.shift();
+}
+function reset(replies) { dialogs = []; answers = replies.slice(); posted = []; logs = []; refreshed = 0; }
+
+const ENTRY = { name: "palworld-save-20260101T000000Z.tar.gz", bytes: 150020, modified: 1767225600 };
+
+(async () => {
+  // formatting, pinned with literal expectations (the dialogs quote these)
+  check("bytes under 1 KiB are plain", formatBytes(512) === "512 B");
+  check("KiB gets one decimal under 10", formatBytes(1536) === "1.5 KiB");
+  check("KiB is rounded over 10", formatBytes(150020) === "147 KiB");
+  check("GiB scales", formatBytes(5 * 1024 * 1024 * 1024) === "5.0 GiB");
+  check("a missing size is named, not NaN", formatBytes(undefined) === "unknown size");
+  check("the date is rendered in UTC", formatWhen(1767225600) === "2026-01-01 00:00:00Z");
+  check("a missing date is named", formatWhen(0) === "unknown date");
+
+  // STEP 1 -> cancel: nothing is sent, and only the first dialog was opened.
+  reset([false]);
+  await deleteArchive(ENTRY, 3);
+  check("cancelling the first dialog sends NOTHING", posted.length === 0);
+  check("cancelling the first dialog opens exactly one dialog", dialogs.length === 1);
+  check("the first dialog is the first delete dialog", dialogs[0].id === "confirm-delete-1");
+  check("the first dialog names the archive in its title", String(dialogs[0].title).indexOf(ENTRY.name) !== -1);
+  check("the first dialog names the archive in its body", dialogs[0].message.indexOf(ENTRY.name) !== -1);
+  check("the first dialog names the size", dialogs[0].message.indexOf("147 KiB") !== -1);
+  check("the first dialog names the date", dialogs[0].message.indexOf("2026-01-01 00:00:00Z") !== -1);
+  check("a first-step cancel refreshes nothing", refreshed === 0);
+  check("a first-step cancel is logged as sending nothing", logs.some(l => /nothing was sent/.test(l)));
+
+  // STEP 2 -> cancel: the second dialog was reached, and still nothing is sent.
+  reset([true, false]);
+  await deleteArchive(ENTRY, 3);
+  check("confirming ONLY the first dialog sends NOTHING", posted.length === 0);
+  check("confirming the first dialog opens the second", dialogs.length === 2);
+  check("the second dialog is the final one", dialogs[1].id === "confirm-delete-2");
+  check("the final dialog says it cannot be recovered", /cannot be recovered/i.test(dialogs[1].message));
+  check("the final dialog names the archive", dialogs[1].message.indexOf(ENTRY.name) !== -1);
+  check("the final dialog does not cry 'only archive' when there are three",
+        !/ONLY archive/.test(dialogs[1].message));
+  check("a second-step cancel refreshes nothing", refreshed === 0);
+  check("a second-step cancel is logged as sending nothing", logs.some(l => /nothing was sent/.test(l)));
+
+  // BOTH confirmed: exactly one POST, with confirm: true and nothing else.
+  reset([true, true]);
+  await deleteArchive(ENTRY, 3);
+  check("both confirmations send exactly one job", posted.length === 1);
+  check("the job is backup_delete", posted[0].action === "backup_delete");
+  check("the payload names the archive", posted[0].params.backup === ENTRY.name);
+  check("the payload carries confirm: true", posted[0].params.confirm === true);
+  check("the payload carries only backup and confirm",
+        JSON.stringify(Object.keys(posted[0].params).sort()) === '["backup","confirm"]');
+  check("the list refreshes after a real delete", refreshed === 1);
+  check("two dialogs were shown, not one", dialogs.length === 2);
+
+  // The only-archive case: the last backup there is must say so out loud.
+  reset([true, true]);
+  await deleteArchive(ENTRY, 1);
+  check("the final dialog says it is the only archive", /ONLY archive/.test(dialogs[1].message));
+  check("...and says there would then be no backup at all",
+        /no backup of this world at all/.test(dialogs[1].message));
+  check("deleteFinalMessage(entry, 1) says only", /ONLY archive/.test(deleteFinalMessage(ENTRY, 1)));
+  check("deleteFinalMessage(entry, 2) does not", !/ONLY archive/.test(deleteFinalMessage(ENTRY, 2)));
+
+  console.log(failures === 0 ? "OK" : "FAIL");
+})();
+EOF
+  del_out="$(node "$DEL_JS" 2>&1)"
+  assert_eq "$del_out" "OK" "deleteArchive() extracted from the page really is three steps"
+
+  # --- node: the row renderer, against a hostile archive name --------------
+  # The API would refuse this name, which is exactly why the renderer is driven
+  # directly: the page's own escaping must not depend on the server's filter.
+  REN_JS="$WORK/render-archives.js"
+  {
+    js_block "$PAGE" '^function formatBytes' '^}'
+    js_block "$PAGE" '^function formatWhen' '^}'
+    grep '^function el(' "$PAGE"
+    js_block "$PAGE" '^function renderArchives' '^}'
+  } > "$REN_JS"
+  cat >> "$REN_JS" <<'EOF'
+
+let failures = 0;
+function check(desc, cond) { if (!cond) { failures++; console.log("FAIL: " + desc); } }
+
+// A DOM stub that makes every HTML sink an immediate failure: if the renderer
+// ever reaches for one, this throws instead of quietly "working".
+function node(tag) {
+  const self = {
+    tag: tag, children: [], attrs: {}, props: {}, _text: "", listeners: 0,
+    classList: {
+      _c: new Set(),
+      contains(c) { return this._c.has(c); },
+      add(c) { this._c.add(c); },
+      remove(c) { this._c.delete(c); },
+      toggle(c, on) { if (on) this._c.add(c); else this._c.delete(c); },
+    },
+    append(...kids) { for (const k of kids) self.children.push(k); },
+    appendChild(k) { self.children.push(k); },
+    setAttribute(k, v) { self.attrs[k] = String(v); },
+    addEventListener() { self.listeners++; },
+  };
+  Object.defineProperty(self, "textContent", {
+    get() { return self._text; },
+    set(v) { self._text = String(v); self.children = []; },
+  });
+  for (const sink of ["innerHTML", "outerHTML"]) {
+    Object.defineProperty(self, sink, {
+      set(v) { throw new Error("the renderer assigned " + sink); },
+    });
+  }
+  self.insertAdjacentHTML = () => { throw new Error("the renderer used insertAdjacentHTML"); };
+  self.setHTMLUnsafe = () => { throw new Error("the renderer used setHTMLUnsafe"); };
+  return self;
+}
+const ROOT = node("div");
+global.document = { createElement: node, getElementById: (id) => (id === "archives" ? ROOT : null) };
+function walk(n, out) {
+  out.push(n);
+  for (const k of n.children) walk(k, out);
+  return out;
+}
+
+const HOSTILE = '<img src=x onerror=alert(1)>';
+
+// the empty case: the fresh-install message, marked pw-empty
+renderArchives([]);
+check("an empty list renders one node", ROOT.children.length === 1);
+check("the empty list says 'No backups yet'", ROOT.children[0]._text === "No backups yet");
+check("the empty placeholder is pw-empty", ROOT.children[0].className === "pw-empty");
+
+renderArchives([
+  { name: HOSTILE, bytes: 1536, modified: 1767225600 },
+  { name: "palworld-save-20260102T000000Z.tar.gz", bytes: 150020, modified: 1785159909 },
+]);
+check("one row per archive", ROOT.children.length === 2);
+const nodes = walk(ROOT, []);
+const texts = nodes.map(n => n._text);
+check("the hostile name is present as ONE literal text value", texts.indexOf(HOSTILE) !== -1);
+check("no node holds an escaped or partial version of it",
+      !texts.some(t => t !== HOSTILE && t.indexOf("<img") !== -1));
+check("nothing double-escapes the name", !texts.some(t => t.indexOf("&lt;") !== -1));
+check("the row shows the formatted size", texts.indexOf("1.5 KiB") !== -1);
+check("the row shows the formatted date", texts.indexOf("2026-01-01 00:00:00Z") !== -1);
+check("the second row shows its own date", texts.indexOf("2026-07-27 13:45:09Z") !== -1);
+
+const links = nodes.filter(n => n.tag === "a");
+check("each row has a download link", links.length === 2);
+check("the hostile name is percent-encoded into the URL",
+      links[0].href === "/api/backups/" + encodeURIComponent(HOSTILE) + "/download");
+check("the download href carries no raw angle bracket", links[0].href.indexOf("<") === -1);
+check("the download is an attachment named after the archive", links[0].download === HOSTILE);
+
+const buttons = nodes.filter(n => n.tag === "button");
+check("each row has Restore and Delete", buttons.length === 4);
+check("Restore and Delete are marked destructive",
+      buttons.every(b => String(b.className).indexOf("pw-btn--danger") !== -1));
+check("every row control is wired to a handler", buttons.every(b => b.listeners === 1));
+check("the row labels are plain text",
+      buttons.map(b => b._text).join(",") === "Restore,Delete,Restore,Delete");
+
+console.log(failures === 0 ? "OK" : "FAIL");
+EOF
+  ren_out="$(node "$REN_JS" 2>&1)"
+  assert_eq "$ren_out" "OK" "renderArchives() renders a hostile archive name as literal text"
+
+  # --- node: the schedule form --------------------------------------------
+  # All four keys every time (the worker refuses a partial save on purpose), the
+  # enabled flag as a real JSON boolean, and a refusal shown back verbatim.
+  SCH_JS="$WORK/schedule.js"
+  {
+    js_block "$PAGE" '^const SCHEDULE_FIELDS' '^]'
+    js_block "$PAGE" '^function collectSchedule' '^}'
+    js_block "$PAGE" '^async function saveSchedule' '^}'
+  } > "$SCH_JS"
+  cat >> "$SCH_JS" <<'EOF'
+
+let failures = 0;
+function check(desc, cond) { if (!cond) { failures++; console.log("FAIL: " + desc); } }
+
+let STATE = {};
+function el(id) { return STATE[id]; }
+function form(enabled, interval, retention, keepmin) {
+  STATE = {
+    "sched-enabled": { checked: enabled },
+    "sched-interval": { value: interval },
+    "sched-retention": { value: retention },
+    "sched-keepmin": { value: keepmin },
+  };
+}
+let status = [];
+function setStatus(id, message, empty) { status.push({ id: id, message: message, empty: empty }); }
+let posted = [], reply = { ok: true, id: "job-1" };
+async function runJob(action, params) { posted.push({ action: action, params: params }); return reply; }
+
+(async () => {
+  form(true, "6", " 30 ", "5");
+  const got = collectSchedule();
+  check("all four keys are collected",
+        JSON.stringify(Object.keys(got).sort()) ===
+        '["BACKUP_ENABLED","BACKUP_INTERVAL_HOURS","BACKUP_KEEP_MIN","BACKUP_RETENTION_DAYS"]');
+  check("BACKUP_ENABLED is a real JSON boolean", got.BACKUP_ENABLED === true);
+  check("the numbers are digit strings", got.BACKUP_INTERVAL_HOURS === "6");
+  check("whitespace is trimmed", got.BACKUP_RETENTION_DAYS === "30");
+  check("no number is sent as a JSON boolean",
+        !/"BACKUP_(INTERVAL_HOURS|RETENTION_DAYS|KEEP_MIN)":(true|false)/.test(JSON.stringify(got)));
+
+  // off is still sent — an omitted BACKUP_ENABLED would be refused, and a
+  // "false means leave it out" bug is exactly what that refusal exists for
+  form(false, "1", "1", "1");
+  check("disabling still posts BACKUP_ENABLED", collectSchedule().BACKUP_ENABLED === false);
+  check("disabling still posts all four keys", Object.keys(collectSchedule()).length === 4);
+
+  // the happy save
+  form(true, "6", "30", "5");
+  posted = []; status = []; reply = { ok: true, id: "job-1" };
+  await saveSchedule();
+  check("saving posts exactly one job", posted.length === 1);
+  check("saving posts backup_schedule_save", posted[0].action === "backup_schedule_save");
+  check("the payload carries only settings",
+        JSON.stringify(Object.keys(posted[0].params)) === '["settings"]');
+  check("the payload carries all four keys", Object.keys(posted[0].params.settings).length === 4);
+  check("the success message says it takes effect on the next tick",
+        /next scheduled tick/.test(status[status.length - 1].message));
+
+  // the worker's refusal, verbatim
+  const REFUSAL = "BACKUP_INTERVAL_HOURS must be an integer 1-720, got 0";
+  form(true, "0", "30", "5");
+  posted = []; status = []; reply = { ok: false, error: REFUSAL };
+  await saveSchedule();
+  check("an out-of-range value still reaches the worker (it is the authority)", posted.length === 1);
+  check("the worker's refusal is shown verbatim",
+        status[status.length - 1].message === REFUSAL);
+  check("the refusal is not styled as an empty placeholder",
+        !status[status.length - 1].empty);
+
+  console.log(failures === 0 ? "OK" : "FAIL");
+})();
+EOF
+  sch_out="$(node "$SCH_JS" 2>&1)"
+  assert_eq "$sch_out" "OK" "the schedule form posts all four keys and shows a refusal verbatim"
+
+  # --- node: the upload itself --------------------------------------------
+  # The one request on this page that is not a job: the File goes out as the raw
+  # body with the validated name in a header, and a 403 discards the cached token
+  # so the operator's retry can just work.
+  UP_JS="$WORK/upload.js"
+  {
+    grep '^const TOKEN_KEY' "$PAGE"
+    js_block "$PAGE" '^function formatBytes' '^}'
+    js_block "$PAGE" '^function errText' '^}'
+    js_block "$PAGE" '^async function stageUpload' '^}'
+  } > "$UP_JS"
+  cat >> "$UP_JS" <<'EOF'
+
+let failures = 0;
+function check(desc, cond) { if (!cond) { failures++; console.log("FAIL: " + desc); } }
+
+const logs = [], toasts = [];
+let busy = [];
+function log(l) { logs.push(String(l)); }
+function toast(ok, m) { toasts.push({ ok: ok, message: String(m) }); }
+function setBusy(b) { busy.push(b); }
+async function token() { return "T-tok"; }
+let store = { "palwarden-token": "T-tok" };
+global.sessionStorage = {
+  getItem(k) { return Object.prototype.hasOwnProperty.call(store, k) ? store[k] : null; },
+  setItem(k, v) { store[k] = String(v); },
+  removeItem(k) { delete store[k]; },
+};
+let seen = null, responder = null;
+global.fetch = async (url, opts) => { seen = { url: url, opts: opts }; return responder(); };
+function json(status, body) {
+  return { status: status, ok: status >= 200 && status < 300, json: async () => body };
+}
+const FILE = { name: "palworld-save-20260101T000000Z.tar.gz", size: 150020 };
+function reset(r) { logs.length = 0; toasts.length = 0; busy = []; seen = null; responder = r; }
+
+(async () => {
+  reset(() => json(202, { ok: true, data: { staged: FILE.name, bytes: FILE.size } }));
+  let res = await stageUpload(FILE);
+  check("a good upload reports the staged name", res.ok && res.staged === FILE.name);
+  check("the upload POSTs to the upload endpoint", seen.url === "/api/backups/upload");
+  check("the upload is a POST", seen.opts.method === "POST");
+  check("the File itself is the request body", seen.opts.body === FILE);
+  check("the filename travels in the header",
+        seen.opts.headers["X-Palwarden-Filename"] === FILE.name);
+  check("the upload carries the token header",
+        seen.opts.headers["X-Palwarden-Token"] === "T-tok");
+  check("the upload is not sent as form data",
+        seen.opts.headers["Content-Type"] === "application/octet-stream");
+  check("progress is reported while streaming", logs.some(l => /uploading .* to the staging area/.test(l)));
+  check("the size is shown in the progress line", logs.some(l => l.indexOf("147 KiB") !== -1));
+  check("the controls are re-enabled on the happy path",
+        busy[0] === true && busy[busy.length - 1] === false);
+
+  // a refusal: the reason is handed back (not written to the DOM here, where
+  // setBusy's syncImport would overwrite it), and the controls come back
+  reset(() => json(400, { ok: false, error: "X-Palwarden-Filename must be an archive name this project wrote" }));
+  res = await stageUpload(FILE);
+  check("a refused upload reports not-ok", res.ok === false);
+  check("a refused upload hands back the server's reason verbatim",
+        res.error === "X-Palwarden-Filename must be an archive name this project wrote");
+  check("a refused upload toasts the failure", toasts.length === 1 && toasts[0].ok === false);
+  check("the controls are re-enabled after a refusal", busy[busy.length - 1] === false);
+
+  // a 403 discards the cached token so a retry re-fetches it
+  reset(() => json(403, { ok: false, error: "origin not allowed" }));
+  res = await stageUpload(FILE);
+  check("a 403 upload fails", res.ok === false);
+  check("a 403 discards the cached token", !("palwarden-token" in store));
+  check("a 403 says the token was discarded", /discarded/.test(res.error));
+
+  // a body that is not JSON at all must not throw past the caller
+  reset(() => ({ status: 502, ok: false, json: async () => { throw new Error("not json"); } }));
+  res = await stageUpload(FILE);
+  check("an unparseable response is reported, not thrown", res.ok === false && /502/.test(res.error));
+  check("the controls are re-enabled after a parse failure", busy[busy.length - 1] === false);
+
+  // a hard network failure
+  reset(() => { throw new Error("network down"); });
+  res = await stageUpload(FILE);
+  check("a network failure is reported", res.ok === false && /network down/.test(res.error));
+  check("the controls are re-enabled after a network failure", busy[busy.length - 1] === false);
+
+  console.log(failures === 0 ? "OK" : "FAIL");
+})();
+EOF
+  up_out="$(node "$UP_JS" 2>&1)"
+  assert_eq "$up_out" "OK" "stageUpload() streams the File with the validated name and recovers from every failure"
+elif [ -n "${CI:-}" ]; then
+  # These three are the only checks that execute the page's own code. Silently
+  # skipping them when a runner image changes would delete the panel's behavioural
+  # coverage — the three-step delete above all — without anyone noticing.
+  fail "node is required in CI to execute the Backups page's delete flow, renderer and schedule form"
+else
+  echo "  (skipping the node checks of the Backups page: node not found)" >&2
+fi
+
 assert_report

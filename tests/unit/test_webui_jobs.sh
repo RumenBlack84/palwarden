@@ -462,11 +462,11 @@ assert_file_contains "$EDITOR" 'id="toast"' "outcomes go in a pw-toast"
 # renders server-supplied error/blocked_by/Origin text, only vocabulary tokens,
 # and the two request bodies carrying no param key besides settings/confirm.
 #
-# Checks 1-3 run over BOTH first-party pages. The dashboard renders the same
-# API's strings (and grows job rendering next), so the reasoning is identical;
-# checking only the editor would let the guard pass while the sibling page grew
-# the exact hole it exists to prevent.
-structural="$(python3 - "$EDITOR" "$REPO/webui/palwarden.html" <<'PY'
+# Checks 1-3 run over EVERY first-party page. The dashboard renders the same
+# API's strings and the Backups page renders archive names and job output too, so
+# the reasoning is identical; checking only the editor would let the guard pass
+# while a sibling page grew the exact hole it exists to prevent.
+structural="$(python3 - "$EDITOR" "$REPO/webui/palwarden.html" "$REPO/webui/backups.html" <<'PY'
 import re, sys
 
 # Every way a string can become markup instead of text. The 403 reflects the

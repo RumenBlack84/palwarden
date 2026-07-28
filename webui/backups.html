@@ -1,0 +1,848 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 Brian Grant -->
+<!-- Derived in part from the MIT-licensed upstream Palworld settings editor
+     (page shell and form idiom only); see CREDITS.md and
+     webui/LICENSE.upstream-mit. The backup panel, its three-step delete flow and
+     the palwarden control-plane integration are first-party. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>palwarden — Backups</title>
+  <style>
+    /* Design tokens — the only place raw colors appear. Shared vocabulary with
+       webui/palwarden.html and the Engine.ini editor; see the design spec,
+       "Component vocabulary". No component class is invented here. */
+    :root {
+      color-scheme: dark;
+      --pw-bg: #14161a; --pw-surface: #1c1f25; --pw-border: #2b2f37;
+      --pw-fg: #e6e6e6; --pw-fg-muted: #9aa4b2;
+      --pw-ok: #7ddc86; --pw-warn: #f0c674; --pw-bad: #f28b82; --pw-idle: #8b93a1;
+      --pw-accent: #8ab4f8;
+      /* Translucent blacks. Two tokens, not one: --pw-scrim dims the viewport
+         behind a modal and --pw-shadow is an elevation shadow's colour. */
+      --pw-scrim: rgba(0, 0, 0, .6); --pw-shadow: rgba(0, 0, 0, .45);
+      --pw-space-1: 4px; --pw-space-2: 8px; --pw-space-3: 16px; --pw-space-4: 24px;
+      --pw-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+      --pw-sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body { font: 14px/1.5 var(--pw-sans); margin: 0;
+           background: var(--pw-bg); color: var(--pw-fg); }
+    a { color: var(--pw-accent); }
+    :focus-visible { outline: 2px solid var(--pw-accent); outline-offset: 2px; }
+
+    /* pw-nav: slim header bar with the wordmark and a segmented tab control. */
+    .pw-nav { display: flex; align-items: center; justify-content: space-between;
+              gap: var(--pw-space-3); padding: var(--pw-space-2) var(--pw-space-4);
+              border-bottom: 1px solid var(--pw-border); background: var(--pw-surface);
+              flex-wrap: wrap; }
+    .pw-nav__wordmark { font-family: var(--pw-mono); font-size: 1.1rem;
+                         letter-spacing: .08em; color: var(--pw-fg); }
+    .pw-nav__tabs { display: flex; gap: 2px; background: var(--pw-bg);
+                    border: 1px solid var(--pw-border); border-radius: 8px; padding: 2px; }
+    .pw-tab { font-family: var(--pw-sans); font-size: .82rem; color: var(--pw-fg-muted);
+              text-decoration: none; padding: var(--pw-space-1) var(--pw-space-3);
+              border-radius: 6px; }
+    .pw-tab:hover { color: var(--pw-fg); }
+    .pw-tab[aria-current="page"] { background: var(--pw-surface); color: var(--pw-fg);
+                                    border: 1px solid var(--pw-border); }
+
+    .pw-page { padding: var(--pw-space-4); }
+    .pw-page > h1 { font-family: var(--pw-mono); font-size: 1.8rem; font-weight: 600;
+                    margin: 0 0 var(--pw-space-2); letter-spacing: -.01em; }
+    .pw-page > p { color: var(--pw-fg-muted); margin: 0 0 var(--pw-space-4); }
+
+    /* pw-grid / pw-card: every top-level region is a titled card. */
+    .pw-grid { display: grid; gap: var(--pw-space-3);
+               grid-template-columns: repeat(6, 1fr); margin-bottom: var(--pw-space-3); }
+    .pw-card { background: var(--pw-surface); border: 1px solid var(--pw-border);
+               border-radius: 6px; padding: var(--pw-space-3);
+               grid-column: span 2; margin-bottom: var(--pw-space-3); }
+    .pw-card--wide { grid-column: span 3; }
+    .pw-card > h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .1em;
+                    color: var(--pw-fg-muted); margin: 0 0 var(--pw-space-2);
+                    font-family: var(--pw-sans); }
+    .pw-card > p { color: var(--pw-fg-muted); margin: 0 0 var(--pw-space-2); }
+    .pw-card code, .pw-card pre { font-family: var(--pw-mono); }
+    .pw-card pre { margin: 0; overflow: auto; }
+
+    /* pw-pill: state badge. Always carries a text label — never color alone. */
+    .pw-pill { display: inline-block; padding: 0 var(--pw-space-2); border-radius: 999px;
+               font-family: var(--pw-mono); font-size: .82rem;
+               border: 1px solid currentColor; }
+    .pw-pill--ok { color: var(--pw-ok); } .pw-pill--warn { color: var(--pw-warn); }
+    .pw-pill--bad { color: var(--pw-bad); } .pw-pill--idle { color: var(--pw-idle); }
+
+    /* pw-btn: action button. pw-btn--danger marks the disruptive one. The
+       inline-block/text-decoration pair is here so the per-row Download link can
+       be the same component as the buttons beside it without a new class. */
+    .pw-btn { font: inherit; color: var(--pw-fg); background: var(--pw-bg);
+              border: 1px solid var(--pw-border); border-radius: 6px;
+              padding: var(--pw-space-1) var(--pw-space-3); cursor: pointer;
+              margin: 0 var(--pw-space-2) var(--pw-space-2) 0;
+              display: inline-block; text-decoration: none;
+              transition: color .15s ease, border-color .15s ease; }
+    .pw-btn:hover:enabled, a.pw-btn:hover { color: var(--pw-accent);
+                                            border-color: var(--pw-accent); }
+    .pw-btn--danger { color: var(--pw-warn); border-color: var(--pw-warn); }
+    .pw-btn[disabled] { color: var(--pw-idle); border-color: var(--pw-border);
+                        cursor: not-allowed; }
+
+    input, select, textarea { font: inherit; font-family: var(--pw-mono);
+      color: var(--pw-fg); background: var(--pw-bg); border: 1px solid var(--pw-border);
+      border-radius: 6px; padding: var(--pw-space-1) var(--pw-space-2); }
+    input[type="checkbox"] { width: 18px; height: 18px; padding: 0;
+                             accent-color: var(--pw-accent); }
+    input[type="file"] { max-width: 100%; }
+
+    /* Archive rows and schedule rows: structural selectors, so no per-widget
+       class is invented. Rows are name / size / date / actions. */
+    #archives > div { display: grid; grid-template-columns: 1fr 7rem 12rem auto;
+                      gap: var(--pw-space-2); align-items: center;
+                      padding: var(--pw-space-2) 0;
+                      border-top: 1px solid var(--pw-border); }
+    #archives > div:first-child { border-top: 0; }
+    #archives code { word-break: break-all; }
+    #archives > div > div { white-space: nowrap; }
+    #schedule > div { display: grid; grid-template-columns: 1fr 8rem;
+                      gap: var(--pw-space-2); align-items: center;
+                      padding: var(--pw-space-2) 0;
+                      border-top: 1px solid var(--pw-border); }
+    #schedule > div:first-child { border-top: 0; }
+    #schedule label { font-weight: 600; }
+    #schedule small { display: block; color: var(--pw-fg-muted); font-weight: 400; }
+
+    /* pw-log: monospace scroll region for job progress. */
+    .pw-log { margin: 0; white-space: pre-wrap; word-break: break-word;
+              max-height: 14rem; overflow: auto; font-family: var(--pw-mono);
+              color: var(--pw-fg); }
+    .pw-empty { color: var(--pw-fg-muted); font-style: italic; }
+
+    /* pw-confirm: modal confirmation. showModal() supplies the focus trap and
+       Esc-cancels; the ::backdrop keeps the page visibly out of reach. */
+    .pw-confirm { background: var(--pw-surface); color: var(--pw-fg);
+                  border: 1px solid var(--pw-border); border-radius: 8px;
+                  padding: var(--pw-space-4); max-width: 34rem; }
+    .pw-confirm::backdrop { background: var(--pw-scrim); }
+    .pw-confirm > h2 { margin: 0 0 var(--pw-space-2); font-size: 1.1rem; }
+    .pw-confirm > p { margin: 0 0 var(--pw-space-3); }
+
+    /* pw-toast: one transient result at a time. */
+    .pw-toast { position: fixed; bottom: var(--pw-space-4); right: var(--pw-space-4);
+                max-width: 30rem; display: flex; align-items: baseline;
+                gap: var(--pw-space-2); background: var(--pw-surface);
+                border: 1px solid var(--pw-border); border-radius: 6px;
+                padding: var(--pw-space-3); box-shadow: 0 8px 24px var(--pw-shadow); }
+    .pw-toast[hidden] { display: none; }
+    .pw-toast > span { word-break: break-word; }
+
+    @media (max-width: 900px) {
+      .pw-grid { grid-template-columns: 1fr; }
+      .pw-card, .pw-card--wide { grid-column: span 1; }
+      #archives > div { grid-template-columns: 1fr; }
+      #schedule > div { grid-template-columns: 1fr 6rem; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      * { transition: none !important; animation: none !important; }
+    }
+  </style>
+</head>
+<body>
+<nav class="pw-nav">
+  <span class="pw-nav__wordmark">palwarden</span>
+  <div class="pw-nav__tabs">
+    <a class="pw-tab" href="palwarden.html">Dashboard</a>
+    <a class="pw-tab" href="PalWorldSettingsEditor.html">Server settings</a>
+    <a class="pw-tab" href="EngineIniPerformanceEditor.html">Engine.ini performance</a>
+    <a class="pw-tab" href="backups.html" aria-current="page">Backups</a>
+  </div>
+</nav>
+<div class="pw-page">
+  <h1>Backups</h1>
+  <p>World-save archives written by <code>palworld-backup</code> and managed by
+     <code>palworld-backups</code>. Everything on this page runs as a job through the
+     palwarden control plane; nothing is done in the browser.</p>
+
+  <section class="pw-card">
+    <h2>Archives</h2>
+    <p><strong>Download</strong> streams the archive to this browser and changes nothing.
+       <strong>Restore</strong> stops the server and replaces the live world.
+       <strong>Delete</strong> is the one action here with no undo, so it asks twice.</p>
+    <div>
+      <button type="button" class="pw-btn" id="btn-refresh">Refresh list</button>
+      <button type="button" class="pw-btn" id="btn-backup">Create backup</button>
+    </div>
+    <div id="archives"></div>
+  </section>
+
+  <section class="pw-card">
+    <h2>Import an archive</h2>
+    <p>Two steps on purpose: the file is first streamed to a staging area, then a
+       separate job promotes it into the backups directory. Only names this project
+       wrote are accepted — <code>palworld-save-&lt;UTC stamp&gt;.tar.gz</code>.
+       Importing does not restore anything; the archive appears below as an ordinary
+       row and Restore is still a separate, confirmed action.</p>
+    <div>
+      <input type="file" id="import-file" accept=".gz,application/gzip"
+             aria-label="Archive file to import">
+      <button type="button" class="pw-btn" id="btn-upload" disabled>Upload and import</button>
+    </div>
+    <p class="pw-empty" id="import-msg" aria-live="polite">No file selected.</p>
+  </section>
+
+  <section class="pw-card">
+    <h2>Scheduled backups</h2>
+    <p>Read from the schedule file by <code>palworld-backups --if-due</code> on every
+       tick. Saving rewrites all four values together — a partial save is refused by
+       the worker on purpose, so a field left out cannot silently revert to a default.
+       <strong>Changes take effect on the next tick</strong>, not immediately: nothing
+       here starts or stops a backup that is already due.</p>
+    <div id="schedule">
+      <div>
+        <label for="sched-enabled">Scheduled backups enabled
+          <small>When off, the tick does nothing and no archive is written.</small>
+        </label>
+        <input type="checkbox" id="sched-enabled">
+      </div>
+      <div>
+        <label for="sched-interval">Interval (hours)
+          <small>1–720. How old the newest archive must be before a tick makes another.</small>
+        </label>
+        <input type="number" id="sched-interval" min="1" max="720" step="1" value="6">
+      </div>
+      <div>
+        <label for="sched-retention">Retention (days)
+          <small>1–3650. Archives older than this are pruned.</small>
+        </label>
+        <input type="number" id="sched-retention" min="1" max="3650" step="1" value="30">
+      </div>
+      <div>
+        <label for="sched-keepmin">Minimum kept
+          <small>1–100. Never prune below this many archives, however old they are.</small>
+        </label>
+        <input type="number" id="sched-keepmin" min="1" max="100" step="1" value="5">
+      </div>
+    </div>
+    <div>
+      <button type="button" class="pw-btn" id="btn-schedule-reload">Reload from server</button>
+      <button type="button" class="pw-btn" id="btn-schedule-save">Save schedule</button>
+    </div>
+    <!-- The worker's refusal is shown here verbatim, via textContent. -->
+    <p class="pw-empty" id="schedule-msg" aria-live="polite">Loading the schedule…</p>
+  </section>
+
+  <section class="pw-card">
+    <h2>Job progress</h2>
+    <pre class="pw-log pw-empty" id="joblog" aria-live="polite">No job started from this page yet.</pre>
+  </section>
+</div>
+
+<!-- Three dialogs, one per decision, rather than one element reused: the two
+     delete steps say different things and must be separately reviewable (and
+     separately assertable) — see tests/unit/test_webui_backups.sh.
+     In every one of them Cancel comes first in DOM order AND carries autofocus,
+     so the default focused control is never the destructive one: Enter or Space
+     on a freshly-opened dialog cancels. aria-describedby points at the body text
+     so the dialog has a description, not just a name. -->
+<dialog class="pw-confirm" id="confirm-restore" aria-labelledby="confirm-restore-title"
+        aria-describedby="confirm-restore-body">
+  <h2 id="confirm-restore-title">Restore this archive over the live world?</h2>
+  <p id="confirm-restore-body"></p>
+  <div>
+    <button type="button" class="pw-btn" id="confirm-restore-cancel" autofocus>Cancel</button>
+    <button type="button" class="pw-btn pw-btn--danger" id="confirm-restore-ok">Stop the server and restore</button>
+  </div>
+</dialog>
+
+<dialog class="pw-confirm" id="confirm-delete-1" aria-labelledby="confirm-delete-1-title"
+        aria-describedby="confirm-delete-1-body">
+  <h2 id="confirm-delete-1-title">Delete this archive?</h2>
+  <p id="confirm-delete-1-body"></p>
+  <div>
+    <button type="button" class="pw-btn" id="confirm-delete-1-cancel" autofocus>Cancel</button>
+    <button type="button" class="pw-btn pw-btn--danger" id="confirm-delete-1-ok">Continue</button>
+  </div>
+</dialog>
+
+<dialog class="pw-confirm" id="confirm-delete-2" aria-labelledby="confirm-delete-2-title"
+        aria-describedby="confirm-delete-2-body">
+  <h2 id="confirm-delete-2-title">This cannot be undone</h2>
+  <p id="confirm-delete-2-body"></p>
+  <div>
+    <button type="button" class="pw-btn" id="confirm-delete-2-cancel" autofocus>Cancel</button>
+    <button type="button" class="pw-btn pw-btn--danger" id="confirm-delete-2-ok">Delete permanently</button>
+  </div>
+</dialog>
+
+<!-- role starts polite and toast() switches it to "alert" for failures: a
+     disruptive job that errored must interrupt, not wait for the next idle. -->
+<div class="pw-toast" id="toast" role="status" hidden>
+  <span class="pw-pill pw-pill--idle" id="toast-state">—</span>
+  <span id="toast-message"></span>
+  <button type="button" class="pw-btn" id="toast-dismiss">Dismiss</button>
+</div>
+
+<script>
+// The archive-name rule, mirrored from lib/palwarden_archive.py's ARCHIVE_RE. Used
+// only to give a better message before spending an upload: the server re-checks it
+// and is the actual authority.
+const ARCHIVE_RE=/^palworld-save-[0-9]{8}T[0-9]{6}Z\.tar\.gz$/;
+const SCHEDULE_FIELDS=[
+  {key:'BACKUP_ENABLED', id:'sched-enabled', bool:true},
+  {key:'BACKUP_INTERVAL_HOURS', id:'sched-interval', min:1, max:720},
+  {key:'BACKUP_RETENTION_DAYS', id:'sched-retention', min:1, max:3650},
+  {key:'BACKUP_KEEP_MIN', id:'sched-keepmin', min:1, max:100},
+];
+function el(id){return document.getElementById(id)}
+
+// --- formatting -------------------------------------------------------------
+// Both are pure and both are fed server-supplied numbers, so both are written to
+// return a plain string the caller renders with textContent.
+function formatBytes(n){
+  const v=Number(n);
+  if(!isFinite(v) || v<0) return 'unknown size';
+  if(v<1024) return v+' B';
+  const units=['KiB','MiB','GiB','TiB'];
+  let scaled=v/1024, i=0;
+  while(scaled>=1024 && i<units.length-1){ scaled/=1024; i++; }
+  return (scaled<10 ? scaled.toFixed(1) : Math.round(scaled)) + ' ' + units[i];
+}
+// UTC, deliberately: every archive name carries a UTC stamp, and a local-time row
+// next to a UTC name is how an operator deletes the wrong one.
+function formatWhen(epochSeconds){
+  const v=Number(epochSeconds);
+  if(!isFinite(v) || v<=0) return 'unknown date';
+  const iso=new Date(v*1000).toISOString();
+  return iso.slice(0,10)+' '+iso.slice(11,19)+'Z';
+}
+
+// --- the three confirmation texts, as pure functions ------------------------
+// Pure so the exact words an operator is asked to agree to are testable without a
+// browser: what the second delete dialog says when the archive is the last one is
+// a requirement, not a detail.
+function restoreMessage(entry){
+  return 'Restoring '+entry.name+' ('+formatBytes(entry.bytes)+', '+formatWhen(entry.modified)+
+    ') stops the Palworld server: every player online is disconnected. The current world '+
+    'is archived first, so this is reversible — that safety archive appears in this list '+
+    'when the job finishes. The server is started again afterwards.';
+}
+function deleteFirstMessage(entry){
+  return 'Delete '+entry.name+'? It is '+formatBytes(entry.bytes)+', made '+
+    formatWhen(entry.modified)+'. Nothing has been sent yet, and you will be asked '+
+    'to confirm once more.';
+}
+// total is the number of archives currently listed. The "only archive" wording is
+// not a nicety: an operator who deletes their single backup has no way back, and
+// this dialog is the last place anything can say so.
+function deleteFinalMessage(entry, total){
+  let msg='This permanently deletes '+entry.name+' from the server’s backups '+
+    'directory. It cannot be recovered: palwarden keeps no second copy and there is no '+
+    'undo. Deleting it here does not touch any copy you downloaded to this machine.';
+  if(Number(total)<=1){
+    msg+=' This is the ONLY archive on the server — after this there is no backup of '+
+      'this world at all.';
+  }
+  return msg;
+}
+
+// --- the archive list -------------------------------------------------------
+// Every value in `list` comes from the server. `entry.name` in particular is
+// rendered with textContent and nothing else: the API refuses a name that does not
+// match ARCHIVE_RE, but this renderer is the last line of defence and is tested
+// directly against a hostile name for exactly that reason.
+function renderArchives(list){
+  const root=el('archives');
+  root.textContent='';
+  if(!list || !list.length){
+    const p=document.createElement('p');
+    p.className='pw-empty';
+    p.textContent='No backups yet';
+    root.append(p);
+    return;
+  }
+  list.forEach(entry=>{
+    const name=String(entry.name);
+    const row=document.createElement('div');
+    const nameCell=document.createElement('code');
+    nameCell.textContent=name;
+    const sizeCell=document.createElement('span');
+    sizeCell.textContent=formatBytes(entry.bytes);
+    const whenCell=document.createElement('span');
+    whenCell.textContent=formatWhen(entry.modified);
+    const actions=document.createElement('div');
+    // A link, not a job: the download is a plain authenticated GET.
+    const dl=document.createElement('a');
+    dl.className='pw-btn';
+    dl.href='/api/backups/'+encodeURIComponent(name)+'/download';
+    dl.download=name;
+    dl.textContent='Download';
+    dl.setAttribute('aria-label', 'Download '+name);
+    const restore=document.createElement('button');
+    restore.type='button';
+    restore.className='pw-btn pw-btn--danger';
+    restore.textContent='Restore';
+    restore.setAttribute('aria-label', 'Restore '+name);
+    restore.addEventListener('click', ()=>{ if(dialogOpen()) return; restoreArchive(entry); });
+    const del=document.createElement('button');
+    del.type='button';
+    del.className='pw-btn pw-btn--danger';
+    del.textContent='Delete';
+    del.setAttribute('aria-label', 'Delete '+name);
+    // list.length is captured at render time, which is what the final dialog needs
+    // to be able to say "this is the only archive".
+    del.addEventListener('click', ()=>{ if(dialogOpen()) return; deleteArchive(entry, list.length); });
+    actions.append(dl, restore, del);
+    row.append(nameCell, sizeCell, whenCell, actions);
+    root.append(row);
+  });
+}
+
+async function loadArchives(){
+  try {
+    const res=await fetch('/api/backups', {headers:{'Accept':'application/json'}});
+    let json=null;
+    try { json=await res.json(); } catch(e) { json=null; }
+    if(!res.ok || !json || json.ok===false){
+      throw new Error((json && json.error) ? json.error : ('GET /api/backups: HTTP '+res.status));
+    }
+    renderArchives(json.data || []);
+  } catch(e) {
+    const root=el('archives');
+    root.textContent='';
+    const p=document.createElement('p');
+    p.className='pw-empty';
+    // Server-supplied text, so textContent. The list is left empty rather than
+    // stale: a row that no longer exists is a row someone would click Delete on.
+    p.textContent='could not list the archives: '+errText(e);
+    root.append(p);
+  }
+}
+
+// --- the schedule form ------------------------------------------------------
+function fillSchedule(data){
+  SCHEDULE_FIELDS.forEach(f=>{
+    const value=data[f.key];
+    if(typeof value==='undefined' || value===null) return;
+    if(f.bool) el(f.id).checked = value===true || value==='true';
+    else el(f.id).value=String(value);
+  });
+}
+// All four keys, every time. backup_schedule_save *replaces* the file, so the
+// worker refuses a partial post — see palwarden-jobd's validate_schedule_settings.
+// BACKUP_ENABLED is a real JSON boolean (the worker rejects "true"/1); the three
+// numbers go as digit strings, which it accepts and a form field can actually
+// produce.
+function collectSchedule(){
+  const out={};
+  SCHEDULE_FIELDS.forEach(f=>{
+    if(f.bool){ out[f.key]=!!el(f.id).checked; return; }
+    out[f.key]=String(el(f.id).value).trim();
+  });
+  return out;
+}
+function setStatus(id, message, empty){
+  const node=el(id);
+  node.textContent=message;
+  node.classList.toggle('pw-empty', !!empty);
+}
+async function loadSchedule(){
+  try {
+    const res=await fetch('/api/backup-schedule', {headers:{'Accept':'application/json'}});
+    let json=null;
+    try { json=await res.json(); } catch(e) { json=null; }
+    if(!res.ok || !json || json.ok===false || !json.data){
+      throw new Error((json && json.error) ? json.error : ('GET /api/backup-schedule: HTTP '+res.status));
+    }
+    fillSchedule(json.data);
+    setStatus('schedule-msg', 'Showing the schedule the next tick will use.', true);
+  } catch(e) {
+    setStatus('schedule-msg', 'could not read the schedule: '+errText(e), true);
+  }
+}
+// The worker's refusal ("BACKUP_INTERVAL_HOURS must be an integer 1-720, got 0")
+// is shown exactly as it arrived: it names the key and the bound, which is more
+// useful than anything this page could paraphrase.
+async function saveSchedule(){
+  const settings=collectSchedule();
+  setStatus('schedule-msg', 'saving the schedule…', true);
+  const res=await runJob('backup_schedule_save', {settings: settings});
+  if(res.ok){
+    setStatus('schedule-msg', 'Saved. It takes effect on the next scheduled tick.', false);
+  } else {
+    setStatus('schedule-msg', res.error, false);
+  }
+}
+
+// --- control plane ----------------------------------------------------------
+// Mutations need HTTP Basic (the browser already holds it for this page) *plus*
+// the token in X-Palwarden-Token. The custom header is the CSRF defence: a
+// cross-origin page cannot set it without a preflight the server never grants.
+//
+// The token lives in sessionStorage only — never in persistent local storage,
+// never in a cookie, never in a URL, and never logged.
+const TOKEN_KEY='palwarden-token';
+const POLL_INTERVAL_MS=2000;
+// ~15 minutes. A restore stops the server, unpacks a world and starts it again;
+// an import is a copy plus a verify. Both finish well inside this on any sane
+// host. On expiry the UI says so, names the job id, and re-enables the controls —
+// the poll stopping is not the job stopping.
+const POLL_MAX_ATTEMPTS=450;
+// A status GET can fail while the job is perfectly healthy — jobd is a separate
+// process. Tolerate a run of consecutive failures (~20 s) before giving up, and
+// reset on any success.
+const POLL_MAX_STATUS_FAILURES=10;
+const TERMINAL=['succeeded','failed'];
+
+// Resolves to the token, or throws with something the operator can act on.
+// Cached in sessionStorage so repeat actions cost no extra request; the cache is
+// cleared on a 403 so a rotated token self-heals on the next click.
+async function token(){
+  const cached=sessionStorage.getItem(TOKEN_KEY);
+  if(cached) return cached;
+  let unauthenticated=false;
+  try {
+    const res=await fetch('/api/token', {headers:{'Accept':'application/json'}});
+    // A 401 means the Basic session is gone, which no token can fix: the very
+    // next POST would 401 too.
+    if(res.status===401){ unauthenticated=true; throw new Error('HTTP 401'); }
+    if(!res.ok) throw new Error('HTTP '+res.status);
+    const json=await res.json();
+    const payload=json && json.data;
+    if(!json || json.ok===false || !payload || !payload.token){
+      throw new Error((json && json.error) ? json.error : 'the response carried no token');
+    }
+    const t=String(payload.token);
+    sessionStorage.setItem(TOKEN_KEY, t);
+    return t;
+  } catch(e) {
+    if(unauthenticated){
+      throw new Error('not signed in any more (GET /api/token answered 401) — '+
+        'reload this page and re-enter the web UI credentials');
+    }
+    // Fallback, kept on purpose and identical to the Engine editor's: a server
+    // without /api/token (an older palwarden) would otherwise leave this page
+    // unable to mutate at all.
+    const why=errText(e);
+    log('could not fetch the API token ('+why+'); asking for it instead');
+    const typed=window.prompt('palwarden could not supply the API token ('+why+'). '+
+      'Enter WEBUI_TOKEN from /etc/palworld/webui.env. Kept in this tab only.');
+    if(typed){ sessionStorage.setItem(TOKEN_KEY, typed); return typed; }
+    throw new Error('no API token available: '+why);
+  }
+}
+function errText(e){ return String((e && e.message) || e); }
+function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
+
+// Every string below is server-influenceable — the 403 reflects the request's
+// Origin back, and error/output/blocked_by come from the API — so it only ever
+// reaches the DOM through textContent.
+function log(line){
+  const pre=el('joblog');
+  const atBottom=pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 4;
+  if(pre.classList.contains('pw-empty')){ pre.textContent=''; pre.classList.remove('pw-empty'); }
+  pre.textContent += line + '\n';
+  if(atBottom) pre.scrollTop = pre.scrollHeight;
+}
+let toastTimer=null;
+function toast(ok, message){
+  const box=el('toast'), state=el('toast-state');
+  // Failures are assertive: a failed restore must not wait for the next idle to
+  // be announced. The role is set, and the box unhidden, *before* the text is
+  // written — a live region whose content changes while hidden is not reliably
+  // announced.
+  box.setAttribute('role', ok ? 'status' : 'alert');
+  box.hidden=false;
+  state.className='pw-pill pw-pill--' + (ok ? 'ok' : 'bad');
+  state.textContent = ok ? 'DONE' : 'ERROR';
+  el('toast-message').textContent=message;
+  if(toastTimer){ clearTimeout(toastTimer); toastTimer=null; }
+  if(ok) toastTimer=setTimeout(dismissToast, 8000);
+}
+function dismissToast(){ el('toast').hidden=true; if(toastTimer){ clearTimeout(toastTimer); toastTimer=null; } }
+
+// Everything interactive inside a card is disabled for the whole life of a job
+// and re-enabled in a finally block, so an HTTP error, a JSON parse failure, a
+// network failure or an expired poll cannot leave the page permanently dead. The
+// dialogs and the toast live outside .pw-card on purpose: their buttons must stay
+// usable (Dismiss in particular) while a job runs.
+function setBusy(busy){
+  document.querySelectorAll('.pw-card button, .pw-card input').forEach(node=>{
+    node.disabled=busy;
+  });
+  if(!busy) syncImport();
+}
+function dialogOpen(){
+  return ['confirm-restore','confirm-delete-1','confirm-delete-2'].some(id=>el(id).open);
+}
+
+async function postJob(action, params){
+  const tok=await token();
+  const res=await fetch('/api/jobs', {
+    method:'POST',
+    headers:{'Content-Type':'application/json','Accept':'application/json','X-Palwarden-Token':tok},
+    body: JSON.stringify({action: action, params: params}),
+  });
+  let json=null;
+  try { json=await res.json(); } catch(e) { json=null; }
+  if(res.status===202 && json && json.id) return json.id;
+  let msg=(json && json.error) ? json.error : ('HTTP '+res.status);
+  const b=json && json.blocked_by;
+  if(b) msg += ' [blocked by '+b.action+' '+b.id+' ('+b.state+')]';
+  if(res.status===403){
+    // Either the cached token is stale or the request was cross-origin. Dropping
+    // the cache is right in the first case and harmless in the second.
+    sessionStorage.removeItem(TOKEN_KEY);
+    msg += ' — the API token was refused; it has been discarded, so retrying re-fetches it';
+  }
+  throw new Error(msg);
+}
+
+// Resolves to one of three outcomes, deliberately not to a thrown error: losing
+// sight of a job is not the same event as a job failing.
+//   {outcome:'done', job}           — the job reached a terminal state
+//   {outcome:'expired'}             — the bounded poll ran out
+//   {outcome:'unreachable', detail} — status stopped answering
+async function pollJob(id){
+  let last='';
+  let failures=0;
+  for(let i=0;i<POLL_MAX_ATTEMPTS;i++){
+    // First status GET goes out immediately: a delete finishes in milliseconds and
+    // sleeping first would show "accepted" and nothing else for a whole interval.
+    if(i>0) await sleep(POLL_INTERVAL_MS);
+    let job=null;
+    try {
+      const res=await fetch('/api/jobs/'+encodeURIComponent(id), {headers:{'Accept':'application/json'}});
+      let json=null;
+      try { json=await res.json(); } catch(e) { json=null; }
+      if(!res.ok || !json || json.ok===false || !json.data){
+        throw new Error((json && json.error) ? json.error : ('job status: HTTP '+res.status));
+      }
+      job=json.data;
+    } catch(e) {
+      const detail=errText(e);
+      failures++;
+      log('status check failed ('+failures+'/'+POLL_MAX_STATUS_FAILURES+'): '+detail);
+      if(failures>=POLL_MAX_STATUS_FAILURES) return {outcome:'unreachable', detail: detail};
+      continue;
+    }
+    failures=0;
+    const state=String(job.state || 'unknown');
+    if(state!==last){ log('state: '+state); last=state; }
+    if(TERMINAL.includes(state)) return {outcome:'done', job: job};
+  }
+  return {outcome:'expired'};
+}
+
+// Returns {ok, error, id} rather than nothing, because two callers need the
+// outcome: the schedule card shows the worker's refusal verbatim, and the list
+// only refreshes when something actually changed.
+async function runJob(action, params){
+  setBusy(true);
+  dismissToast();
+  try {
+    log('POST /api/jobs ' + action);
+    const id=await postJob(action, params);
+    log('job '+id+' accepted');
+    const res=await pollJob(id);
+    if(res.outcome==='expired'){
+      const msg='job '+id+' is still unfinished after '+
+        Math.round(POLL_MAX_ATTEMPTS*POLL_INTERVAL_MS/60000)+
+        ' minutes; this page stopped polling. The job itself is unaffected — check '+
+        '/api/jobs/'+id+' or the dashboard, then use Refresh list.';
+      log(msg); toast(false, msg); return {ok:false, error:msg, id:id};
+    }
+    // Careful wording: this is "we lost the status endpoint", NOT "the job
+    // failed". jobd runs independently of this page.
+    if(res.outcome==='unreachable'){
+      const msg='job status unreachable ('+res.detail+') — the job may still be running. '+
+        action+' is job '+id+'; check /api/jobs/'+id+' or the dashboard for its outcome.';
+      log(msg); toast(false, msg); return {ok:false, error:msg, id:id};
+    }
+    const job=res.job;
+    if(job.output) log(String(job.output));
+    if(job.state==='succeeded'){
+      log(action+' succeeded'); toast(true, action+' succeeded');
+      return {ok:true, id:id};
+    }
+    const msg=action+' failed (exit '+String(job.exit_code)+'); see the log above';
+    log(msg); toast(false, msg); return {ok:false, error:msg, id:id};
+  } catch(e) {
+    const msg=errText(e); log('error: '+msg); toast(false, msg);
+    return {ok:false, error:msg};
+  } finally {
+    setBusy(false);
+  }
+}
+
+// showModal() is the platform's own focus trap: the rest of the document goes
+// inert and Esc fires cancel/close, which resolves this as a cancellation.
+// Cancel is focused explicitly as well as carrying autofocus, so the destructive
+// button is never the default target however the browser reads the attribute on a
+// dialog that has already been opened once.
+function openConfirm(id, title, message, okLabel){
+  return new Promise(resolve=>{
+    const dlg=el(id), ok=el(id+'-ok'), cancel=el(id+'-cancel');
+    if(title) el(id+'-title').textContent=title;
+    el(id+'-body').textContent=message;
+    if(okLabel) ok.textContent=okLabel;
+    let settled=false;
+    function finish(result){
+      if(settled) return;
+      settled=true;
+      ok.removeEventListener('click', onOk);
+      cancel.removeEventListener('click', onCancel);
+      dlg.removeEventListener('close', onClose);
+      resolve(result);
+    }
+    function onOk(){ finish(true); dlg.close(); }
+    function onCancel(){ finish(false); dlg.close(); }
+    function onClose(){ finish(false); }
+    ok.addEventListener('click', onOk);
+    cancel.addEventListener('click', onCancel);
+    dlg.addEventListener('close', onClose);
+    dlg.showModal();
+    cancel.focus();
+  });
+}
+
+// --- the actions ------------------------------------------------------------
+async function createBackup(){
+  const res=await runJob('backup', {});
+  if(res.ok) await loadArchives();
+}
+
+async function restoreArchive(entry){
+  const okToGo=await openConfirm('confirm-restore', null, restoreMessage(entry), null);
+  if(!okToGo){ log('restore of '+entry.name+' cancelled; nothing was sent'); return; }
+  const res=await runJob('backup_restore', {backup: entry.name, confirm: true});
+  // Even a failed restore may have written the safety archive, so refresh either
+  // way: the list is how the operator finds it.
+  await loadArchives();
+  if(!res.ok) log('the restore did not succeed; read the job output above before retrying');
+}
+
+// Three deliberate steps, and the first two send nothing at all:
+//   1. the row's Delete button called this function
+//   2. the first dialog names the archive, its size and its date
+//   3. the second dialog says it cannot be recovered (and says so louder when it
+//      is the only archive there is)
+// Only after (3) is anything POSTed. Cancelling at either dialog returns without
+// a request. tests/unit/test_webui_backups.sh drives this function with a stubbed
+// runJob and asserts exactly that, because a three-step flow that is untested at
+// the step boundaries is a one-step flow with extra dialogs.
+async function deleteArchive(entry, total){
+  const first=await openConfirm('confirm-delete-1', 'Delete '+entry.name+'?',
+    deleteFirstMessage(entry), 'Continue');
+  if(!first){ log('delete of '+entry.name+' cancelled at the first confirmation; nothing was sent'); return; }
+  const second=await openConfirm('confirm-delete-2', null,
+    deleteFinalMessage(entry, total), 'Delete permanently');
+  if(!second){ log('delete of '+entry.name+' cancelled at the final confirmation; nothing was sent'); return; }
+  const res=await runJob('backup_delete', {backup: entry.name, confirm: true});
+  if(res.ok) await loadArchives();
+}
+
+// The file input's own rule: refuse a name the server would refuse anyway, before
+// spending the upload.
+function selectedFile(){
+  const input=el('import-file');
+  return (input.files && input.files.length) ? input.files[0] : null;
+}
+function syncImport(){
+  const file=selectedFile();
+  el('btn-upload').disabled = !file;
+  if(!file){ setStatus('import-msg', 'No file selected.', true); return; }
+  if(!ARCHIVE_RE.test(file.name)){
+    el('btn-upload').disabled=true;
+    setStatus('import-msg', 'palwarden only imports archives it wrote: the name must be '+
+      'palworld-save-<UTC stamp>.tar.gz, not '+file.name, false);
+    return;
+  }
+  setStatus('import-msg', file.name+' — '+formatBytes(file.size)+' ready to upload.', true);
+}
+
+// Streams the File as the raw request body. There is no upload-progress event on
+// fetch(), so progress is reported as elapsed time on a ticker: an operator
+// pushing a multi-gigabyte archive over a slow link must be able to tell "still
+// going" from "hung".
+//
+// Returns {ok, staged} or {ok:false, error}. The failure message is handed back
+// rather than written to #import-msg here, because setBusy(false) in the finally
+// runs syncImport(), which rewrites that same line — an error set before it would
+// be silently replaced by "ready to upload".
+async function stageUpload(file){
+  setBusy(true);
+  let ticker=null;
+  try {
+    const tok=await token();
+    log('uploading '+file.name+' ('+formatBytes(file.size)+') to the staging area…');
+    const started=Date.now();
+    ticker=setInterval(()=>{
+      log('still uploading '+file.name+' — '+Math.round((Date.now()-started)/1000)+'s elapsed');
+    }, 5000);
+    const res=await fetch('/api/backups/upload', {
+      method:'POST',
+      headers:{'Accept':'application/json','Content-Type':'application/octet-stream',
+               'X-Palwarden-Token':tok,'X-Palwarden-Filename':file.name},
+      body: file,
+    });
+    let json=null;
+    try { json=await res.json(); } catch(e) { json=null; }
+    if(res.status===403) sessionStorage.removeItem(TOKEN_KEY);
+    if(res.status!==202 || !json || json.ok===false){
+      let msg=(json && json.error) ? json.error : ('upload: HTTP '+res.status);
+      if(res.status===403){
+        msg += ' — the API token was refused; it has been discarded, so retrying re-fetches it';
+      }
+      throw new Error(msg);
+    }
+    const staged=(json.data && json.data.staged) ? String(json.data.staged) : file.name;
+    log('staged as '+staged+' ('+formatBytes(file.size)+' sent)');
+    return {ok:true, staged: staged};
+  } catch(e) {
+    const msg=errText(e);
+    log('upload failed: '+msg);
+    toast(false, msg);
+    return {ok:false, error:msg};
+  } finally {
+    if(ticker) clearInterval(ticker);
+    setBusy(false);
+  }
+}
+
+async function importArchive(){
+  const file=selectedFile();
+  if(!file){ setStatus('import-msg', 'Choose an archive file first.', false); return; }
+  if(!ARCHIVE_RE.test(file.name)){ syncImport(); return; }
+  const upload=await stageUpload(file);
+  if(!upload.ok){ setStatus('import-msg', upload.error, false); return; }
+  const staged=upload.staged;
+  setStatus('import-msg', 'uploaded; importing '+staged+'…', true);
+  // A refused import leaves the staged file where it is, so retrying the import
+  // does not mean re-uploading. Say so rather than making the operator guess.
+  const res=await runJob('backup_import', {staged: staged});
+  if(res.ok){
+    setStatus('import-msg', staged+' imported.', true);
+    await loadArchives();
+  } else {
+    setStatus('import-msg', res.error, false);
+    log(staged+' is still staged on the server, so Upload and import can be retried '+
+      'without sending the file again');
+  }
+}
+
+el('btn-refresh').addEventListener('click', loadArchives);
+el('btn-backup').addEventListener('click', createBackup);
+el('btn-upload').addEventListener('click', importArchive);
+el('import-file').addEventListener('change', syncImport);
+el('btn-schedule-reload').addEventListener('click', loadSchedule);
+el('btn-schedule-save').addEventListener('click', saveSchedule);
+el('toast-dismiss').addEventListener('click', dismissToast);
+
+syncImport();
+loadArchives();
+loadSchedule();
+</script>
+</body>
+</html>
