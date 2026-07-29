@@ -25,6 +25,7 @@ import importlib.util
 import os
 import re
 import secrets
+import select
 import subprocess
 import sys
 import time
@@ -101,6 +102,16 @@ JOBD_INTERVAL_DEFAULT = 2.0
 # the operator is watching must not be dropped, so this side WAITS.
 BACKUP_LOCK = Path(os.environ.get("PALWARDEN_BACKUP_LOCK", "/run/palworld-backups.lock"))
 BACKUP_LOCK_WAIT_DEFAULT = 1800.0
+
+# How long one step of a job may run before it is killed. A ceiling, not a
+# budget: a full-world tar or a cross-mount restore copy can legitimately take
+# many minutes, and the point of the bound is that a wedged step does not hold
+# the worker forever. `_run_step` records the step's output as it arrives, so
+# reaching this is diagnosable rather than silent. Overridable so an operator
+# whose world takes longer than this to copy across a mount boundary can raise it
+# without a patch - and so the suite can drive the timeout path in one second
+# instead of thirty minutes, which is the only reason it was previously untested.
+STEP_TIMEOUT = float(archive.env_int("PALWARDEN_JOBD_STEP_TIMEOUT", 1800))
 # Only actions that mutate the collection or the world. backup_schedule_save writes
 # SCHEDULE_ENV and is deliberately absent: it races nothing (the tick
 # re-reads the file each time), and holding a lock across it would let a slow tar
@@ -1153,19 +1164,110 @@ def backup_lock(job_id: str):
         os.close(fd)  # releases the flock
 
 
+def _run_step(job_id: str, argv: list[str]) -> int:
+    """Run one step, recording its output **as it arrives**. Returns an exit code.
+
+    This was `subprocess.run(..., capture_output=True, timeout=STEP_TIMEOUT)`, which
+    buffers everything in the child's pipes and hands it over at the end — so a step
+    that hit the timeout was killed and *all* of its output discarded, with only
+    `TimeoutExpired`'s `str()` recorded. That was survivable while a timed-out step
+    could only be a long backup. It stopped being survivable when `--restore` began
+    swapping `Pal/Saved`'s contents entry by entry: a SIGKILL can now land *mid-swap*
+    (a directory rename could only be interrupted before or after itself), the
+    containerised restore copies the world rather than relinking it and so takes
+    roughly twice as long, and the entire mitigation for a mixed tree is that every
+    failure names the exact state the tree is in. Discarding the output discards the
+    mitigation.
+
+    So the output is appended in whole lines as the step produces it, and the
+    timeout only decides when to stop reading. Whatever `palworld-restore` had
+    printed — the safety archive's name, which entries had moved, the replaced
+    tree's path — is on the job before the kill.
+
+    **Chosen over deriving the timeout from the world size**, which was the other
+    option. A size-derived bound is a guess about disk throughput, it still throws
+    everything away when the guess is wrong, and it makes the failure mode depend on
+    a measurement taken before the copy starts. A fixed bound whose output survives
+    is strictly better than a clever bound whose output does not — and nothing stops
+    the bound being raised later, now that exceeding it is diagnosable.
+
+    stderr is merged into stdout rather than appended after it, so the interleaving
+    the tool actually printed is what the operator reads. `palworld-restore` prints
+    its recovery routes to stderr and its progress to stdout; those two belong in
+    order.
+
+    Decoded with `errors="replace"` and not by `text=True`: a step emitting a byte
+    that is not UTF-8 used to raise `UnicodeDecodeError` out of `subprocess.run`,
+    which is neither an `OSError` nor a `TimeoutExpired` and so took the worker down
+    instead of failing the job.
+    """
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT)
+    deadline = time.monotonic() + STEP_TIMEOUT
+    pending = b""
+    timed_out = False
+
+    def flush(data: bytes) -> None:
+        if data:
+            jobs.append_output(job_id, data.decode("utf-8", "replace"))
+
+    try:
+        stream = proc.stdout
+        assert stream is not None
+        fd = stream.fileno()
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                timed_out = True
+                break
+            try:
+                # A bounded select rather than a blocking read, so the deadline is
+                # enforced while the step is quiet as well as while it is talking.
+                ready, _, _ = select.select([fd], [], [], min(left, 5.0))
+            except InterruptedError:
+                continue
+            if not ready:
+                continue
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            pending += chunk
+            # Whole lines only: a half-written line appended now and completed later
+            # would still read correctly, but a partial line is also how a truncated
+            # multi-byte character gets mangled by the decode above.
+            head, sep, pending = pending.rpartition(b"\n")
+            if sep:
+                flush(head + sep)
+    finally:
+        flush(pending)
+        if timed_out:
+            proc.kill()
+        with contextlib.suppress(OSError):
+            if proc.stdout is not None:
+                proc.stdout.close()
+        rc = proc.wait()
+    if timed_out:
+        jobs.append_output(
+            job_id,
+            f"timed out after {STEP_TIMEOUT:.0f}s and was killed: {argv!r}. The "
+            f"output above is everything the step printed before it was killed - "
+            f"for a restore, read it for which entries had already moved before "
+            f"trusting the state of the world directory.\n")
+        # 1, the code the TimeoutExpired handler used to return: the timeout is a
+        # failed step, and nothing downstream distinguishes flavours of failure.
+        return 1
+    return rc
+
+
 def _run_commands(job_id: str, action: str, params: dict) -> int:
     """Run an action's steps in order, stopping at the first failure."""
     exit_code = 0
     for argv in build_commands(action, params):
         try:
-            result = subprocess.run(argv, capture_output=True, text=True, timeout=1800, check=False)
-        except (OSError, subprocess.TimeoutExpired) as exc:
+            exit_code = _run_step(job_id, argv)
+        except OSError as exc:
             jobs.append_output(job_id, f"failed to run {argv!r}: {exc}\n")
             return 1
-        jobs.append_output(job_id, result.stdout)
-        if result.stderr:
-            jobs.append_output(job_id, result.stderr)
-        exit_code = result.returncode
         if exit_code != 0:
             break
     return exit_code

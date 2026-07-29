@@ -184,11 +184,41 @@ or `Config/` — see [`palwarden_archive`](#libraries).
   works for a mount point and an ordinary directory alike, so bare metal and every
   container share one code path; where the two directories are under different
   *mounts* (which is exactly the mount-point case) each move falls back to a copy on
-  `EXDEV`, as `shutil.move` does, so a restore there costs an extra copy of the
-  world. The cost of moving entries is that a failure **partway** can leave
+  `EXDEV`, as `shutil.move` does.
+
+  **Free space, in the container: budget about 2× the world on the *server*
+  volume.** With `docker/compose.yaml`'s layout the extracted staging tree and the
+  replaced world tree both land beside `Pal/Saved` — that is the **server** volume
+  — while the restored world is copied *into* the `Saved` volume, so a
+  containerised restore holds a full extracted copy and a full replaced copy on the
+  server volume at the same time, plus one world's worth on the Saved volume.
+  Bare metal renames instead and needs none of it. `ENOSPC` is consequently the
+  most likely way a swap fails, and a swap that fails partway is the mixed-tree
+  state below, so each cross-mount move is preceded by a `statvfs` check of the
+  destination against everything that phase still has to move (plus
+  `PALWARDEN_IMPORT_FREE_HEADROOM`) and **refuses before anything moves** if it will
+  not fit. A move that renames is not checked at all, because a rename consumes no
+  space.
+
+  Every destination the copy path creates is created **through the destination
+  directory's descriptor** with a call that fails on an existing name
+  (`O_CREAT|O_EXCL|O_NOFOLLOW`, `mkdir`, `symlink`), so a name already occupied in
+  `Pal/Saved` — which the service account can create at any time — is a refusal and
+  never a write through someone else's symlink. A copy that fails partway has its
+  half-written **destination** entry removed before the failure is reported, so both
+  directories hold only whole entries and the recovery instructions below are safe
+  to follow literally. The ownership pass then walks the restored tree through
+  descriptors (`os.fwalk` + `chown(..., dir_fd=…, follow_symlinks=False)`) and
+  **refuses any non-directory entry with more than one hard link**: `Pal/Saved` is
+  writable by the service account throughout the swap, and a hardlink planted in it
+  resolves to its target inode through a descriptor exactly as it does through a
+  path.
+
+  The cost of moving entries is that a failure **partway** can leave
   `Pal/Saved` holding part of one world and part of another, where a directory
   rename could only fail before or after. Every such failure prints exactly which
-  state the tree is in, how many top-level entries moved, the replaced tree's path,
+  state the tree is in, which top-level entries are in which directory (by name),
+  the replaced tree's path,
   the staging tree's path when it still holds entries, and the safety archive's
   name — a mixed tree must not be started on, and the output is what says so.
 

@@ -138,6 +138,7 @@ python3 "$WORK/build_hostile.py" "$WORK/hostile.tar.gz" \
 # interleaves exactly one thing, the way test_restore_import.sh does. Nothing is
 # faked out: the real copy, the real validation and the real extraction all run.
 cat > "$WORK/harness.py" <<'PYEOF'
+import atexit
 import importlib.machinery
 import importlib.util
 import os
@@ -306,7 +307,7 @@ elif mode == "swapfail":
     orig_move = mod._move_entry
     landed = []
 
-    def failing_move(name, src_fd, dst_fd, src_display, dst_display):
+    def failing_move(name, src_fd, dst_fd, src_display, dst_display, **kw):
         into_live = str(dst_display) == str(mod.SAVED_DIR)
         if mode_arg == "out" and not into_live:
             raise OSError(5, "stub move failure")
@@ -314,9 +315,98 @@ elif mode == "swapfail":
             landed.append(name)
             if len(landed) > 1:
                 raise OSError(5, "stub move failure")
-        return orig_move(name, src_fd, dst_fd, src_display, dst_display)
+        return orig_move(name, src_fd, dst_fd, src_display, dst_display, **kw)
 
     mod._move_entry = failing_move
+elif mode in ("copies", "exdev"):
+    # The copy fallback, which no tier reached before. `_move_entry` renames first
+    # and copies only on EXDEV, and an unprivileged suite cannot create the mount
+    # point that produces one — so the *kernel's answer* is what is faked, at the
+    # one call site that asks for it, and nothing about the tool's own decision is
+    # stubbed: it still branches on errno, still classifies by lstat, still writes
+    # through the pinned destination.
+    #
+    #   mode "copies" — count the copies, renames left alone. A same-filesystem
+    #                   swap must perform none, which is the only thing that makes
+    #                   "rename first" falsifiable: with the rename attempt deleted
+    #                   everything copies and every other assertion still passes.
+    #   mode "exdev"  — every per-entry rename returns EXDEV, so the copy branch
+    #                   runs end to end. `mode_arg` adds the attacker:
+    #                     "plant:<path>" — plant a symlink at the destination name
+    #                                      during the out-phase, which is the C1
+    #                                      privilege escalation.
+    counts = {"copytree": 0, "copy2": 0, "copyfileobj": 0}
+
+    def counting(kind, fn):
+        def wrapper(*a, **k):
+            counts[kind] += 1
+            return fn(*a, **k)
+        return wrapper
+
+    mod.shutil.copytree = counting("copytree", mod.shutil.copytree)
+    mod.shutil.copy2 = counting("copy2", mod.shutil.copy2)
+    mod.shutil.copyfileobj = counting("copyfileobj", mod.shutil.copyfileobj)
+
+    if mode == "exdev":
+        real_rename = os.rename
+
+        def crossing_rename(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
+            # Only the descriptor-to-descriptor form, which is `_move_entry`'s and
+            # nothing else's in this tool: the scratch copy's own rename, and
+            # `_open_live_dir`'s move-aside, must keep working.
+            if src_dir_fd is not None and dst_dir_fd is not None:
+                raise OSError(18, "Invalid cross-device link")
+            return real_rename(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+        os.rename = crossing_rename
+
+    if mode_arg.startswith("hardlink:"):
+        # The same window, aimed at the *ownership* pass rather than the copy.
+        # `_chown_tree` used to walk a tree root had just created and renamed into
+        # place, so nothing could inject into it; it now walks SAVED_DIR, which the
+        # service account can write for the whole restore. A directory planted
+        # mid-swap that contains a HARDLINK to a root-owned file is not fixed by
+        # walking with descriptors - a name resolves to its target inode either way -
+        # so it has to be refused.
+        victim = mode_arg[len("hardlink:"):]
+        orig_move_hl = mod._move_entry
+
+        def linking_move(name, src_fd, dst_fd, src_display, dst_display, **kw):
+            result = orig_move_hl(name, src_fd, dst_fd, src_display, dst_display, **kw)
+            if str(dst_display) != str(mod.SAVED_DIR):
+                planted = os.path.join(str(mod.SAVED_DIR), "zz-planted")
+                if not os.path.exists(planted):
+                    os.mkdir(planted)
+                    os.link(victim, os.path.join(planted, "root-file"))
+                    print("PLANTED=%s" % planted)
+            return result
+
+        mod._move_entry = linking_move
+
+    if mode_arg.startswith("plant:"):
+        # The attacker is the account that owns Pal/Saved - the one palwarden-webui
+        # runs as. Its window is the whole out-phase, because the live directory's
+        # entries are snapshotted once before it: a name planted after that snapshot
+        # is never moved aside and is still sitting there when the in-phase copies
+        # onto it. So this plants after the first entry has moved out, which is
+        # inside the window and needs no race to be won.
+        victim = mode_arg[len("plant:"):]
+        orig_move = mod._move_entry
+
+        def planting_move(name, src_fd, dst_fd, src_display, dst_display, **kw):
+            result = orig_move(name, src_fd, dst_fd, src_display, dst_display, **kw)
+            if str(dst_display) != str(mod.SAVED_DIR):
+                link = os.path.join(str(mod.SAVED_DIR), "Config")
+                if not os.path.lexists(link):
+                    os.symlink(victim, link)
+                    print("PLANTED=%s" % link)
+            return result
+
+        mod._move_entry = planting_move
+
+    atexit.register(lambda: print("COPIES=%d copytree=%d copy2=%d copyfileobj=%d" % (
+        sum(counts.values()), counts["copytree"], counts["copy2"],
+        counts["copyfileobj"])))
 elif mode == "extractfail":
     # A partial extraction. Writes into the staging tree, then fails.
     def failing_extract(path, dest, *a, **k):
@@ -517,6 +607,237 @@ assert_eq "$(replaced_trees)" "1" "the replaced tree is kept after a partial swa
 assert_eq "$(staging_trees)" "1" "the staging tree is kept when it still holds entries"
 assert_contains "$out" "the extracted world is left at $SAVED.restore-" \
   "...and the output names it rather than leaking it silently"
+
+# ===========================================================================
+# the copy fallback: taken only on EXDEV, and it never writes through a name
+# ===========================================================================
+# Nothing in any tier reached this branch before. `_move_entry` renames first and
+# copies only on `EXDEV`, an unprivileged suite cannot create the mount point that
+# produces one, and integration scenario N runs on a layout where the rename
+# succeeds — so deleting the `os.rename` attempt outright left the whole suite
+# green while turning every restore into a copy. Both halves are pinned here: the
+# rename is preferred where it can work, and the copy is correct where it cannot.
+#
+# The harness fakes the *kernel's answer* at the one call that asks for it (the
+# descriptor-to-descriptor `os.rename`), never the tool's decision: the branch on
+# errno, the lstat classification and the pinned destination are all the real code.
+# Deliberately not an st_dev comparison, here or in the tool — two bind mounts off
+# one host filesystem report the same device and the rename is refused anyway.
+
+# A same-filesystem swap must perform NO copy. This is what makes "rename first"
+# falsifiable; without it the rename is unfalsifiable preference.
+reset_all
+populate_world
+stage
+out="$(harness copies "" --restore "$NAME" --startup-timeout 5 2>&1)"
+assert_contains "$out" "rc=0" "a same-filesystem swap restores cleanly (output: $out)"
+assert_contains "$out" "COPIES=0 " \
+  "a same-filesystem swap copies nothing at all - every entry is renamed"
+assert_eq "$(cat "$SAVED/SaveGames/marker.txt" 2>/dev/null)" "GOOD" \
+  "...and it really restored, so COPIES=0 is not the count of a tool that did nothing"
+
+# EXDEV on every entry: the copy branch end to end. The world must land exactly as
+# the rename path lands it.
+reset_all
+populate_world
+stage
+out="$(harness exdev "" --restore "$NAME" --startup-timeout 5 2>&1)"
+assert_contains "$out" "rc=0" "a cross-mount swap restores cleanly too (output: $out)"
+assert_not_contains "$out" "COPIES=0 " "...by copying, since no rename could serve"
+assert_eq "$(cat "$SAVED/SaveGames/marker.txt" 2>/dev/null)" "GOOD" \
+  "...and the copied world holds the archive's contents"
+assert_file_exists "$SAVED/Config/PalWorldSettings.ini" \
+  "...including the archive's Config tree"
+assert_eq "$(wc -c < "$SAVED/SaveGames/0/Level.sav" | tr -d ' ')" "200000" \
+  "...and a nested 200 KB save file arrives whole"
+assert_path_absent "$SAVED/SaveGames/old.sav" "...with the previous world gone from it"
+assert_eq "$(replaced_trees)" "0" "...and the replaced tree still removed on success"
+assert_eq "$(staging_trees)" "0" "...and no staging tree left behind"
+
+# ===========================================================================
+# C1: the copy branch must not write through a symlink planted at the destination
+# ===========================================================================
+# The privilege escalation this section exists for, reproduced end to end before it
+# was fixed: `rc=0`, "the REST API is healthy", and the victim file's contents
+# replaced with the archive's bytes while `Pal/Saved/Config` was still a symlink to
+# it. Targets are whatever root can write — `/root/.ssh/authorized_keys`,
+# `/etc/cron.d/*`, `/etc/ld.so.preload`.
+#
+# Every link of the chain is in the shipped code, which is why this is a test and
+# not a note. `_check_member` is "first component in ALLOWED_TOPLEVEL" plus
+# "isreg() or isdir()", so an archive whose ONLY member is a *regular file named
+# Config* validates, imports, and restores — and it selects the one exploitable
+# branch. The live directory's entries are snapshotted once before the out-phase,
+# so a name planted after that snapshot is never moved aside and is still there
+# when the in-phase copies onto it: the window is the whole out-phase, not a race.
+# The old spelling was `shutil.copy2(src, dst, follow_symlinks=False)`, where
+# `follow_symlinks=False` governs the SOURCE; `shutil.copyfile` opens the
+# destination with `open(dst, "wb")`, which follows a symlink at the final
+# component. `_at` pins the directory half of that path and nothing pinned the
+# last component, which `SAVED_DIR`'s owner - the account palwarden-webui runs as -
+# controls.
+reset_all
+populate_world
+printf 'SAFE\n' > "$WORK/victim"
+# The archive: one member, a regular file, named exactly `Config`.
+python3 - "$BK/$NAME" <<'PYEOF'
+import io
+import sys
+import tarfile
+
+with tarfile.open(sys.argv[1], "w:gz") as tf:
+    data = b"PWNED\n"
+    info = tarfile.TarInfo("Config")
+    info.size = len(data)
+    info.mode = 0o644
+    tf.addfile(info, io.BytesIO(data))
+PYEOF
+out="$(harness exdev "plant:$WORK/victim" --restore "$NAME" --startup-timeout 5 2>&1)"
+assert_contains "$out" "PLANTED=$SAVED/Config" "the symlink really was planted at the destination name"
+assert_contains "$out" "rc=1" "a symlink at the destination name fails the restore"
+assert_eq "$(cat "$WORK/victim")" "SAFE" \
+  "the victim file outside the world is untouched - root did not write through the link"
+assert_eq "$(readlink "$SAVED/Config")" "$WORK/victim" \
+  "...and the planted link is still a link, so it was refused rather than replaced"
+# Pinned on the errno, because that is the whole mechanism: the destination is
+# created with O_CREAT|O_EXCL|O_NOFOLLOW through the destination descriptor, so an
+# occupied name is EEXIST out of the syscall rather than a check of our own that
+# could be raced.
+assert_contains "$out" "File exists" "the refusal is EEXIST from the create itself"
+assert_contains "$out" "MIXED tree" "...and the mid-swap state is reported as usual"
+assert_contains "$out" "the previous world is complete in $SAVED.replaced-" \
+  "...naming the route back"
+
+# ===========================================================================
+# the copy branch's other two types
+# ===========================================================================
+# A symlink in the LIVE world is legal — the game and operators write that tree —
+# so the copy branch must reproduce it as a link rather than duplicating its
+# target. `copy2` with the default `follow_symlinks=True` would copy the target's
+# bytes, which for a link into the install tree means silently inflating the
+# replaced world by however large that target is.
+reset_all
+populate_world
+printf 'TARGET\n' > "$WORK/linktarget"
+ln -s "$WORK/linktarget" "$SAVED/zz-link"
+stage
+# API exit 2 keeps the replaced tree, which is the only place the moved-out link
+# can be inspected.
+out="$(STUB_API_RC=2 harness exdev "" --restore "$NAME" --startup-timeout 5 2>&1)"
+assert_contains "$out" "rc=0" "a live-world symlink does not stop a cross-mount swap (output: $out)"
+moved_link="$(echo "$SAVED".replaced-*/zz-link)"
+assert_eq "$(readlink "$moved_link")" "$WORK/linktarget" \
+  "the moved-aside symlink is still a symlink to its original target"
+assert_eq "$(cat "$WORK/linktarget")" "TARGET" "...and its target was not disturbed"
+
+# Anything that is neither file, directory nor symlink is refused rather than
+# guessed at — and the refusal is the reviewer's unprivileged DoS, so the state
+# report is what makes it survivable. A FIFO named to sort AFTER a real entry means
+# the out-phase has already moved something when it aborts, so the previous world
+# is left split across two directories. The tool `lstat`s rather than opening, so a
+# FIFO cannot hang it.
+reset_all
+populate_world
+mkfifo "$SAVED/zz-fifo"
+stage
+out="$(harness exdev "" --restore "$NAME" --startup-timeout 5 2>&1)"
+assert_contains "$out" "rc=1" "a FIFO in the live world fails a cross-mount swap"
+assert_contains "$out" "neither a regular file, a directory nor a symbolic link" \
+  "...naming why that entry could not be copied"
+assert_contains "$out" "$SAVED/zz-fifo" "...and naming the entry itself"
+assert_contains "$out" "SPLIT ACROSS THE TWO" \
+  "...and reporting the previous world as split, because an earlier entry had moved"
+assert_contains "$out" "SaveGames" "...naming which entries are where, not just how many"
+assert_path_absent "$SAVED/SaveGames/marker.txt" "...with no part of the archive landed"
+
+# ===========================================================================
+# a cross-mount swap that will not fit is refused BEFORE anything moves
+# ===========================================================================
+# `--import` has had a statvfs precheck since it shipped; the swap had none, and
+# the fallback is what made that expensive: in docker/compose.yaml the replaced
+# tree and the staging tree both land on the *server* volume while the new world is
+# copied into the *Saved* volume, so a containerised restore needs roughly twice
+# the world free on the server volume. ENOSPC is therefore the most likely mid-swap
+# failure, and a mid-swap ENOSPC produces exactly the mixed tree everything else
+# here is about avoiding.
+#
+# The free space is driven by inflating the headroom rather than by filling a disk:
+# the same PALWARDEN_IMPORT_FREE_HEADROOM the import check already honours, so the
+# arithmetic under test is the real arithmetic.
+reset_all
+populate_world
+stage
+out="$(PALWARDEN_IMPORT_FREE_HEADROOM=$(( 1 << 60 )) harness exdev "" \
+        --restore "$NAME" --startup-timeout 5 2>&1)"
+assert_contains "$out" "rc=1" "a cross-mount swap with no room is refused"
+assert_contains "$out" "needs about" "...saying how much space it needed"
+assert_contains "$out" "crosses a mount boundary" \
+  "...and why a copy, not a rename, is what needs it"
+assert_contains "$out" "Nothing was moved" "...before anything moved"
+assert_eq "$(cat "$SAVED/SaveGames/old.sav" 2>/dev/null)" "PREVIOUS" \
+  "...so the previous world is complete and untouched"
+assert_eq "$(staging_trees)" "0" "...and the staging tree is discarded, not leaked"
+
+# The same impossible headroom must NOT refuse a swap that renames, because a
+# rename consumes no space. This is the assertion that stops the precheck being
+# turned into an unconditional one - which would refuse restores on bare metal
+# that work perfectly.
+reset_all
+populate_world
+stage
+out="$(PALWARDEN_IMPORT_FREE_HEADROOM=$(( 1 << 60 )) harness copies "" \
+        --restore "$NAME" --startup-timeout 5 2>&1)"
+assert_contains "$out" "rc=0" \
+  "a same-filesystem swap ignores the free-space check entirely (output: $out)"
+assert_contains "$out" "COPIES=0 " "...because it copied nothing"
+
+# ===========================================================================
+# a failed copy leaves no debris at the destination
+# ===========================================================================
+# `shutil.copytree` copies what it can and THEN raises, so "a failure leaves the
+# entry where it was" was true of the source only. The recovery instructions tell
+# the operator to move whole entries back from the replaced tree; a half copy
+# sitting at the destination is what makes that `mv` collide or silently merge over
+# a good tree. The dangling symlink below makes the *source* unreadable partway
+# through the tree, which is how a real ENOSPC/EIO presents.
+reset_all
+populate_world
+mkdir -p "$SAVED/SaveGames/sub"
+ln -s "$WORK/definitely-not-there" "$SAVED/SaveGames/sub/broken"
+chmod 000 "$SAVED/SaveGames/sub"
+stage
+out="$(harness exdev "" --restore "$NAME" --startup-timeout 5 2>&1)"
+chmod 755 "$SAVED/SaveGames/sub" 2>/dev/null
+assert_contains "$out" "rc=1" "a copy that fails partway fails the restore"
+assert_contains "$out" "only whole entries" \
+  "...and the report says the partial destination entry was removed"
+assert_eq "$(count_glob "$SAVED".replaced-*/SaveGames)" "0" \
+  "...and the half-copied SaveGames really is gone from the replaced tree"
+
+# ===========================================================================
+# the ownership pass refuses a hardlink planted in the live tree
+# ===========================================================================
+# `_chown_tree` walked a root-created staging tree that had just been renamed into
+# place, so nothing could inject during the walk. It now walks `Pal/Saved`, which
+# the service account owns for the whole restore, and `lchown` on a hardlink to a
+# root-owned file hands that file to the service account -
+# `/etc/shadow`, a systemd unit, anything root can read. Descriptors do not fix it:
+# a name resolves to its target inode through `dir_fd` exactly as through a path.
+# `fs.protected_hardlinks=1` would, but that is a host sysctl this project neither
+# sets nor verifies, so the link count is checked instead. A world this tool
+# extracted cannot contain one - `_check_member` refuses hardlink members by type.
+reset_all
+populate_world
+printf 'ROOT OWNED\n' > "$WORK/rootfile"
+stage
+out="$(harness copies "hardlink:$WORK/rootfile" --restore "$NAME" --startup-timeout 5 2>&1)"
+assert_contains "$out" "PLANTED=$SAVED/zz-planted" "the hardlink really was planted in the live tree"
+assert_contains "$out" "rc=1" "a hardlink in the tree being chowned fails the restore"
+assert_contains "$out" "hard links" "...naming the link count as the reason"
+assert_contains "$out" "zz-planted/root-file" "...and naming the offending path"
+assert_contains "$out" "$SAVED holds the restored world" \
+  "...and saying the world is already restored, since this refusal is after the swap"
+assert_eq "$(cat "$WORK/rootfile")" "ROOT OWNED" "the linked file's contents are untouched"
 
 # --wait is forwarded to the stop tool, which is where the player warning lives.
 reset_all
@@ -1111,5 +1432,11 @@ assert_file_contains "$DOCS/tools.md" "--restore" \
   "docs/tools.md documents the --restore mode"
 assert_file_contains "$DOCS/tools.md" "--import" \
   "docs/tools.md documents the --import mode"
+# The space requirement, which is a deployment fact an operator cannot derive from
+# the tool's own output: the cross-mount fallback holds the staging tree and the
+# replaced tree on the server volume at once, so a containerised restore needs
+# roughly twice the world free there.
+assert_file_contains "$DOCS/tools.md" "2× the world" \
+  "docs/tools.md states the free-space requirement of the copy fallback"
 
 assert_report

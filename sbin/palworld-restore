@@ -63,6 +63,7 @@ import stat
 import subprocess
 import sys
 import time
+from collections.abc import Sequence
 from pathlib import Path
 
 # Mirror how palwarden-jobd locates palwarden_jobs: prepend the bare-metal lib
@@ -948,8 +949,128 @@ class _SwapError(archive.ArchiveError):
         self.touched_live = touched_live
 
 
+def _entry_bytes(path: str) -> int:
+    """Apparent size of one top-level entry, following no symlink.
+
+    `st_size` and not `st_blocks * 512`: the question this answers is "how much
+    will writing a copy of this consume", and a copy writes the bytes, not the
+    source's allocation. A sparse or reflinked source therefore reads as bigger
+    than it is on disk, which errs towards refusing a restore that would just fit
+    rather than starting one that will not — the right direction, given the state
+    a mid-swap `ENOSPC` leaves behind.
+    """
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return 0
+    if not stat.S_ISDIR(st.st_mode):
+        return st.st_size
+    total = st.st_size
+    for dirpath, _dirnames, filenames in os.walk(path, followlinks=False):
+        for entry in filenames:
+            try:
+                total += os.lstat(os.path.join(dirpath, entry)).st_size
+            except OSError:
+                # A file that vanished mid-walk contributes nothing; this is a
+                # budget estimate, not an inventory, and one unreadable name must
+                # not turn a capacity check into a failed restore.
+                continue
+    return total
+
+
+def _check_copy_capacity(remaining: Sequence[str], src_fd: int, dst_fd: int,
+                         src_display: Path, dst_display: Path) -> None:
+    """Refuse a cross-mount copy that will not fit. Raises OSError(ENOSPC).
+
+    **Why here and not once before the swap.** A `rename` consumes no space at
+    all, so an unconditional precheck would refuse restores on bare metal that
+    would have worked; and the only honest way to know a copy is coming is the
+    `EXDEV` the kernel already gave us. Deliberately *not* an `st_dev`
+    comparison — two bind mounts off one host filesystem report the same device
+    and the rename is refused anyway, so that test would pass vacuously and the
+    copy would still happen (the same reasoning as `_move_entry`'s fallback).
+
+    **Why the whole remainder of the phase and not just this entry.** Once one
+    entry has come back `EXDEV`, every later entry of the same phase will too:
+    it is the same pair of directories. Checking only the entry in hand would
+    approve a first copy that fits and then run out of room on the second — which
+    is precisely the mixed-tree state the swap exists to avoid producing. So the
+    budget is the sum of everything still to move in this phase.
+
+    `os.fstatvfs(dst_fd)`, not `statvfs(path)`: the destination is a descriptor
+    from here on and the free space that matters is the one on the filesystem that
+    descriptor is open on, which is not necessarily the one its name resolves to
+    now. `f_bavail`, matching `_check_capacity` — the blocks available to this
+    caller after the reserved-block margin.
+
+    OSError and not ArchiveError, for `_move_entry`'s reason: the callers catch
+    OSError to build the mid-swap state report, and the whole value of refusing
+    here is that the report says nothing has moved yet.
+    """
+    needed = sum(_entry_bytes(_at(src_fd, entry)) for entry in remaining)
+    needed += FREE_HEADROOM_BYTES
+    try:
+        vfs = os.fstatvfs(dst_fd)
+    except OSError:
+        # A destination we cannot measure is not a reason to refuse a
+        # disaster-recovery restore; the copy below will fail on ENOSPC with the
+        # mid-swap report if it really does not fit.
+        return
+    available = vfs.f_bavail * vfs.f_frsize
+    if available >= needed:
+        return
+    raise OSError(
+        errno.ENOSPC,
+        f"copying {len(remaining)} entr"
+        f"{'y' if len(remaining) == 1 else 'ies'} of {src_display} into "
+        f"{dst_display} needs about {needed} bytes ({FREE_HEADROOM_BYTES} of that "
+        f"headroom) but only {available} bytes are free there. This move crosses a "
+        f"mount boundary, so it is a copy and not a rename, and a restore that "
+        f"runs out of space partway leaves the world split across two directories "
+        f"- so it is refused before anything moves. Free space beside "
+        f"{dst_display} and restore again")
+
+
+def _remove_partial_copy(name: str, dst_fd: int, dst_display: Path) -> None:
+    """Delete the half-written destination entry a failed copy left behind.
+
+    Without this a failed copy leaves debris the mid-swap report contradicts:
+    `shutil.copytree` copies what it can and *then* raises, so an `ENOSPC` partway
+    through `SaveGames` left a full-looking `SAVED_DIR/SaveGames` while the
+    recovery instructions told the operator to move `SaveGames` back from the
+    replaced tree — a `mv` that collides, or silently merges a half copy over the
+    good tree. "A failure leaves the entry where it was" is only true of the
+    *source*; this is what makes it true of the destination too.
+
+    Located through `dst_fd`, and only for something we could have created: an
+    entry that is a symlink now is not our debris (we never create one at a
+    destination without `dir_fd`), and `shutil.rmtree` refuses a symlink anyway
+    rather than deleting through it. Never fatal — it runs on a failure path, and
+    the caller's report is the news.
+    """
+    try:
+        st = os.lstat(name, dir_fd=dst_fd)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        print(f"palworld-restore: warning: cannot inspect the partially copied "
+              f"{dst_display / name} to remove it: {exc}", file=sys.stderr)
+        return
+    try:
+        if stat.S_ISDIR(st.st_mode):
+            # By a path whose directory half is pinned by `_at`; rmtree itself
+            # walks with descriptors on Linux and refuses a symlink at the root.
+            shutil.rmtree(_at(dst_fd, name))
+        else:
+            os.unlink(name, dir_fd=dst_fd)
+    except OSError as exc:
+        print(f"palworld-restore: warning: could not remove the partially copied "
+              f"{dst_display / name}: {exc}; remove it by hand before following "
+              f"the recovery instructions below", file=sys.stderr)
+
+
 def _move_entry(name: str, src_fd: int, dst_fd: int, src_display: Path,
-                dst_display: Path) -> None:
+                dst_display: Path, remaining: Sequence[str] = ()) -> None:
     """Move one top-level entry between two pinned directories.
 
     `rename` first, through both descriptors: that is what runs on bare metal and
@@ -980,6 +1101,31 @@ def _move_entry(name: str, src_fd: int, dst_fd: int, src_display: Path,
     operators, so unlike the extracted tree (whose members `_check_member` limits
     to files and directories) it may hold a symlink, and `copy2` on a link with
     `follow_symlinks=True` would duplicate its target instead of the link.
+
+    **Every destination is created by a call that refuses an existing final
+    component**, through `dst_fd`: `os.mkdir`, `os.symlink`, and
+    `O_CREAT|O_EXCL|O_NOFOLLOW`. That is not belt and braces, it is the whole
+    guarantee — and its absence was a root privilege escalation reachable by the
+    account `palwarden-webui` runs as. `_at` pins the *directory* half of a
+    destination path; the final component is not pinned, and `SAVED_DIR` is owned
+    by that account. This branch was `shutil.copy2(src, dst,
+    follow_symlinks=False)`, where `follow_symlinks=False` governs the **source**
+    only: `shutil.copyfile` opens the destination with a plain `open(dst, "wb")`,
+    which follows a symlink at the final component. So a symlink planted at the
+    destination name had root writing the archive's bytes into a file of the
+    attacker's choosing — `/root/.ssh/authorized_keys`, `/etc/cron.d/*`,
+    `/etc/ld.so.preload` — while the restore reported success. Reproduced end to
+    end, and every link of the chain is reachable in the shipped code: an archive
+    whose only member is a *regular file named `Config`* passes `_check_member`
+    (first component in `ALLOWED_TOPLEVEL`, `isreg()`), the web account can
+    `--import` it, and `_swap_contents` snapshots the live directory's entries
+    *once* before the out-phase, so a name planted after that snapshot is never
+    moved aside and is still there when the in-phase copies onto it. The whole
+    out-phase is the window; there is no race to win.
+
+    An occupied destination is now a refusal, not a clobber. It is `EEXIST` out of
+    the syscall rather than a check of our own, because a check would have the same
+    gap the old code did: whatever we looked at could be replaced before we wrote.
     """
     try:
         os.rename(name, name, src_dir_fd=src_fd, dst_dir_fd=dst_fd)
@@ -988,14 +1134,54 @@ def _move_entry(name: str, src_fd: int, dst_fd: int, src_display: Path,
         if exc.errno != errno.EXDEV:
             raise
     src = _at(src_fd, name)
-    dst = _at(dst_fd, name)
     st = os.lstat(src)
+    if remaining:
+        # Before the first byte, so a destination that cannot hold the rest of this
+        # phase is a refusal with nothing moved rather than a mixed tree.
+        _check_copy_capacity(remaining, src_fd, dst_fd, src_display, dst_display)
     if stat.S_ISDIR(st.st_mode):
-        shutil.copytree(src, dst, symlinks=True)
+        # mkdir first, and not `copytree`'s own makedirs: it claims the name with a
+        # call that fails EEXIST on anything already there (a directory, a file, or
+        # even a dangling symlink — mkdir does not follow the final component), and
+        # it makes the partial tree below unambiguously *ours* to remove. 0700 while
+        # it fills; `copytree`'s closing `copystat` puts the source's mode on.
+        os.mkdir(name, 0o700, dir_fd=dst_fd)
+        try:
+            # dirs_exist_ok is False by default and is written out because the
+            # whole point of the mkdir above is that this must never merge into a
+            # tree someone else put here — except the one we just made, hence the
+            # True: the refusal is the mkdir, not this.
+            shutil.copytree(src, _at(dst_fd, name), symlinks=True,
+                            dirs_exist_ok=True)
+        except BaseException:
+            _remove_partial_copy(name, dst_fd, dst_display)
+            raise
     elif stat.S_ISLNK(st.st_mode):
-        os.symlink(os.readlink(src), dst)
+        # Both halves through a descriptor: the target read from `src_fd`, the link
+        # created in `dst_fd`, where an occupied name is EEXIST.
+        os.symlink(os.readlink(name, dir_fd=src_fd), name, dir_fd=dst_fd)
     elif stat.S_ISREG(st.st_mode):
-        shutil.copy2(src, dst, follow_symlinks=False)
+        # 0600 while it fills, then the source's mode: a world save must not be
+        # briefly group-readable in a directory the service account can read.
+        out_fd = os.open(name, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
+                         0o600, dir_fd=dst_fd)
+        try:
+            with os.fdopen(out_fd, "wb") as out:
+                # The *source* through `src_fd` with `O_NOFOLLOW` as well, so the
+                # type we classified is the type we read: in the out-phase the
+                # source directory is the service account's, and `open(src, "rb")`
+                # on a name swapped for a symlink after the `lstat` reads whatever
+                # it points at.
+                in_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=src_fd)
+                with os.fdopen(in_fd, "rb") as inp:
+                    shutil.copyfileobj(inp, out)
+                os.fchmod(out.fileno(), stat.S_IMODE(st.st_mode))
+                # What copy2 did for us and the game cares about: a save file's
+                # mtime is how an operator tells which world they are looking at.
+                os.utime(out.fileno(), ns=(st.st_atime_ns, st.st_mtime_ns))
+        except BaseException:
+            _remove_partial_copy(name, dst_fd, dst_display)
+            raise
     else:
         # OSError and not ArchiveError, deliberately: the callers catch OSError to
         # build the mid-swap state report, and an ArchiveError raised here would
@@ -1007,7 +1193,11 @@ def _move_entry(name: str, src_fd: int, dst_fd: int, src_display: Path,
             f"symbolic link, so it cannot be copied across the filesystem "
             f"boundary into {dst_display}")
     # Only after the copy is complete, so a failure up to here leaves the entry
-    # where it was — the recoverable half of a mid-swap failure.
+    # where it was *and* leaves nothing of it at the destination (see
+    # `_remove_partial_copy`) — the recoverable half of a mid-swap failure. Both
+    # halves are needed: the recovery instructions tell the operator to move whole
+    # entries back, and a half copy sitting at the destination is what makes that
+    # `mv` collide or merge.
     if stat.S_ISDIR(st.st_mode):
         shutil.rmtree(src)
     else:
@@ -1131,9 +1321,13 @@ def _swap_contents(new_tree: Path, tfd: int, replaced_path: Path) -> Path | None
                     replaced, False) from exc
             moved = 0
             try:
-                for name in old:
+                for index, name in enumerate(old):
                     try:
-                        _move_entry(name, sfd, rfd, SAVED_DIR, replaced_path)
+                        # `old[index:]` is the capacity budget: everything this
+                        # phase has still to move, needed in full if the first
+                        # entry turns out to cross a mount boundary.
+                        _move_entry(name, sfd, rfd, SAVED_DIR, replaced_path,
+                                    remaining=old[index:])
                     except OSError as exc:
                         raise _SwapError(_mid_swap_out(
                             name, moved, old, replaced_path, new_tree, exc),
@@ -1148,9 +1342,10 @@ def _swap_contents(new_tree: Path, tfd: int, replaced_path: Path) -> Path | None
 
         fresh = sorted(os.listdir(tfd))
         landed = 0
-        for name in fresh:
+        for index, name in enumerate(fresh):
             try:
-                _move_entry(name, tfd, sfd, new_tree, SAVED_DIR)
+                _move_entry(name, tfd, sfd, new_tree, SAVED_DIR,
+                            remaining=fresh[index:])
             except OSError as exc:
                 raise _SwapError(_mid_swap_in(
                     name, landed, fresh, replaced, new_tree, exc),
@@ -1168,19 +1363,36 @@ def _mid_swap_out(name: str, moved: int, old: list[str], replaced_path: Path,
     Split out from `_swap_contents` because the exact state of the tree is the
     whole product of this failure path, and it is long enough that burying it in
     the control flow is how one of the two states quietly stops being reported.
+
+    Entries are named and not just counted. With `ALLOWED_TOPLEVEL` at two that is
+    a nicety; the point is that "1 of 2 moved" stops being enough the moment a
+    third is added, and one `', '.join` is cheaper than noticing later.
+
+    "was discarded" is stated as an *intent* rather than a fact because
+    `_discard_staging` can warn and leave the tree alone (a staging name swapped
+    for something that is no longer a directory), and that warning is on stderr
+    right next to this message. Claiming a removal that did not happen is how an
+    operator stops believing the rest of the report.
     """
+    partial = (f"Nothing of {name} was left at the destination - a copy that fails "
+               f"partway is removed, so both directories hold only whole entries")
     if moved == 0:
         return (f"cannot move {SAVED_DIR / name} aside to {replaced_path} "
                 f"({exc}). Nothing was moved: the previous world is complete and "
                 f"untouched in {SAVED_DIR}, and no part of the restored world was "
-                f"written into it. The extracted world at {new_tree} was discarded")
+                f"written into it. {partial}. The extracted world at {new_tree} is "
+                f"being discarded")
+    # "none" rather than an empty pair of brackets: a report is read under
+    # pressure and `()` is a typo, not a state.
+    done = ", ".join(old[:moved]) or "none"
+    left = ", ".join(old[moved:]) or "none"
     return (f"cannot move {SAVED_DIR / name} aside to {replaced_path} ({exc}). "
             f"The restore stopped PARTWAY: {moved} of {len(old)} top-level "
-            f"entries of the previous world are now in {replaced_path} and the "
-            f"remaining {len(old) - moved} are still in {SAVED_DIR}, so the "
-            f"previous world is SPLIT ACROSS THE TWO. No part of the restored "
-            f"world was written into {SAVED_DIR}. To undo: move everything from "
-            f"{replaced_path} back into {SAVED_DIR}")
+            f"entries of the previous world are now in {replaced_path} ({done}) "
+            f"and the remaining {len(old) - moved} are still in {SAVED_DIR} "
+            f"({left}), so the previous world is SPLIT ACROSS THE TWO. No part of "
+            f"the restored world was written into {SAVED_DIR}. {partial}. To undo: "
+            f"move everything from {replaced_path} back into {SAVED_DIR}")
 
 
 def _mid_swap_in(name: str, landed: int, fresh: list[str],
@@ -1190,7 +1402,7 @@ def _mid_swap_in(name: str, landed: int, fresh: list[str],
     This is the bad one: `SAVED_DIR` holds part of one world and part of another,
     and the server must not be started on it. So it says so, in those words, and
     names the tree the rest of the restored world is still in as well as both
-    routes back.
+    routes back — by name, for `_mid_swap_out`'s reason.
     """
     if replaced is not None:
         state = (f"the previous world is complete in {replaced}. To undo: empty "
@@ -1198,11 +1410,15 @@ def _mid_swap_in(name: str, landed: int, fresh: list[str],
     else:
         state = (f"there was no previous world to move aside, so the only route "
                  f"back is the safety archive named below - if one was taken")
+    done = ", ".join(fresh[:landed]) or "none"
+    left = ", ".join(fresh[landed:]) or "none"
     return (f"cannot move {new_tree / name} into {SAVED_DIR} ({exc}). The restore "
             f"stopped PARTWAY: {landed} of {len(fresh)} top-level entries of the "
-            f"restored world are in {SAVED_DIR} and the remaining "
-            f"{len(fresh) - landed} are still in {new_tree}, so {SAVED_DIR} is a "
-            f"MIXED tree and the server must NOT be started on it - {state}")
+            f"restored world are in {SAVED_DIR} ({done}) and the remaining "
+            f"{len(fresh) - landed} are still in {new_tree} ({left}), so "
+            f"{SAVED_DIR} is a MIXED tree and the server must NOT be started on "
+            f"it. Nothing of {name} was left in {SAVED_DIR} - a copy that fails "
+            f"partway is removed, so it holds only whole entries - {state}")
 
 
 def _saved_populated() -> bool:
@@ -1315,11 +1531,38 @@ def _resolve_account() -> tuple[int, int]:
 
 
 def _chown_tree(root: Path) -> None:
-    """Give the restored tree to the service account. Never fatal *after* the
-    root-is-not-a-link check below, which is fatal by design.
+    """Give the restored tree to the service account. A failed `chown` warns; the
+    two *integrity* checks — the root is not a symlink, and no entry is a hardlink
+    — are fatal by design, because either one means the tree is not the one this
+    restore extracted.
 
-    `os.walk(followlinks=False)` plus `lchown`, so a symlink *inside* the tree
-    cannot redirect the chown at a path outside it.
+    `os.fwalk(follow_symlinks=False)` plus `chown(..., dir_fd=…,
+    follow_symlinks=False)`, so a symlink *inside* the tree cannot redirect the
+    chown at a path outside it, and no directory in the walk is re-resolved by
+    name after it was checked.
+
+    **Why descriptors and not `os.walk` + `lchown` any more.** This used to walk a
+    staging tree root had just created and renamed into place, so nothing could
+    inject into it during the walk. It now walks `SAVED_DIR` — writable by the
+    service account for the whole restore, because the swap moves *contents* and
+    the directory itself is the mount point. A directory planted mid-walk is
+    therefore reachable, and `os.walk`'s name-by-name `lchown` would follow the
+    parent chain afresh for each one.
+
+    **Hardlinks are the part a descriptor does not fix**, so they are refused
+    rather than defended. A name is only a name: a hardlink to `/etc/shadow`
+    planted inside the tree resolves to that inode through a `dir_fd` exactly as
+    it does through a path, and `lchown` on it hands root's file to the service
+    account. `fs.protected_hardlinks=1` makes creating such a link impossible for
+    an account that cannot read the target, but that is a *host* sysctl this
+    project neither sets nor verifies, so it cannot be the guarantee. Instead:
+    every non-directory entry is `stat`ed through its parent's descriptor and an
+    `st_nlink > 1` aborts. A world save this tool extracted cannot contain one —
+    `_check_member` refuses hardlink members by type and a fresh extraction creates
+    each file once — so a link count above one means something that is not our
+    world is in the tree, which is the same reasoning as the root-is-a-symlink
+    refusal below and gets the same answer. Directories are exempt because their
+    link count is how subdirectories are counted.
 
     **The root of the walk is the exposure those two do not cover.**
     `followlinks=False` is about *descending* into symlinked subdirectories; the
@@ -1369,19 +1612,59 @@ def _chown_tree(root: Path) -> None:
     failures = 0
     first: str | None = None
 
-    def chown(path: str) -> None:
+    def chown(name: str, display: str, dir_fd: int) -> None:
         nonlocal failures, first
         try:
-            os.lchown(path, uid, gid)
+            # follow_symlinks=False is `lchown`, and dir_fd is what makes the
+            # *parent* of that name the descriptor we are already holding.
+            os.chown(name, uid, gid, dir_fd=dir_fd, follow_symlinks=False)
         except OSError as exc:
             failures += 1
             if first is None:
-                first = f"{path}: {exc}"
+                first = f"{display}: {exc}"
 
-    chown(str(root))
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-        for entry in dirnames + filenames:
-            chown(os.path.join(dirpath, entry))
+    # The root through a descriptor opened O_NOFOLLOW, so the name is resolved
+    # once, here, and the walk below hangs off that resolution rather than
+    # repeating it. The lstat checks above stay: they are what produce the
+    # operator-facing message, where this open would only produce ELOOP/ENOTDIR.
+    try:
+        rfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise archive.ArchiveError(
+            f"cannot open the restored tree {root} to give it to the service "
+            f"account: {exc}") from exc
+    try:
+        try:
+            os.fchown(rfd, uid, gid)
+        except OSError as exc:
+            failures += 1
+            first = f"{root}: {exc}"
+        for dirpath, dirnames, filenames, dirfd in os.fwalk(
+                dir_fd=rfd, follow_symlinks=False):
+            for entry in filenames:
+                display = os.path.normpath(os.path.join(str(root), dirpath, entry))
+                try:
+                    est = os.stat(entry, dir_fd=dirfd, follow_symlinks=False)
+                except OSError as exc:
+                    failures += 1
+                    if first is None:
+                        first = f"{display}: {exc}"
+                    continue
+                if est.st_nlink > 1:
+                    raise archive.ArchiveError(
+                        f"{display} has {est.st_nlink} hard links, so this name is "
+                        f"shared with a file outside the world this restore "
+                        f"extracted; refusing to give it to "
+                        f"{SERVICE_USER}:{SERVICE_GROUP} (a hardlink planted in "
+                        f"{root} is how root's own files are handed to the service "
+                        f"account). {root} holds the restored world - remove the "
+                        f"offending name and re-run the ownership pass by hand")
+                chown(entry, display, dirfd)
+            for entry in dirnames:
+                chown(entry, os.path.normpath(
+                    os.path.join(str(root), dirpath, entry)), dirfd)
+    finally:
+        os.close(rfd)
     if failures:
         # One warning with a count, not one per file: a wrong uid would otherwise
         # bury the rest of the restore's output under thousands of lines.
