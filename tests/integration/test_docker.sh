@@ -590,4 +590,150 @@ assert_contains "$m_logs" "scheduled backups are disabled" "M: ...and reports wh
 assert_eq "$(docker exec pw-it-m sh -c 'ls -1 /opt/palworld/backups | wc -l')" "0" \
   "M: BACKUP_ENABLED=false creates nothing"
 
+# --- Scenario N: restore where Pal/Saved is its own mount point ---------------
+# **This is the layout every real deployment uses, and no tier had ever tested
+# it.** `/opt/palworld/server/Pal/Saved` is a separate mount in both compose files
+# — a named volume in `docker/compose.yaml`, a bind mount in
+# `docker/compose.live.yaml` — and the restore's swap was two renames of the
+# directories themselves. `rename(2)` on a mount point is EBUSY (errno 16), so
+# `--restore` could not succeed in any Docker deployment at all.
+#
+# Nothing caught it because nothing had met a mount point: the unit suite points
+# PALWORLD_SAVED_DIR at a plain `mktemp -d`, and scenario L above — which runs a
+# genuine end-to-end restore and asserts the world comes back — mounts only
+# `/opt/palworld/server`, which leaves `Pal/Saved` an ordinary subdirectory. The
+# suite proved the restore worked in a layout no deployment uses.
+#
+# So this is scenario L's shape (real backup, real corruption, real restore through
+# the real jobd, world asserted back) over the *deliberate* mount layout, and L is
+# left exactly as it was: the two layouts are different risks and both are now
+# covered. Verified to fail with EBUSY when the swap is reverted to renaming the
+# directory.
+NWORK="$(mktemp -d)"; TMPDIRS+=("$NWORK")
+cp -r "$FAKE_REST" "$NWORK/server"
+# The mount source is its own directory on the host, which is what makes Pal/Saved
+# a separate *mount* inside the container. Note "mount", not "filesystem": both
+# bind mounts come off the same host filesystem and report the same st_dev, and
+# rename(2) across the boundary is refused anyway — see the probe below.
+# Anything the fixture ships under
+# Pal/Saved has to be seeded into it rather than left underneath the mount, where
+# it would be invisible — the fixture ships nothing there today, so this is
+# conditional rather than a `|| true` that would also swallow a real copy failure.
+mkdir -p "$NWORK/saved"
+if [ -d "$NWORK/server/Pal/Saved" ]; then
+  cp -r "$NWORK/server/Pal/Saved/." "$NWORK/saved/" \
+    || fail "N: could not seed the Pal/Saved mount source"
+fi
+run_c pw-it-n -e PALWARDEN_MODE=embedded -e UPDATE_ON_START=false \
+  -e ADMIN_PASSWORD=not-a-real-admin-password -e BACKUP_ENABLED=false \
+  -v "$NWORK/server":/opt/palworld/server \
+  -v "$NWORK/saved":/opt/palworld/server/Pal/Saved "$IMG"
+wait_up pw-it-n palworld-server || fail "N: server did not come up"
+
+# The premise of the whole scenario, asserted rather than assumed. If this is not a
+# mount point the test is worthless — it silently degrades into a second copy of L,
+# which is exactly the failure mode that let the bug ship. Read from
+# /proc/self/mountinfo, which is the kernel's own answer and needs no tooling in
+# the image.
+assert_rc 0 docker exec pw-it-n sh -c \
+  "grep -qE ' /opt/palworld/server/Pal/Saved ' /proc/self/mountinfo"
+# And the premise stated as the syscall itself, which is stronger than any
+# structural reading of the mount table: `rename(2)` on this directory must fail
+# with EBUSY. This is the exact call the restore used to make, so if this probe ever
+# starts succeeding the scenario has stopped testing anything and says so here
+# rather than by quietly passing.
+#
+# Note it is NOT enough to compare st_dev with the parent's: two bind mounts from
+# the same host filesystem report the *same* device number, and the rename is still
+# refused — measured. A device comparison would have silently passed as "not a
+# mount point".
+n_probe="$(docker exec pw-it-n python3 -c '
+import os
+try:
+    os.rename("/opt/palworld/server/Pal/Saved",
+              "/opt/palworld/server/Pal/Saved.rename-probe")
+except OSError as exc:
+    print("errno=%d" % exc.errno)
+else:
+    os.rename("/opt/palworld/server/Pal/Saved.rename-probe",
+              "/opt/palworld/server/Pal/Saved")
+    print("errno=0")
+')"
+assert_eq "$n_probe" "errno=16" \
+  "N: renaming Pal/Saved really is EBUSY here - the premise of this whole scenario"
+
+n_user="$(docker exec pw-it-n sh -c 'sed -n "s/^WEBUI_USER=\"\(.*\)\"$/\1/p" /etc/palworld/webui.env')"
+n_pass="$(docker exec pw-it-n sh -c 'sed -n "s/^WEBUI_PASSWORD=\"\(.*\)\"$/\1/p" /etc/palworld/webui.env')"
+n_tok="$(docker exec pw-it-n sh -c 'sed -n "s/^WEBUI_TOKEN=\"\(.*\)\"$/\1/p" /etc/palworld/webui.env')"
+
+# Same bounded enqueue-and-wait as scenario L, against this container.
+n_job() {  # n_job <json-body> <tries>
+  local body="$1" tries="$2" enq i
+  JOB_ID=""; JOB_STATE=""; JOB_BODY=""
+  enq="$(docker exec pw-it-n sh -c "curl -s -w '\n%{http_code}' -X POST \
+    -u '$n_user:$n_pass' -H 'X-Palwarden-Token: $n_tok' \
+    -H 'Content-Type: application/json' -d '$body' \
+    http://127.0.0.1:8088/api/jobs")"
+  if [ "$(printf '%s' "$enq" | tail -1)" != "202" ]; then
+    JOB_STATE="not-accepted"; JOB_BODY="$enq"; return 0
+  fi
+  JOB_ID="$(printf '%s' "$enq" | grep -oE '[0-9a-f]{32}' | head -1)"
+  for ((i = 0; i < tries; i++)); do
+    JOB_BODY="$(docker exec pw-it-n sh -c "curl -s -u '$n_user:$n_pass' \
+      http://127.0.0.1:8088/api/jobs/$JOB_ID")"
+    JOB_STATE="$(printf '%s' "$JOB_BODY" | sed -n 's/.*"state": "\([a-z]*\)".*/\1/p' | head -1)"
+    case "$JOB_STATE" in queued|running|"") sleep 1 ;; *) break ;; esac
+  done
+}
+
+# A recognisable world inside the mount, so "a tree exists" cannot pass for "the
+# bytes came back".
+docker exec pw-it-n sh -c 'install -d -o steam -g steam /opt/palworld/server/Pal/Saved/SaveGames/0 \
+  && printf "mounted-world-ORIGINAL\n" > /opt/palworld/server/Pal/Saved/SaveGames/0/Level.sav'
+# The inode of the mount point itself, which the swap must NOT change. A restore
+# that replaced the directory would either fail (EBUSY, the bug) or — on some other
+# filesystem — shadow the mount, and either way this number moves.
+n_ino_before="$(docker exec pw-it-n stat -c %i /opt/palworld/server/Pal/Saved)"
+
+n_job '{"action":"backup","params":{}}' 60
+assert_eq "$JOB_STATE" "succeeded" "N1: a backup job runs to success (body: $JOB_BODY)"
+n_name="$(docker exec pw-it-n sh -c 'ls -1 /opt/palworld/backups | head -1')"
+assert_contains "$n_name" "palworld-save-" "N1: it produced an archive ($n_name)"
+
+# Break the world, so a restore that silently did nothing cannot pass.
+docker exec pw-it-n sh -c \
+  'printf "mounted-world-CORRUPTED\n" > /opt/palworld/server/Pal/Saved/SaveGames/0/Level.sav'
+
+# The assertion this scenario exists for: the restore has to finish across a mount
+# point. Before the contents swap this job failed with
+# "cannot swap the restored tree into ...: [Errno 16] Device or resource busy".
+n_job "{\"action\":\"backup_restore\",\"params\":{\"backup\":\"$n_name\",\"wait\":0,\"confirm\":true}}" 150
+assert_eq "$JOB_STATE" "succeeded" \
+  "N2: backup_restore succeeds with Pal/Saved as a mount point (body: $JOB_BODY)"
+assert_not_contains "$JOB_BODY" "Device or resource busy" \
+  "N2: ...and specifically not EBUSY, which is how renaming the mount point failed"
+assert_eq "$(docker exec pw-it-n cat /opt/palworld/server/Pal/Saved/SaveGames/0/Level.sav)" \
+  "mounted-world-ORIGINAL" "N2: the restored world is the one that was backed up"
+assert_eq "$(docker exec pw-it-n stat -c '%U' /opt/palworld/server/Pal/Saved/SaveGames/0/Level.sav)" \
+  "steam" "N2: and the restored tree belongs to the service account, not root"
+# The mount survived the restore as a mount: the swap moved contents, so the
+# directory the volume is attached to is still the same one.
+assert_eq "$(docker exec pw-it-n stat -c %i /opt/palworld/server/Pal/Saved)" \
+  "$n_ino_before" "N2: Pal/Saved is still the same directory - its inode is unchanged"
+assert_rc 0 docker exec pw-it-n sh -c \
+  "grep -qE ' /opt/palworld/server/Pal/Saved ' /proc/self/mountinfo"
+# The write landed in the *volume*, not in a directory shadowing the mount — read
+# it back from the host side of the bind mount, which is the only place that can
+# tell the difference.
+assert_eq "$(cat "$NWORK/saved/SaveGames/0/Level.sav" 2>/dev/null)" \
+  "mounted-world-ORIGINAL" "N2: ...and the restored bytes are inside the mounted volume"
+assert_eq "$(docker exec pw-it-n systemctl is-active palworld.service)" "active" \
+  "N2: the server is running again after the restore"
+# No debris of either kind: the replaced tree goes on a confirmed startup, and the
+# staging tree is emptied and removed by the swap itself.
+assert_eq "$(docker exec pw-it-n sh -c 'ls -d /opt/palworld/server/Pal/Saved.replaced-* 2>/dev/null | wc -l')" \
+  "0" "N2: no replaced tree is left behind"
+assert_eq "$(docker exec pw-it-n sh -c 'ls -d /opt/palworld/server/Pal/Saved.restore-* 2>/dev/null | wc -l')" \
+  "0" "N2: no staging tree is left behind either"
+
 assert_report

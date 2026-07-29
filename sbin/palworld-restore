@@ -53,6 +53,7 @@ question "is the server running?" has no truthful local answer; see
 from __future__ import annotations
 
 import argparse
+import errno
 import grp
 import os
 import pwd
@@ -929,6 +930,281 @@ def _discard_staging(tfd: int, display: Path) -> None:
     shutil.rmtree(real, ignore_errors=True)
 
 
+class _SwapError(archive.ArchiveError):
+    """A swap that failed, carrying the state the tree was left in.
+
+    `replaced` is the replaced-world tree if one exists by the time of the failure
+    (so `_print_recovery` can still name it), and `touched_live` says whether
+    `SAVED_DIR` itself was modified before the failure. The caller needs that
+    second bit to decide the staging tree's fate: debris nobody needs when nothing
+    moved, and the only copy of the not-yet-moved half of the new world when
+    something did.
+    """
+
+    def __init__(self, message: str, replaced: Path | None,
+                 touched_live: bool) -> None:
+        super().__init__(message)
+        self.replaced = replaced
+        self.touched_live = touched_live
+
+
+def _move_entry(name: str, src_fd: int, dst_fd: int, src_display: Path,
+                dst_display: Path) -> None:
+    """Move one top-level entry between two pinned directories.
+
+    `rename` first, through both descriptors: that is what runs on bare metal and
+    in any layout where the two directories share a filesystem — atomic per entry
+    and free.
+
+    **The fallback is not a second strategy, it is an errno.** Where `Pal/Saved` is
+    its own mount (a named volume in `docker/compose.yaml`, a bind mount in
+    `docker/compose.live.yaml`) its children sit under a *different mount* from its
+    siblings, so a rename between `Pal/Saved` and `Pal/Saved.replaced-…` returns
+    `EXDEV` — measured, errno 18, in both directions. Worth being precise about:
+    "mount", not "filesystem". Two bind mounts off the same host filesystem report
+    the *same* `st_dev` and the rename is refused regardless, so this cannot be
+    predicted by comparing devices — only by asking the kernel and handling the
+    answer, which is what this does. `shutil.move` crosses
+    the same boundary the same way. Doing it here keeps one code path for every
+    deployment: nothing detects a mount point and nothing branches on the
+    container, the kernel says when a rename cannot serve and only then is a copy
+    paid for. The cost where it fires is real — the world is copied rather than
+    relinked — and a restore is a disaster-recovery operation where correctness
+    outranks minutes.
+
+    `src_dir_fd`/`dst_dir_fd` on the rename, and `/proc/self/fd/<fd>/` spellings on
+    the copy, so neither directory can be re-resolved mid-move; see `_at`.
+
+    The entry is classified with `lstat` and copied by type rather than handed to
+    one do-everything call: the *live* world is written by the game and by
+    operators, so unlike the extracted tree (whose members `_check_member` limits
+    to files and directories) it may hold a symlink, and `copy2` on a link with
+    `follow_symlinks=True` would duplicate its target instead of the link.
+    """
+    try:
+        os.rename(name, name, src_dir_fd=src_fd, dst_dir_fd=dst_fd)
+        return
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+    src = _at(src_fd, name)
+    dst = _at(dst_fd, name)
+    st = os.lstat(src)
+    if stat.S_ISDIR(st.st_mode):
+        shutil.copytree(src, dst, symlinks=True)
+    elif stat.S_ISLNK(st.st_mode):
+        os.symlink(os.readlink(src), dst)
+    elif stat.S_ISREG(st.st_mode):
+        shutil.copy2(src, dst, follow_symlinks=False)
+    else:
+        # OSError and not ArchiveError, deliberately: the callers catch OSError to
+        # build the mid-swap state report, and an ArchiveError raised here would
+        # sail past that and lose the one thing the operator needs — which of the
+        # entries had already moved.
+        raise OSError(
+            errno.EINVAL,
+            f"{src_display / name} is neither a regular file, a directory nor a "
+            f"symbolic link, so it cannot be copied across the filesystem "
+            f"boundary into {dst_display}")
+    # Only after the copy is complete, so a failure up to here leaves the entry
+    # where it was — the recoverable half of a mid-swap failure.
+    if stat.S_ISDIR(st.st_mode):
+        shutil.rmtree(src)
+    else:
+        os.unlink(name, dir_fd=src_fd)
+
+
+def _open_live_dir(replaced_path: Path) -> tuple[int, Path | None]:
+    """Pin `SAVED_DIR` as a real directory, creating it if need be.
+
+    Returns its descriptor and the replaced-tree path if the *name* had to be
+    moved aside — which happens in exactly one case: something that is not a
+    directory sits there. That is the old code's `is_symlink()` branch kept intact
+    (a link at this name must be moved aside, never followed and never clobbered),
+    and it is safe to rename because nothing but a directory can be a mount point,
+    so this is the one path where the name itself still moves.
+
+    `O_DIRECTORY|O_NOFOLLOW` for the same reason `_open_staging_dir` uses it, one
+    directory over: `SAVED_DIR.parent` is owned by the service account that
+    `palwarden-webui` runs as, so between the check above and this open that
+    account can put a link at this name. The descriptor is what every later rename
+    is aimed at, so it — not the name — is the destination from here on.
+    """
+    replaced: Path | None = None
+    try:
+        st: os.stat_result | None = os.lstat(SAVED_DIR)
+    except FileNotFoundError:
+        st = None
+    except OSError as exc:
+        raise _SwapError(
+            f"cannot inspect {SAVED_DIR} before restoring into it: {exc}",
+            None, False) from exc
+
+    if st is not None and not stat.S_ISDIR(st.st_mode):
+        try:
+            os.rename(SAVED_DIR, replaced_path)
+        except OSError as exc:
+            raise _SwapError(
+                f"{SAVED_DIR} is not a directory and it cannot be moved aside to "
+                f"{replaced_path} ({exc}); refusing to restore over it",
+                None, False) from exc
+        replaced = replaced_path
+        print(f"replaced: {SAVED_DIR} was not a directory, so it was moved whole "
+              f"to {replaced}")
+        st = None
+
+    if st is None:
+        try:
+            # 0755, which is the mode the staging tree used to carry in when the
+            # swap was a rename of the directory. An *existing* directory keeps its
+            # own mode: where it is a mount point, its mode belongs to the volume
+            # and silently rewriting it is not this tool's business. Ownership is
+            # still normalised either way, by `_chown_tree`.
+            SAVED_DIR.mkdir(parents=True, mode=0o755)
+        except OSError as exc:
+            raise _SwapError(
+                f"cannot create {SAVED_DIR} to restore into: {exc}",
+                replaced, False) from exc
+
+    try:
+        sfd = os.open(SAVED_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise _SwapError(
+            f"cannot open {SAVED_DIR} to restore into: {exc}",
+            replaced, False) from exc
+    return sfd, replaced
+
+
+def _swap_contents(new_tree: Path, tfd: int, replaced_path: Path) -> Path | None:
+    """Put the extracted world into `SAVED_DIR` by moving *contents*, not the
+    directory. Returns the replaced-world tree, or None if there was nothing to
+    move aside. Raises `_SwapError`.
+
+    **Why contents.** This was two renames of the directories themselves, which was
+    atomic, shorter, and cannot succeed in any Docker deployment:
+    `/opt/palworld/server/Pal/Saved` is a mount point in both compose files, and
+    `rename(2)` on a mount point is `EBUSY` — measured, errno 16. Moving the
+    children works whether the target is a mount point or an ordinary directory, so
+    bare metal and every container shape run the same code. A mount-point detector
+    with two strategies would put the deployment that matters on the branch the
+    suite exercises least.
+
+    **The cost, plainly: this is not atomic.** A directory `rename` either happened
+    or did not, so a failure left the old world untouched and complete. Moving
+    entries one at a time can fail halfway and leave `SAVED_DIR` *mixed* — part of
+    the new world in, part of the old world still there, or the old world split
+    across two directories. That is strictly worse than what it replaces, and the
+    answer is not to hide it: every failure below names which of those states the
+    tree is in and where both routes back are, because a partial recovery the
+    operator cannot diagnose from the job output is this project's worst outcome.
+
+    Everything the previous version guarded is still guarded. `SAVED_DIR` is pinned
+    with `O_DIRECTORY|O_NOFOLLOW` before anything moves and every rename is aimed
+    at the descriptor, which is *stronger* than the by-name rename it replaces —
+    the destination cannot be re-resolved at all now, rather than being re-checked
+    just before. `_check_staging_identity` still runs before the first entry moves.
+    `_chown_tree`'s `S_ISLNK` refusal still stands over the ownership pass.
+    """
+    sfd, replaced = _open_live_dir(replaced_path)
+    try:
+        old = sorted(os.listdir(sfd))
+        if not old:
+            # "held no entries" rather than "was empty" or "did not exist": both
+            # are true here (a missing one was just created by `_open_live_dir`)
+            # and this is the wording that is not a lie in either case.
+            print(f"replaced: nothing to move aside - {SAVED_DIR} held no entries")
+        else:
+            try:
+                # 0700 and mkdir (not exist_ok): the name carries entropy precisely
+                # so that an occupied one means someone else got there first, which
+                # is a refusal and not something to extract a world into. 0700
+                # because this is a full world save sitting in a service-account
+                # directory until an operator removes it.
+                os.mkdir(replaced_path, 0o700)
+                rfd = os.open(replaced_path,
+                              os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            except OSError as exc:
+                raise _SwapError(
+                    f"cannot create the replaced-world tree {replaced_path} "
+                    f"({exc}); {SAVED_DIR} has not been touched, so the previous "
+                    f"world is intact and this restore did nothing",
+                    replaced, False) from exc
+            moved = 0
+            try:
+                for name in old:
+                    try:
+                        _move_entry(name, sfd, rfd, SAVED_DIR, replaced_path)
+                    except OSError as exc:
+                        raise _SwapError(_mid_swap_out(
+                            name, moved, old, replaced_path, new_tree, exc),
+                            replaced_path if moved else replaced,
+                            moved > 0) from exc
+                    moved += 1
+                    replaced = replaced_path
+            finally:
+                os.close(rfd)
+            print(f"replaced: the previous world's {moved} top-level entr"
+                  f"{'y' if moved == 1 else 'ies'} moved to {replaced}")
+
+        fresh = sorted(os.listdir(tfd))
+        landed = 0
+        for name in fresh:
+            try:
+                _move_entry(name, tfd, sfd, new_tree, SAVED_DIR)
+            except OSError as exc:
+                raise _SwapError(_mid_swap_in(
+                    name, landed, fresh, replaced, new_tree, exc),
+                    replaced, True) from exc
+            landed += 1
+    finally:
+        os.close(sfd)
+    return replaced
+
+
+def _mid_swap_out(name: str, moved: int, old: list[str], replaced_path: Path,
+                  new_tree: Path, exc: OSError) -> str:
+    """The message for a failure while moving the *previous* world aside.
+
+    Split out from `_swap_contents` because the exact state of the tree is the
+    whole product of this failure path, and it is long enough that burying it in
+    the control flow is how one of the two states quietly stops being reported.
+    """
+    if moved == 0:
+        return (f"cannot move {SAVED_DIR / name} aside to {replaced_path} "
+                f"({exc}). Nothing was moved: the previous world is complete and "
+                f"untouched in {SAVED_DIR}, and no part of the restored world was "
+                f"written into it. The extracted world at {new_tree} was discarded")
+    return (f"cannot move {SAVED_DIR / name} aside to {replaced_path} ({exc}). "
+            f"The restore stopped PARTWAY: {moved} of {len(old)} top-level "
+            f"entries of the previous world are now in {replaced_path} and the "
+            f"remaining {len(old) - moved} are still in {SAVED_DIR}, so the "
+            f"previous world is SPLIT ACROSS THE TWO. No part of the restored "
+            f"world was written into {SAVED_DIR}. To undo: move everything from "
+            f"{replaced_path} back into {SAVED_DIR}")
+
+
+def _mid_swap_in(name: str, landed: int, fresh: list[str],
+                 replaced: Path | None, new_tree: Path, exc: OSError) -> str:
+    """The message for a failure while moving the *restored* world in.
+
+    This is the bad one: `SAVED_DIR` holds part of one world and part of another,
+    and the server must not be started on it. So it says so, in those words, and
+    names the tree the rest of the restored world is still in as well as both
+    routes back.
+    """
+    if replaced is not None:
+        state = (f"the previous world is complete in {replaced}. To undo: empty "
+                 f"{SAVED_DIR}, then move everything from {replaced} back into it")
+    else:
+        state = (f"there was no previous world to move aside, so the only route "
+                 f"back is the safety archive named below - if one was taken")
+    return (f"cannot move {new_tree / name} into {SAVED_DIR} ({exc}). The restore "
+            f"stopped PARTWAY: {landed} of {len(fresh)} top-level entries of the "
+            f"restored world are in {SAVED_DIR} and the remaining "
+            f"{len(fresh) - landed} are still in {new_tree}, so {SAVED_DIR} is a "
+            f"MIXED tree and the server must NOT be started on it - {state}")
+
+
 def _saved_populated() -> bool:
     """True when SAVED_DIR exists and holds at least one entry.
 
@@ -1180,7 +1456,13 @@ def _require_answerable_service_state() -> None:
 
 
 def _report_stale_replaced() -> None:
-    """Name any replaced-world trees earlier restores left behind. Never fatal.
+    """Name any world trees earlier restores left behind. Never fatal.
+
+    Both kinds, `.replaced-*` and `.restore-*`. Only the first used to be globbed,
+    which was fine while a staging tree could only survive a crash — and wrong from
+    the moment the swap could fail with the staging tree deliberately kept (see
+    `_swap_contents`). Each is a full world save, so a glob that names one kind and
+    not the other is how the disk quietly fills.
 
     Every restore whose startup could not be confirmed keeps a full copy of the
     previous world beside the target, on purpose and forever — it is the fastest
@@ -1195,15 +1477,16 @@ def _report_stale_replaced() -> None:
     only route back to a world is not something a tool should do unasked.
     """
     try:
-        stale = sorted(p.name for p in
-                       SAVED_DIR.parent.glob(f"{SAVED_DIR.name}.replaced-*"))
+        stale = sorted(p.name for pattern in ("replaced", "restore")
+                       for p in SAVED_DIR.parent.glob(
+                           f"{SAVED_DIR.name}.{pattern}-*"))
     except OSError:
         # The parent may not exist at all on a rebuilt host, and a directory we
         # cannot list is not a reason to refuse a disaster-recovery restore.
         return
     if not stale:
         return
-    print(f"note: {len(stale)} replaced world tree(s) from earlier restores are "
+    print(f"note: {len(stale)} leftover world tree(s) from earlier restores are "
           f"still in {SAVED_DIR.parent}, each holding a full world save: "
           f"{', '.join(stale)}. Remove them by hand once those servers are known "
           f"good.")
@@ -1238,8 +1521,13 @@ def restore_archive(name: str, wait: int | None = None,
 
     The order below is the design, and each step's failure stops the next:
     validate the scratch copy → conditional safety backup → graceful stop →
-    extract *beside* the target → swap by rename → chown → start and confirm →
-    delete the replaced tree only on a confirmed startup.
+    extract *beside* the target → swap the target's *contents* → chown → start and
+    confirm → delete the replaced tree only on a confirmed startup.
+
+    The swap moves entries rather than renaming the directory because `Pal/Saved`
+    is a mount point in every Docker deployment and `rename(2)` on one is EBUSY;
+    the trade — it is no longer atomic — and how a partial swap is reported are in
+    `_swap_contents`.
 
     The scratch-directory descriptor is opened before the copy and held until the
     restore is over, so the copy, the validation, the extraction and the cleanup
@@ -1323,22 +1611,40 @@ def restore_archive(name: str, wait: int | None = None,
                     # deleting an attacker-chosen tree while cleaning up.
                     _discard_staging(tfd, new_tree)
                     raise
+
+                # The swap is inside the descriptor's lifetime now, because it
+                # moves the staging tree's *entries* and therefore needs `tfd` —
+                # see `_swap_contents` for why it cannot be a rename of the
+                # directory.
+                try:
+                    replaced = _swap_contents(new_tree, tfd, replaced_path)
+                except _SwapError as exc:
+                    # The staging tree used to leak on every failure here: this
+                    # `except` sat outside the `_discard_staging` try above, so a
+                    # failed swap left a fully extracted world save behind with
+                    # nothing printed about it — which, since the swap could not
+                    # succeed in a container at all, was every containerised
+                    # restore attempt.
+                    replaced = exc.replaced
+                    if exc.touched_live:
+                        # Not discarded: it holds the entries that had not been
+                        # moved in yet, and an operator reconstructing a mixed tree
+                        # may want them. Named instead, so it is never silent.
+                        print(f"palworld-restore: the extracted world is left at "
+                              f"{new_tree}; it still holds the entries that were "
+                              f"not moved in. Remove it by hand once this restore "
+                              f"has been sorted out", file=sys.stderr)
+                    else:
+                        _discard_staging(tfd, new_tree)
+                    raise
+                except BaseException:
+                    _discard_staging(tfd, new_tree)
+                    raise
+                # Emptied by the swap; removed through the descriptor for
+                # `_discard_staging`'s reason, not by name.
+                _discard_staging(tfd, new_tree)
             finally:
                 os.close(tfd)
-
-            try:
-                # is_symlink as well as exists, so a symlinked Pal/Saved is moved
-                # aside rather than skipped and then clobbered by the rename below.
-                if SAVED_DIR.exists() or SAVED_DIR.is_symlink():
-                    os.rename(SAVED_DIR, replaced_path)
-                    replaced = replaced_path
-                    print(f"replaced: previous world moved to {replaced}")
-                else:
-                    print(f"replaced: nothing to move aside - {SAVED_DIR} did not exist")
-                os.rename(new_tree, SAVED_DIR)
-            except OSError as exc:
-                raise archive.ArchiveError(
-                    f"cannot swap the restored tree into {SAVED_DIR}: {exc}") from exc
             print(f"restored: {SAVED_DIR}")
 
             _chown_tree(SAVED_DIR)

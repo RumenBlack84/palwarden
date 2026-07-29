@@ -290,6 +290,33 @@ elif mode == "linkroot":
         return orig_chown(root)
 
     mod._chown_tree = linking_chown
+elif mode == "swapfail":
+    # A failure partway through the contents swap. A `rename` of the directory
+    # made this state unreachable — it either happened or it did not — and moving
+    # entries one at a time makes it reachable, so the report is the mitigation and
+    # this is what tests it. `mode_arg` picks the phase:
+    #
+    #   "out" — fails on the very first entry of the previous world, so nothing has
+    #           moved: the live world is intact and the staging tree is pure debris.
+    #   "in"  — fails after one entry of the restored world has landed, so the live
+    #           tree is genuinely mixed and the staging tree holds the rest of it.
+    #
+    # The direction is read off the *destination*, which is the only thing that
+    # distinguishes the two loops.
+    orig_move = mod._move_entry
+    landed = []
+
+    def failing_move(name, src_fd, dst_fd, src_display, dst_display):
+        into_live = str(dst_display) == str(mod.SAVED_DIR)
+        if mode_arg == "out" and not into_live:
+            raise OSError(5, "stub move failure")
+        if mode_arg == "in" and into_live:
+            landed.append(name)
+            if len(landed) > 1:
+                raise OSError(5, "stub move failure")
+        return orig_move(name, src_fd, dst_fd, src_display, dst_display)
+
+    mod._move_entry = failing_move
 elif mode == "extractfail":
     # A partial extraction. Writes into the staging tree, then fails.
     def failing_extract(path, dest, *a, **k):
@@ -398,6 +425,98 @@ assert_contains "$out" "cleaned up: removed the replaced world" \
 # failure-path reports above were fixed for, third instance in this feature.
 assert_contains "$out" "safety archive retained: palworld-save-20260101T000000Z.tar.gz" \
   "the closing report records the safety archive by name"
+
+# ===========================================================================
+# the swap moves CONTENTS, not the directory
+# ===========================================================================
+# The regression that shipped: the swap was `rename(Pal/Saved, Saved.replaced-…)`
+# followed by `rename(Saved.restore-…, Pal/Saved)`, and `Pal/Saved` is a **mount
+# point** in every Docker deployment — a named volume in `docker/compose.yaml`, a
+# bind mount in `docker/compose.live.yaml` — where `rename(2)` returns EBUSY
+# (errno 16, reproduced). So `--restore` could not finish in any container, and
+# nothing noticed: this suite points PALWORLD_SAVED_DIR at a plain `mktemp -d`, and
+# the integration scenario that runs a genuine end-to-end restore mounted only
+# `/opt/palworld/server`, leaving `Pal/Saved` an ordinary subdirectory. The swap had
+# never met a mount point in any tier.
+#
+# An unprivileged suite cannot create a mount point, and faking one would prove
+# nothing about the syscall. So this asserts the *observable that distinguishes the
+# two strategies*: renaming the directory replaces its inode, moving its children
+# does not. tests/integration/test_docker.sh scenario N runs the real thing against
+# a real mount point, which is where the EBUSY itself is pinned.
+reset_all
+populate_world
+stage
+saved_ino_before="$(stat -c %i "$SAVED")"
+out="$(run --restore "$NAME" --startup-timeout 5 2>&1)"
+assert_eq "$?" "0" "the contents swap restores cleanly (output: $out)"
+assert_eq "$(stat -c %i "$SAVED")" "$saved_ino_before" \
+  "Pal/Saved is still the same directory afterwards - its own inode is unchanged"
+# ...and it really restored, so the inode assertion cannot be satisfied by a tool
+# that did nothing at all. Both halves are needed; either alone is passable.
+assert_eq "$(cat "$SAVED/SaveGames/marker.txt" 2>/dev/null)" "GOOD" \
+  "...while the contents of that same directory are now the archive's"
+assert_path_absent "$SAVED/SaveGames/old.sav" \
+  "...and the previous world's file is no longer in it"
+# The replaced tree, by contrast, IS a new sibling directory and must stay one: it
+# is not a mount point, so creating and later removing it is free, and the recovery
+# instructions printed on every failure path name it as a real path.
+assert_eq "$(replaced_trees)" "0" "the replaced sibling is still removed on success"
+
+# ===========================================================================
+# a swap that fails partway says exactly what state the tree is in
+# ===========================================================================
+# The honest cost of moving entries instead of the directory. A directory rename
+# could not fail halfway; this can, and the resulting tree is mixed. A partial
+# recovery the operator cannot diagnose from the job output is this project's worst
+# outcome, so the report is part of the contract and is pinned here.
+#
+# Phase 1: the failure lands before anything moves. The live world is untouched,
+# which the message must say rather than leaving the operator to guess.
+reset_all
+populate_world
+stage
+out="$(harness swapfail out --restore "$NAME" --startup-timeout 5 2>&1)"
+assert_contains "$out" "rc=1" "a swap that fails before anything moves fails the restore"
+assert_contains "$out" "Nothing was moved" "...and says nothing was moved"
+assert_contains "$out" "complete and untouched" "...that the previous world is intact"
+assert_eq "$(cat "$SAVED/SaveGames/old.sav" 2>/dev/null)" "PREVIOUS" \
+  "...and the previous world really is still there"
+assert_path_absent "$SAVED/SaveGames/marker.txt" "...with no part of the archive in it"
+# Nothing of the new world landed, so the staging tree is debris and is discarded
+# rather than left as an unreported world save. This is the leak: the `except`
+# around the swap sat outside the `_discard_staging` try, so every containerised
+# restore attempt — all of which failed, on EBUSY — leaked a full world silently.
+assert_eq "$(staging_trees)" "0" \
+  "the staging tree is discarded when the swap failed before touching the world"
+assert_contains "$out" "the pre-restore safety archive is" \
+  "...and the safety archive is still named as a route back"
+
+# Phase 2: the failure lands after one entry of the restored world is in. This is
+# the state that did not exist before, and the only defence is that it is described
+# precisely.
+reset_all
+populate_world
+stage
+out="$(harness swapfail in --restore "$NAME" --startup-timeout 5 2>&1)"
+assert_contains "$out" "rc=1" "a swap that fails partway through fails the restore"
+assert_contains "$out" "stopped PARTWAY" "...and says the restore stopped partway"
+assert_contains "$out" "MIXED tree" "...that the live tree is mixed"
+assert_contains "$out" "must NOT be started on it" \
+  "...and that the server must not be started on it"
+# Both routes back, by path, in the same output: the replaced tree holding the
+# whole previous world, and the durable archive.
+assert_contains "$out" "the previous world is complete in $SAVED.replaced-" \
+  "...naming the replaced tree that holds the whole previous world"
+assert_contains "$out" "the pre-restore safety archive is" \
+  "...and naming the safety archive as the durable route"
+assert_eq "$(replaced_trees)" "1" "the replaced tree is kept after a partial swap"
+# Kept, not discarded, and *named*: it holds the entries that never landed, so an
+# operator reassembling the tree needs it — but an unreported world save is what
+# this task was fixing, so it must be mentioned either way.
+assert_eq "$(staging_trees)" "1" "the staging tree is kept when it still holds entries"
+assert_contains "$out" "the extracted world is left at $SAVED.restore-" \
+  "...and the output names it rather than leaking it silently"
 
 # --wait is forwarded to the stop tool, which is where the player warning lives.
 reset_all
@@ -906,18 +1025,28 @@ assert_eq "$(cat "$SAVED/SaveGames/marker.txt" 2>/dev/null)" "GOOD" "the embedde
 reset_all
 populate_world
 stage
+# Both kinds. A `.restore-*` tree is a full world save exactly as much as a
+# `.replaced-*` one is, and it can now outlive a restore *by design* — a swap that
+# fails after it has started moving entries in keeps its staging tree on purpose,
+# because it holds the entries that never landed. The glob used to cover
+# `.replaced-*` only, so the kind this feature made survivable was the kind that
+# went unreported.
 mkdir -p "$SAVED.replaced-20260101T000000Z/SaveGames" \
-         "$SAVED.replaced-20260102T000000Z/SaveGames"
+         "$SAVED.replaced-20260102T000000Z/SaveGames" \
+         "$SAVED.restore-20260103T000000Z/SaveGames"
 out="$(run --restore "$NAME" --startup-timeout 5 2>&1)"
-assert_eq "$?" "0" "pre-existing replaced trees do not stop a restore"
-assert_contains "$out" "2 replaced world tree(s) from earlier restores" \
+assert_eq "$?" "0" "pre-existing leftover trees do not stop a restore"
+assert_contains "$out" "3 leftover world tree(s) from earlier restores" \
   "the restore counts the trees left by earlier ones"
 assert_contains "$out" "Saved.replaced-20260101T000000Z" "the first stale tree is named"
 assert_contains "$out" "Saved.replaced-20260102T000000Z" "the second stale tree is named"
-# This restore's own replaced tree is deleted on its confirmed startup; the two
-# older ones are named and left exactly where they were.
+assert_contains "$out" "Saved.restore-20260103T000000Z" \
+  "a leftover staging tree is named too, not just the replaced ones"
+# This restore's own replaced tree is deleted on its confirmed startup; the older
+# ones are named and left exactly where they were.
 assert_eq "$(replaced_trees)" "2" "naming the stale trees does not delete them"
-rm -rf "$SAVED".replaced-*
+assert_eq "$(staging_trees)" "1" "...and the stale staging tree is left alone as well"
+rm -rf "$SAVED".replaced-* "$SAVED".restore-*
 
 # With none there, no note is printed - so the note cannot be a constant string.
 reset_all

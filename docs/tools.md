@@ -142,8 +142,9 @@ or `Config/` — see [`palwarden_archive`](#libraries).
   backup via `palworld-backup` (skipped with a printed note when there is no
   world to preserve); `palworld-graceful-stop [--wait S]`, where an
   already-stopped server is success but a stop that leaves the server *running*
-  aborts; extract into `Pal/Saved.restore-<stamp>` **beside** the target, rename
-  the live tree to `Pal/Saved.replaced-<stamp>`, rename the new tree into place;
+  aborts; extract into `Pal/Saved.restore-<stamp>` **beside** the target, then swap
+  the target's **contents** — move `Pal/Saved`'s entries into
+  `Pal/Saved.replaced-<stamp>` and the extracted tree's entries in;
   `chown -R` to `PALWORLD_USER`/`PALWORLD_GROUP`; start the service and wait for
   REST readiness (`--startup-timeout`, default 180s — the same check
   `graceful-restart` uses).
@@ -170,9 +171,26 @@ or `Config/` — see [`palwarden_archive`](#libraries).
   any group/other bits, holds that descriptor for the whole restore, and refuses
   if the scratch copy's inode changes between validation and extraction.
 
-  Any `Pal/Saved.replaced-*` trees left by earlier restores are **listed at the
-  start** of a restore (named only — never sized, never deleted), because each is
-  a full world save and nothing else ever mentions them again.
+  Any `Pal/Saved.replaced-*` **or** `Pal/Saved.restore-*` trees left by earlier
+  restores are **listed at the start** of a restore (named only — never sized,
+  never deleted), because each is a full world save and nothing else ever mentions
+  them again.
+
+  **The swap moves contents, not the directory, and is therefore not atomic.**
+  `Pal/Saved` is a *mount point* in every Docker deployment (a named volume in
+  `docker/compose.yaml`, a bind mount in `docker/compose.live.yaml`) and
+  `rename(2)` on a mount point is `EBUSY`, so renaming the directory — which is
+  what this used to do — could not succeed in any container. Moving the entries
+  works for a mount point and an ordinary directory alike, so bare metal and every
+  container share one code path; where the two directories are under different
+  *mounts* (which is exactly the mount-point case) each move falls back to a copy on
+  `EXDEV`, as `shutil.move` does, so a restore there costs an extra copy of the
+  world. The cost of moving entries is that a failure **partway** can leave
+  `Pal/Saved` holding part of one world and part of another, where a directory
+  rename could only fail before or after. Every such failure prints exactly which
+  state the tree is in, how many top-level entries moved, the replaced tree's path,
+  the staging tree's path when it still holds entries, and the safety archive's
+  name — a mixed tree must not be started on, and the output is what says so.
 
 `--restore` is **refused in `PALWARDEN_MODE=external`**: the game runs on another
 host, so `systemctl is-active` (via the shim's `pgrep` fallback) cannot see it,
