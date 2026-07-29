@@ -939,6 +939,63 @@ Old `Pal/Saved.replaced-*` trees are listed at the start of every restore and ar
 never deleted automatically — each is a full world save. Remove them by hand once
 the server is known good.
 
+## 16. The live test testbed
+
+Not part of running a server — this is for the machine where you *test* the tooling
+before trusting it on the server above. The **live test tier** runs the real
+commands in this runbook against a real, throwaway Palworld install on a bind
+mount, because a stub server cannot answer whether a restored world actually
+reopens or whether the drift check survives the game rewriting its own config.
+
+Full setup, the tiers table, the refusal codes and every knob live in
+[`docs/tools.md` → Test tiers](tools.md#test-tiers). It **does not run in CI** —
+there is no game install on a runner, and CI is deliberately kept hermetic. Two
+things belong here, because they are the operator-facing half.
+
+### World drift is expected, and harmless
+
+The testbed keeps its world between runs. There is no pristine snapshot and no
+reset, so the world accumulates play state, and a suite that fails halfway leaves it
+part-way through whatever it was doing. Neither is a problem to fix: every live
+assertion is written against something the same run created — a marker carrying a
+fresh nonce, a backups directory private to that run, a config value chosen to
+differ from what was on disk — never against an assumed world state, file list or
+save size. Drift cannot make a live suite pass or fail for the wrong reason.
+
+Do **not** read this as licence to treat a real deployment the same way. The tier is
+built on a directory that has been explicitly declared disposable with a marker
+file, and every destructive helper refuses without it.
+
+### Recovery: throw the world away, keep the install
+
+When a half-finished run leaves the testbed in a state not worth reasoning about,
+reset the world. It discards only the cheap part — the ~8–10 GB SteamCMD install
+beside it is untouched, which is why no snapshot machinery is needed:
+
+```bash
+cd /path/to/palwarden
+export PALWARDEN_LIVE_TESTBED="$HOME/palworld-testbed"   # if not the default
+source tests/live/lib/testbed.sh
+live_down          # stop the stack first: the game holds the save open and would
+                   # write it back out on shutdown, undoing the reset
+live_reset_world   # rm -rf "$PALWARDEN_LIVE_TESTBED/server/Pal/Saved", then
+                   # recreate it empty
+```
+
+The next `./tests/run.sh --live` starts a server that generates a fresh world.
+`live_reset_world` recreates the directory rather than leaving it absent because it
+is a bind-mount *source* and the overlay sets `create_host_path: false`, so a
+missing path is an error at `up` — which is the right behaviour for a typo, and the
+wrong behaviour for a wipe we asked for.
+
+Both helpers call the testbed guard first, so neither can run against a directory
+that is missing the `.palwarden-live-testbed` marker. If either refuses, the message
+names the code (`LIVE_E_*`) and the command that fixes it; the codes are tabulated
+in [`docs/tools.md`](tools.md#refusals).
+
+If the install itself is damaged rather than the world, delete the whole testbed
+directory and redo the one-time install step in `docs/tools.md`.
+
 ## Short version
 
 The core service is simply:

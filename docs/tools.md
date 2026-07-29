@@ -15,6 +15,7 @@ files, talk to the REST API, and touch `palworld`-owned files).
 - [Libraries](#libraries)
 - [Config parser](#palworld-config-parser)
 - [systemd units & timers](#systemd-units--timers)
+- [Test tiers](#test-tiers)
 
 ---
 
@@ -710,3 +711,167 @@ Installed to `/etc/systemd/system`. Enable only what you need.
 
 Each `*.timer` has a matching one-shot `*.service`. After changing any unit:
 `sudo systemctl daemon-reload`.
+
+---
+
+## Test tiers
+
+Three tiers, one runner. Lint is separate.
+
+```bash
+./tests/lint.sh                     # shellcheck + python py_compile
+./tests/run.sh                      # tier 1: unit only (default)
+./tests/run.sh --integration        # + tier 2: docker container scenarios
+./tests/run.sh --live               # + tier 3: a REAL Palworld server
+```
+
+`RUN_INTEGRATION=1` and `RUN_LIVE=1` are equivalent to the two flags, for CI and
+`make`-style callers. Both tiers are additive — `--live` runs unit *and* live, so
+`--integration --live` runs all three.
+
+| Tier | Gate | In CI | Server under test | Suites |
+|------|------|-------|-------------------|--------|
+| Unit | default | yes | stubs | `tests/unit/test_*.sh` |
+| Integration | `--integration` / `RUN_INTEGRATION=1` | yes | `tests/fixtures/fake-server` (a shell script pretending to be the game) in a real container | `tests/integration/test_*.sh` |
+| **Live** | `--live` / `RUN_LIVE=1` **and** a marker file | **no** | the real game, on a throwaway bind mount | `tests/live/test_*.sh` |
+
+Integration and live both need `docker`; when it is missing the runner says so and
+skips rather than failing. When the live tier is skipped it prints how to enable it,
+because a tier nobody knows exists is a tier nobody runs.
+
+### The live tier does not run in CI
+
+Deliberately, and it is not a gap to be closed. There is no ~8–10 GB game install
+on a runner, and the whole point is that **CI stays hermetic**: this project has
+already had an integration suite write into a persistent bind-mounted fixture, so
+each run pre-seeded the next — a fresh clone would have failed and one assertion was
+passing over a *failed* backup. Persistence hid a real defect for two tasks. The
+hermetic suites stay the merge gate; the live tier is a **local fidelity check** you
+run before trusting something on a real host. See
+[`docs/superpowers/specs/2026-07-28-live-test-tier-design.md`](superpowers/specs/2026-07-28-live-test-tier-design.md).
+
+What it covers — the paths a stub server cannot exercise:
+
+| Suite | What only a real game can answer |
+|-------|----------------------------------|
+| `tests/live/test_restore_roundtrip.sh` | `backup_restore` end to end: stop, extract, swap by rename, chown, start, REST readiness — and the world actually reopens. |
+| `tests/live/test_stop_consistency.sh` | A graceful stop's `SIGINT` produces a world the game loads again; and `palworld-backups --if-due` against a real `Pal/Saved` produces an archive that really unpacks. |
+| `tests/live/test_config_drift.sh` | The **semantic** drift comparison (`True` == `1`, `60.000000` == `60`) surviving the game's own rewrite of `Engine.ini`, applied `PalWorldSettings.ini` values surviving it too (with secrets still redacted), and `update_check` against real Steam. |
+
+### One-time setup
+
+The testbed is a disposable directory **outside the repository tree**, holding the
+game install and the world. It persists between runs, so the multi-GB download
+happens once.
+
+```bash
+# 1. Create it and declare it disposable. The marker is not optional: the live tier
+#    stops the server, deletes worlds and restarts it, so it refuses to touch any
+#    directory that is not marked. A mistyped path is the one accident that would
+#    actually hurt, and a real deployment will not have this file.
+export PALWARDEN_LIVE_TESTBED="$HOME/palworld-testbed"   # also the built-in default
+mkdir -p "$PALWARDEN_LIVE_TESTBED/server/Pal/Saved"
+touch "$PALWARDEN_LIVE_TESTBED/.palwarden-live-testbed"
+
+# 2. Give the stack an admin password (docker/.env or the environment). The live
+#    tier drives the server through its REST API, which the game only enables when
+#    ADMIN_PASSWORD is set — without one, readiness could never be reached.
+grep -q '^ADMIN_PASSWORD=.' docker/.env 2>/dev/null \
+  || echo "ADMIN_PASSWORD=pick-something" >> docker/.env
+
+# 3. Install the game — ONCE. The overlay pins UPDATE_ON_START=false so ordinary
+#    runs start in seconds; this is the only invocation that sets it true. ~8-10 GB
+#    via SteamCMD; no suite ever does this for you.
+UPDATE_ON_START=true COMPOSE_PROFILES=embedded \
+  PALWARDEN_LIVE_TESTBED="$PALWARDEN_LIVE_TESTBED" \
+  docker compose -p palwarden-live --project-directory docker \
+    -f docker/compose.yaml -f docker/compose.live.yaml up -d --build
+
+# ...watch it install and boot, which takes a while:
+docker compose -p palwarden-live --project-directory docker \
+  -f docker/compose.yaml -f docker/compose.live.yaml logs -f palwarden
+
+# 4. Then run the tier. The suites bring the stack up and down themselves.
+./tests/run.sh --live
+```
+
+The `-f docker/compose.yaml -f docker/compose.live.yaml` overlay is what swaps the
+`palworld-server` and `palworld-saved` **named volumes** for bind mounts into the
+testbed; `docker/compose.yaml` is left untouched, so nothing about a real deployment
+changes. The `-p palwarden-live --project-directory docker` pair is exactly what
+`tests/live/lib/testbed.sh` passes, and it is worth copying rather than relying on
+the overlay's `name:` — `COMPOSE_PROJECT_NAME`, from the environment *or* from
+`docker/.env`, overrides `name:`, and `-p` is the only reliable pin. Ports come from
+`compose.yaml`, so a real deployment already listening on 8088/8211 makes the live
+`up` fail loudly instead of quietly sharing state.
+
+Web UI credentials need no setup: the suites read the generated ones out of
+`/etc/palworld/webui.env` in the running container, and honour pinned
+`WEBUI_USER`/`WEBUI_PASSWORD`/`WEBUI_TOKEN` if you have set them.
+
+### Refusals
+
+Every mutating helper in `tests/live/lib/testbed.sh` checks the testbed first, and
+each refusal carries a stable code plus the command that fixes it:
+
+| Code | Meaning |
+|------|---------|
+| `LIVE_E_NO_TESTBED` | `$PALWARDEN_LIVE_TESTBED` does not exist. |
+| `LIVE_E_UNMARKED` | It exists but has no `.palwarden-live-testbed` marker. |
+| `LIVE_E_OWNER_UID` | The testbed, `server/`, or `server/Pal/Saved` is owned by the wrong uid — the container's `steam` account is uid **1000**, and a testbed it cannot write to surfaces later as a corrupt-looking save. `sudo chown -R 1000 "$PALWARDEN_LIVE_TESTBED"`, or set `PALWARDEN_LIVE_EXPECT_UID`. |
+| `LIVE_E_NOT_INSTALLED` | No `server/PalServer.sh` — step 3 above has not been done. |
+| `LIVE_E_NOT_EXECUTABLE` | `PalServer.sh` lost its exec bit (a restore from a tar that dropped modes). `chmod +x` it. |
+| `LIVE_E_NO_ADMIN_PASSWORD` | Step 2 above. Set-but-empty in the environment counts, and beats `docker/.env`. |
+| `LIVE_E_COMPOSE_UP` | `docker compose up` itself failed; its output is above the refusal. |
+
+The guard is exercised by `tests/unit/test_live_guard.sh`, which runs in ordinary CI
+with neither a game nor Docker: a destructive suite's safety check cannot be verified
+only by a tier nobody runs automatically.
+
+### Knobs
+
+All optional; the defaults are what the suites use.
+
+| Variable | Default | What |
+|----------|---------|------|
+| `PALWARDEN_LIVE_TESTBED` | `$HOME/palworld-testbed` | The testbed directory. |
+| `PALWARDEN_LIVE_EXPECT_UID` | `1000` | The uid the testbed must be owned by. |
+| `PALWARDEN_LIVE_PROJECT` | `palwarden-live` | Compose project name. |
+| `PALWARDEN_LIVE_REPO` | derived from the suite's path | Repo root, so the helpers can be sourced from anywhere. |
+| `PALWARDEN_LIVE_WEBUI_PORT` | asked of compose after `up` | Published host port for the web UI. |
+| `PALWARDEN_LIVE_WEBUI_USER` | `$WEBUI_USER`, else `admin` | Web UI username. |
+| `PALWARDEN_LIVE_WEBUI_PASSWORD` / `_TOKEN` | `$WEBUI_PASSWORD` / `$WEBUI_TOKEN`, else read from `/etc/palworld/webui.env` in the container | Web UI password and CSRF token. |
+| `PALWARDEN_LIVE_UP_TIMEOUT` | `420` | Seconds to wait for REST readiness. |
+| `PALWARDEN_LIVE_JOB_TIMEOUT` | `300` | Seconds for an ordinary job to settle. |
+| `PALWARDEN_LIVE_RESTORE_TIMEOUT` | `900` | The restore job (stop + extract + cold start + readiness poll). |
+| `PALWARDEN_LIVE_STOP_TIMEOUT` | `420` | The graceful stop in `test_stop_consistency.sh`. |
+| `PALWARDEN_LIVE_RESTART_TIMEOUT` | `420` | The graceful restart in `test_config_drift.sh`. |
+| `PALWARDEN_LIVE_UPDATE_TIMEOUT` | `600` | `update_check` against real Steam. |
+
+Every wait in the tier is bounded: a live suite that hangs is worse than one that
+fails, because nobody watches it long enough to notice.
+
+### World drift, and the escape hatch
+
+There is **no** pristine-world snapshot and no reset between runs. The world
+accumulates play state, and a suite that failed halfway leaves it drifted — both are
+expected and harmless, because every live assertion is written against an artefact
+the same run created (a marker carrying a fresh nonce, a private backups directory,
+a config value the run chose to differ from what was on disk), never against an
+assumed world state or file list.
+
+When a half-finished run leaves the testbed in a state not worth reasoning about,
+throw the world away and keep the expensive install:
+
+```bash
+cd /path/to/palwarden
+source tests/live/lib/testbed.sh
+live_down          # stop the stack first — the game holds the save open and would
+                   # write it back out on shutdown
+live_reset_world   # deletes $PALWARDEN_LIVE_TESTBED/server/Pal/Saved, recreates it
+                   # empty; the server generates a fresh world on the next start
+```
+
+Both are guarded, so neither can run against an unmarked directory. See the runbook,
+[§16](palworld-service-runbook.md#16-the-live-test-testbed), for the operator-facing
+version of this.

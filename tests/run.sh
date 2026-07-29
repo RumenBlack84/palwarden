@@ -69,10 +69,11 @@ if [[ "$want_live" == "1" ]]; then
   fi
 else
   echo
-  # Points at the overlay's header comment, which documents the testbed, the marker
-  # and the one-time install in full. docs/tools.md documents no test tier at all
-  # (not even RUN_INTEGRATION); repoint this line there once Task 4 adds one.
-  echo "(live tests skipped; pass --live to run them — needs a real server, see docker/compose.live.yaml)"
+  # Points at docs/tools.md's "Test tiers" section, which documents all three
+  # tiers, the testbed, the marker, the one-time install and the recovery step in
+  # one place. (It used to point at docker/compose.live.yaml's header comment,
+  # because that section did not exist yet.)
+  echo "(live tests skipped; pass --live to run them — needs a real server, see docs/tools.md#test-tiers)"
 fi
 
 echo
