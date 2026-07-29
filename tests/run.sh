@@ -7,6 +7,7 @@
 #   ./tests/run.sh              # unit tests only
 #   ./tests/run.sh --integration# unit + docker integration tests
 #   ./tests/run.sh --live       # + suites against a REAL Palworld server
+#   ./tests/run.sh --reset-world# wipe the live testbed's world, then exit
 #   RUN_INTEGRATION=1 ./tests/run.sh
 #   RUN_LIVE=1 ./tests/run.sh
 #
@@ -24,6 +25,21 @@ for a in "$@"; do [[ "$a" == "--integration" ]] && want_integration=1; done
 want_live=0
 [[ "${RUN_LIVE:-0}" == "1" ]] && want_live=1
 for a in "$@"; do [[ "$a" == "--live" ]] && want_live=1; done
+
+# --reset-world is the live tier's escape hatch, not a test mode: world drift is
+# accepted there, so the only recovery needed is throwing the cheap half away and
+# keeping the expensive install. It runs the guard first (so it can never fire at an
+# unmarked directory) and exits without running any suite, because mixing a
+# destructive reset into a test run is how someone loses a world they meant to keep.
+for a in "$@"; do
+  if [[ "$a" == "--reset-world" ]]; then
+    # shellcheck source=tests/live/lib/testbed.sh
+    source "$DIR/live/lib/testbed.sh"
+    live_require_testbed
+    live_reset_world
+    exit 0
+  fi
+done
 
 failed=0
 run_file() {
