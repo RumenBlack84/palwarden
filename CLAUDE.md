@@ -116,6 +116,14 @@ via env (as the existing scripts do). Fixtures live in `tests/fixtures/`.
   `docker compose down -v`. A config of *only defaults* is truncated to one
   newline on first start (Unreal writes only non-defaults) — harmless, but it
   looks like a wipe.
+- **…but the game clobbers on-disk config edits made while it runs.** Observed
+  on v1.0.3: the server rewrites its config from memory as it *exits*, so an
+  apply issued against a running server was silently reverted mid-shutdown
+  (same second; only the mtime fraction gave it away). "Values survive
+  restarts" (above) holds only for values the game *booted with*. Therefore
+  every apply-then-restart flow must apply **between stop and start** —
+  `palworld-graceful-restart --apply-config/--apply-engine` exists for exactly
+  this, and `tests/unit/test_graceful_restart.sh` pins the ordering.
 - **Drift checks must compare semantically**, not textually: the game reformats
   values, so normalise both sides (`True` == `1`, `60.000000` == `60`) — see
   `palworld-engine-config`'s check.
@@ -127,5 +135,6 @@ via env (as the existing scripts do). Fixtures live in `tests/fixtures/`.
 ## Commits
 
 SPDX headers on new scripts; clear messages; end with
-`Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`. Branch before
+`Co-Authored-By: <the model that wrote the change> <noreply@anthropic.com>`
+(e.g. `Claude Fable 5`). Branch before
 committing if on the default branch. Commit/push only when asked.

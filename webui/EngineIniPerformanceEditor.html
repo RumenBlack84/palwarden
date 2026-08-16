@@ -10,46 +10,17 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>palwarden — Engine.ini performance</title>
-  <style>
+  <link rel="stylesheet" href="palwarden-ui.css">
+<script src="palwarden-ui.js" defer></script>
+<style>
     /* Design tokens — the only place raw colors appear. Shared vocabulary with
        webui/palwarden.html; see the design spec, "Component vocabulary". */
-    :root {
-      color-scheme: dark;
-      --pw-bg: #14161a; --pw-surface: #1c1f25; --pw-border: #2b2f37;
-      --pw-fg: #e6e6e6; --pw-fg-muted: #9aa4b2;
-      --pw-ok: #7ddc86; --pw-warn: #f0c674; --pw-bad: #f28b82; --pw-idle: #8b93a1;
-      --pw-accent: #8ab4f8;
-      /* Translucent blacks. Two tokens, not one: --pw-scrim dims the whole
-         viewport behind a modal and --pw-shadow is the colour of an elevation
-         shadow, so they answer to different questions (how unreachable does the
-         page look / how far off the surface does the toast float) and are
-         expected to move independently. */
-      --pw-scrim: rgba(0, 0, 0, .6); --pw-shadow: rgba(0, 0, 0, .45);
-      --pw-space-1: 4px; --pw-space-2: 8px; --pw-space-3: 16px; --pw-space-4: 24px;
-      --pw-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
-      --pw-sans: system-ui, -apple-system, "Segoe UI", sans-serif;
-    }
     * { box-sizing: border-box; }
     body { font: 14px/1.5 var(--pw-sans); margin: 0;
            background: var(--pw-bg); color: var(--pw-fg); }
     a { color: var(--pw-accent); }
     :focus-visible { outline: 2px solid var(--pw-accent); outline-offset: 2px; }
 
-    /* pw-nav: slim header bar with the wordmark and a segmented tab control. */
-    .pw-nav { display: flex; align-items: center; justify-content: space-between;
-              gap: var(--pw-space-3); padding: var(--pw-space-2) var(--pw-space-4);
-              border-bottom: 1px solid var(--pw-border); background: var(--pw-surface);
-              flex-wrap: wrap; }
-    .pw-nav__wordmark { font-family: var(--pw-mono); font-size: 1.1rem;
-                         letter-spacing: .08em; color: var(--pw-fg); }
-    .pw-nav__tabs { display: flex; gap: 2px; background: var(--pw-bg);
-                    border: 1px solid var(--pw-border); border-radius: 8px; padding: 2px; }
-    .pw-tab { font-family: var(--pw-sans); font-size: .82rem; color: var(--pw-fg-muted);
-              text-decoration: none; padding: var(--pw-space-1) var(--pw-space-3);
-              border-radius: 6px; }
-    .pw-tab:hover { color: var(--pw-fg); }
-    .pw-tab[aria-current="page"] { background: var(--pw-surface); color: var(--pw-fg);
-                                    border: 1px solid var(--pw-border); }
 
     .pw-page { padding: var(--pw-space-4); }
     .pw-page > h1 { font-family: var(--pw-mono); font-size: 1.8rem; font-weight: 600;
@@ -60,14 +31,10 @@
        the grid spans the page, which is what the wide regions want. */
     .pw-grid { display: grid; gap: var(--pw-space-3);
                grid-template-columns: repeat(6, 1fr); margin-bottom: var(--pw-space-3); }
-    .pw-card { background: var(--pw-surface); border: 1px solid var(--pw-border);
-               border-radius: 6px; padding: var(--pw-space-3);
-               grid-column: span 2; margin-bottom: var(--pw-space-3); }
+    /* Card visuals come from the shared .pw-section component (the editor's
+       collapsible boxes); only the grid placement is this page's business. */
+    .pw-card { grid-column: span 2; }
     .pw-card--wide { grid-column: span 3; }
-    .pw-card > h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .1em;
-                    color: var(--pw-fg-muted); margin: 0 0 var(--pw-space-2);
-                    font-family: var(--pw-sans); }
-    .pw-card > p { color: var(--pw-fg-muted); margin: 0 0 var(--pw-space-2); }
     .pw-card code, .pw-card pre { font-family: var(--pw-mono); }
     .pw-card pre { margin: 0; overflow: auto; }
 
@@ -140,15 +107,16 @@
     }
   </style>
 </head>
-<body>
-<nav class="pw-nav">
-  <span class="pw-nav__wordmark">palwarden</span>
-  <div class="pw-nav__tabs">
-    <a class="pw-tab" href="palwarden.html">Dashboard</a>
-    <a class="pw-tab" href="PalWorldSettingsEditor.html">Server settings</a>
-    <a class="pw-tab" href="EngineIniPerformanceEditor.html" aria-current="page">Engine.ini performance</a>
-    <a class="pw-tab" href="backups.html">Backups</a>
-  </div>
+<body class="pw-with-sidebar" data-theme="dark">
+<nav class="pw-sidebar" aria-label="palwarden">
+  <div class="pw-sidebar__brand"><span class="pw-sidebar__label">palwarden</span></div>
+  <a class="pw-sidebar__item" href="palwarden.html" title="Dashboard"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 14a8 8 0 1 1 16 0"/><path d="M12 14l4-4"/><path d="M6 20h12"/></svg><span class="pw-sidebar__label">Dashboard</span></a>
+  <a class="pw-sidebar__item" href="PalWorldSettingsEditor.html" title="Server settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="4" y1="7" x2="12" y2="7"/><line x1="18" y1="7" x2="20" y2="7"/><circle cx="15" cy="7" r="2"/><line x1="4" y1="12" x2="6" y2="12"/><line x1="12" y1="12" x2="20" y2="12"/><circle cx="9" cy="12" r="2"/><line x1="4" y1="17" x2="13" y2="17"/><line x1="19" y1="17" x2="20" y2="17"/><circle cx="16" cy="17" r="2"/></svg><span class="pw-sidebar__label">Server settings</span></a>
+  <a class="pw-sidebar__item" href="EngineIniPerformanceEditor.html" aria-current="page" title="Engine.ini performance"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 2 4.5 13.5H11L9.5 22 18 10.5h-6.5L13 2z"/></svg><span class="pw-sidebar__label">Engine.ini performance</span></a>
+  <a class="pw-sidebar__item" href="backups.html" title="Backups"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="5" rx="1"/><path d="M5 9v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V9"/><path d="M10 13h4"/></svg><span class="pw-sidebar__label">Backups</span></a>
+  <div class="pw-sidebar__spacer"></div>
+  <button class="pw-sidebar__item" id="pw-theme-toggle" type="button" title="Toggle light/dark theme"><span class="pw-sidebar__emoji">☀️</span><span class="pw-sidebar__label">Theme</span></button>
+  <button class="pw-sidebar__item" id="pw-sidebar-toggle" type="button" title="Collapse sidebar" aria-expanded="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg><span class="pw-sidebar__label">Collapse</span></button>
 </nav>
 <div class="pw-page">
   <h1>Engine.ini performance</h1>
@@ -157,8 +125,9 @@
      <code>palworld-engine-config</code> is what ever touches Engine.ini.</p>
 
   <div class="pw-grid">
-    <section class="pw-card pw-card--wide">
-      <h2>Presets</h2>
+    <details class="pw-card pw-card--wide pw-section pw-section--indigo" open>
+      <summary class="pw-section__header"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="4" y1="7" x2="12" y2="7"/><line x1="18" y1="7" x2="20" y2="7"/><circle cx="15" cy="7" r="2"/><line x1="4" y1="12" x2="6" y2="12"/><line x1="12" y1="12" x2="20" y2="12"/><circle cx="9" cy="12" r="2"/><line x1="4" y1="17" x2="13" y2="17"/><line x1="19" y1="17" x2="20" y2="17"/><circle cx="16" cy="17" r="2"/></svg><h2>Presets</h2></summary>
+      <div class="pw-section__content">
       <p>Presets only fill values in this browser. Review before saving. Higher tick
          rates may improve smoothness but can raise CPU and network load.</p>
       <div>
@@ -168,10 +137,12 @@
         <button type="button" class="pw-btn" onclick="clearAll()">Clear managed values</button>
       </div>
       <p><span class="pw-pill pw-pill--idle">Restart required to take effect</span></p>
-    </section>
+    </div>
+</details>
 
-    <section class="pw-card pw-card--wide">
-      <h2>Current Engine.ini</h2>
+    <details class="pw-card pw-card--wide pw-section pw-section--blue" open>
+      <summary class="pw-section__header"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 2h9l5 5v15H6z"/><path d="M14 2v6h6"/></svg><h2>Current Engine.ini</h2></summary>
+      <div class="pw-section__content">
       <p>Loads the live file through the read-only <code>current/</code> mount and fills
          the managed rows from it.</p>
       <div>
@@ -179,17 +150,21 @@
         <button type="button" class="pw-btn" onclick="parseIni(document.getElementById('iniText').value)">Parse pasted INI</button>
       </div>
       <textarea id="iniText" aria-label="Engine.ini source" placeholder="Paste Engine.ini here, or click Load current Engine.ini..."></textarea>
-    </section>
+    </div>
+</details>
   </div>
 
-  <section class="pw-card">
-    <h2>Managed performance settings</h2>
+  <details class="pw-card pw-section pw-section--purple" open>
+    <summary class="pw-section__header"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="4" y1="7" x2="12" y2="7"/><line x1="18" y1="7" x2="20" y2="7"/><circle cx="15" cy="7" r="2"/><line x1="4" y1="12" x2="6" y2="12"/><line x1="12" y1="12" x2="20" y2="12"/><circle cx="9" cy="12" r="2"/><line x1="4" y1="17" x2="13" y2="17"/><line x1="19" y1="17" x2="20" y2="17"/><circle cx="16" cy="17" r="2"/></svg><h2>Managed performance settings</h2></summary>
+    <div class="pw-section__content">
     <p>The right-hand checkbox marks a key as managed; only managed rows are sent.</p>
     <div id="settings"></div>
-  </section>
+  </div>
+</details>
 
-  <section class="pw-card">
-    <h2>Apply via palwarden</h2>
+  <details class="pw-card pw-section pw-section--green" open>
+    <summary class="pw-section__header"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg><h2>Apply via palwarden</h2></summary>
+    <div class="pw-section__content">
     <p><strong>Save</strong> writes the managed values into
        <code>/etc/palworld/engine.env</code> and nothing else — no file under Engine.ini
        changes and the server is untouched, so it is safe at any time.
@@ -203,11 +178,13 @@
       <button type="button" class="pw-btn pw-btn--danger" id="btn-save-apply">Save and apply (restarts the server)</button>
     </div>
     <pre class="pw-log pw-empty" id="joblog" aria-live="polite">No job started from this page yet.</pre>
-  </section>
+  </div>
+</details>
 
   <div class="pw-grid">
-    <section class="pw-card pw-card--wide">
-      <h2>Generated engine.env</h2>
+    <details class="pw-card pw-card--wide pw-section pw-section--teal" open>
+      <summary class="pw-section__header"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 2h9l5 5v15H6z"/><path d="M14 2v6h6"/></svg><h2>Generated engine.env</h2></summary>
+      <div class="pw-section__content">
       <p>What Save sends, in the file format <code>palworld-engine-config</code> reads.
          Copy it out only if you would rather install it by hand.</p>
       <div>
@@ -220,10 +197,12 @@
            Editing any managed row regenerates and so discards those tweaks,
            which is the same behaviour the page has always had. -->
       <textarea id="envOut" aria-label="Generated engine.env"></textarea>
-    </section>
+    </div>
+</details>
 
-    <section class="pw-card pw-card--wide">
-      <h2>Generated Engine.ini fragment</h2>
+    <details class="pw-card pw-card--wide pw-section pw-section--gold" open>
+      <summary class="pw-section__header"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 2h9l5 5v15H6z"/><path d="M14 2v6h6"/></svg><h2>Generated Engine.ini fragment</h2></summary>
+      <div class="pw-section__content">
       <p>Reference only. Prefer engine.env plus apply, so backups, validation,
          ownership, the pretty copy and the Discord diff all happen consistently.</p>
       <div>
@@ -231,16 +210,19 @@
       </div>
       <!-- Editable for the same reason as envOut: Copy fragment reads .value. -->
       <textarea id="iniOut" aria-label="Generated Engine.ini fragment"></textarea>
-    </section>
+    </div>
+</details>
   </div>
 
-  <section class="pw-card">
-    <h2>Manual apply (bare metal, or when the control plane is unavailable)</h2>
+  <details class="pw-card pw-section pw-section--red" open>
+    <summary class="pw-section__header"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 17l6-5-6-5"/><path d="M12 19h8"/></svg><h2>Manual apply (bare metal, or when the control plane is unavailable)</h2></summary>
+    <div class="pw-section__content">
     <pre><code>sudo install -m 0644 -o root -g root engine.env /etc/palworld/engine.env
 sudo /usr/local/sbin/palworld-engine-config apply --dry-run
 sudo /usr/local/sbin/palworld-engine-config apply
 sudo /usr/local/sbin/palworld-graceful-restart</code></pre>
-  </section>
+  </div>
+</details>
 </div>
 
 <!-- aria-describedby points at the body text so the dialog has an accessible
@@ -626,8 +608,9 @@ el('btn-save-apply').addEventListener('click', async ()=>{
   if(!settings) return;
   const keys=Object.keys(settings).sort().join(', ');
   const okToGo=await confirmDisruptive(
-    'This writes engine.env, runs palworld-engine-config apply, and then gracefully '+
-    'restarts the server: players are warned in-game and the world is saved before it '+
+    'This writes engine.env and gracefully restarts the server, applying the values '+
+    'while it is stopped (an apply while it runs would be lost to the game\u2019s own '+
+    'exit-time config write): players are warned in-game and the world is saved before it '+
     'goes down. The warning window is the restart tool’s own default — up to 300 s with '+
     'players online, 15 s on an empty server (in a container the restart follows the save '+
     'immediately). Keys: '+keys+'.');

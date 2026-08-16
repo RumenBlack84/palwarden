@@ -250,7 +250,10 @@ if [[ "$MODE" == "embedded" ]]; then
   # starts: enables the REST API (so embedded telemetry works out of the box),
   # sets passwords, and any PALWORLD_CFG_* server settings. Runs as root so it
   # can chown to steam; best-effort so a parser hiccup never blocks boot.
-  if [[ -n "${ADMIN_PASSWORD:-}" ]] || compgen -e | grep -q '^PALWORLD_CFG_'; then
+  # Also when the web editor has saved overrides: those live on the state
+  # volume and must be re-asserted onto the (possibly recreated) config file.
+  if [[ -n "${ADMIN_PASSWORD:-}" ]] || compgen -e | grep -q '^PALWORLD_CFG_' \
+      || [[ -r "${PALWORLD_SETTINGS_OVERRIDES:-/etc/palworld/settings-overrides.env}" ]]; then
     log "Applying settings.env to PalWorldSettings.ini..."
     # PALWORLD_USER/GROUP come from the image env (steam).
     /usr/local/sbin/palworld-config-apply-env \

@@ -28,7 +28,7 @@ Saves the world (REST API), issues a timed API shutdown with a player notice
 service isn't active. Notifies on completion/timeout.
 
 ### `palworld-graceful-restart`
-`/usr/local/sbin/palworld-graceful-restart [--wait S] [--empty-wait S] [--message T] [--empty-message T] [--startup-timeout S]`
+`/usr/local/sbin/palworld-graceful-restart [--wait S] [--empty-wait S] [--message T] [--empty-message T] [--startup-timeout S] [--apply-config] [--apply-engine]`
 
 The preferred way to restart once the REST API is live. Checks current player
 count via the API and picks a short `--empty-wait` (default 15s) when the server
@@ -36,6 +36,14 @@ is empty, otherwise the full `--wait` (300s). Runs `graceful-stop`, starts the
 service, waits for systemd `active`, then waits for REST API readiness before
 declaring success. Records `graceful restart requested` / `completed` event
 markers. **Prefer this over `systemctl restart palworld.service`.**
+
+`--apply-config` / `--apply-engine` run `palworld-config-apply-env` /
+`palworld-engine-config apply` in the window where the server is fully stopped
+— the only moment an apply is safe: the game rewrites its config files from
+memory as it exits, so an apply issued while it still runs is silently
+clobbered mid-shutdown (observed on v1.0.3). A failed apply never leaves the
+server down — it is started regardless and the script exits nonzero so the
+caller sees the apply failed.
 
 ### `palworld-update`
 `/usr/local/sbin/palworld-update [--check] [--notify-no-update]`
@@ -241,9 +249,13 @@ example variables. Summary of the commands:
 
 Reads `/etc/palworld/settings.env`, backs up the current `PalWorldSettings.ini`
 to `/opt/palworld/config-backups/`, then applies every setting (passwords
-included) via `palworld-config-parser`. Regenerates the pretty INI, posts a
-redacted diff + settings summary, and records a config event marker.
-**Requires a service restart to take effect.**
+included) via `palworld-config-parser`. If the web editor has saved overrides
+(`PALWORLD_SETTINGS_OVERRIDES`, default `/etc/palworld/settings-overrides.env`,
+written by `palwarden-jobd`'s `settings_save`), those are applied in a second
+parser pass **after** `settings.env`, so a value saved in the browser wins over
+its `PALWORLD_CFG_*` variable; one backup and one diff cover both passes.
+Regenerates the pretty INI, posts a redacted diff + settings summary, and
+records a config event marker. **Requires a service restart to take effect.**
 
 ### `palworld-engine-config`
 `/usr/local/sbin/palworld-engine-config {apply|status|rollback|pretty|diff|template} [...]`
@@ -287,7 +299,14 @@ be running or queued actions never execute. See
 
 Serves the web UI and the JSON API on `127.0.0.1:8088`
 (`PALWARDEN_WEBUI_BIND`/`PALWARDEN_WEBUI_PORT`; keep the bind loopback — see the
-tunnel note below). **Every path requires
+tunnel note below). A non-loopback bind serves reads but refuses every mutation
+with a 403 (the Origin check accepts only loopback hosts) unless the operator
+also sets **`PALWARDEN_WEBUI_ORIGIN_HOSTS`** — a comma-separated allowlist of
+exact hostnames/IPs (compared case-insensitively against the Origin's host,
+never scheme or port) whose pages are then trusted like localhost's. List only
+names that resolve to this machine on a network you trust (a VPN/tailnet name,
+a LAN address); Basic auth, the token, and the `Sec-Fetch-Site` check still
+apply, and unlisted (including DNS-rebound) names are still refused. **Every path requires
 HTTP Basic auth**, including the vendored editor, using credentials in
 `/etc/palworld/webui.env` (`--init-credentials` generates them once, as root, and
 never overwrites an existing file; `install.sh` and the container entrypoint call
@@ -399,12 +418,30 @@ live worker legitimately owns. Must run as root (it cannot even open the lock
 otherwise).
 
 Actions: `config_apply`, `engine_apply`, `config_pretty`, `snapshot_create`,
-`backup`, `mark`, `engine_save`, `backup_import`, `backup_schedule_save`
-(file-only) and `graceful_restart`, `graceful_stop`, `update_check`,
-`update_apply`, `engine_rollback`, `api_save`, `engine_save_apply_restart`,
-`backup_restore`, `backup_delete` (disruptive, `confirm: true` required).
+`backup`, `mark`, `engine_save`, `settings_save`, `backup_import`,
+`backup_schedule_save` (file-only) and `graceful_restart`, `graceful_stop`,
+`update_check`, `update_apply`, `engine_rollback`, `api_save`,
+`engine_save_apply_restart`, `settings_save_apply_restart`, `backup_restore`,
+`backup_delete` (disruptive, `confirm: true` required).
 Composite actions stop at the first failure — a failed save or apply never reaches
 the restart. Output is captured combined and capped.
+
+`settings_save` is the PalWorldSettings twin of `engine_save`: it validates every
+requested key and value against the shapes actually present in the live
+`PalWorldSettings.ini` (using `palworld-config-parser`'s own resolver and
+renderer, so a value the apply would drop is refused at the form instead),
+refuses `AdminPassword`/`ServerPassword` outright (those stay managed via
+`settings.env`) and `RESTAPIEnabled`/`RESTAPIPort` too (the REST API is the
+control plane's own lifeline — a saved `RESTAPIEnabled=False` would ride the
+overrides file, win over `settings.env` on every boot, and permanently cut off
+telemetry, graceful save-on-stop and updates; it stays managed via
+`ADMIN_PASSWORD`/`PALWORLD_REST_PORT`), and merge-writes
+`PALWORLD_SETTINGS_OVERRIDES`.
+`settings_save_apply_restart` chains that write with a
+`palworld-graceful-restart --apply-config`, which runs the apply after the
+server has fully stopped (applying while it runs is lost work — the game
+rewrites its config from memory on exit). `engine_save_apply_restart` uses
+`--apply-engine` the same way.
 
 `backup_delete` is disruptive despite stopping no service: the classification gates
 *irreversible* actions, and deleting the archive that would have recovered the

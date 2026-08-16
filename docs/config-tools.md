@@ -1,14 +1,15 @@
 # Palworld config tools on this VM
 
-## Static web UI
+## Settings web UI
 
-The static editor from BlinkZer0/Palworld-Dedicated-Server-Config-Creator is installed at:
+The settings editor is served local-only on the VM by `palwarden-webui`:
 
-- /opt/palworld/tools/config-webui/PalWorldSettingsEditor.html
-
-It is served local-only on the VM:
-
-- http://127.0.0.1:8088/PalWorldSettingsEditor.html
+- http://127.0.0.1:8088/PalWorldSettingsEditor.html — the full settings editor,
+  wired live to this server (Load Live Config / Save to Server / Save, Apply &
+  Restart). A fork of BlinkZer0/Palworld-Dedicated-Server-Config-Creator (MIT;
+  see CREDITS.md) with the palwarden control plane integrated. Opened as a
+  local file instead, it behaves as the plain offline generate/copy editor —
+  the live controls only appear when served over HTTP.
 
 Use an SSH tunnel from your workstation:
 
@@ -23,7 +24,23 @@ Current config files are exposed read-only via the same local-only server:
 - http://127.0.0.1:8088/current/PalWorldSettings.ini
 - http://127.0.0.1:8088/current/PalWorldSettings.pretty.ini
 
-The web UI is client-side only. It can load, edit, and generate INI text in your browser, but it does not directly write back to the server.
+In live mode only *changed* settings are sent, and the fields the page can
+never save (passwords, the REST API keys, `CrossplayPlatforms`) are hidden. **Save to server** enqueues a `settings_save` job: `palwarden-jobd`
+validates every key and value against the live config's own shapes (the same
+resolver `palworld-config-parser` uses at apply time), refuses the password
+keys and the REST API keys (`RESTAPIEnabled`/`RESTAPIPort` are how palwarden
+itself manages the server; they stay driven by `ADMIN_PASSWORD` /
+`PALWORLD_REST_PORT` in `settings.env`), and merge-writes
+`/etc/palworld/settings-overrides.env`
+(`/var/lib/palworld/settings-overrides.env` in the container, on the
+`palwarden-state` volume so it survives a recreate). **Save, apply and restart**
+(`settings_save_apply_restart`) additionally runs
+`palworld-graceful-restart --apply-config`, which applies the file in the
+window where the server is fully stopped — applying while it runs is lost
+work, because the game rewrites its config from memory as it exits. The overrides file is applied *after*
+`settings.env` on every apply — including the container's boot-time apply — so a
+value saved in the browser wins over its `PALWORLD_CFG_*` variable and is
+re-asserted on every start.
 
 ## Parser CLI
 

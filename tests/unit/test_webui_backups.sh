@@ -676,13 +676,10 @@ assert_file_contains "$PAGE" "SPDX-License-Identifier: AGPL-3.0-or-later" \
 assert_file_contains "$PAGE" "SPDX-FileCopyrightText: 2026 Brian Grant" \
   "the Backups page carries our copyright"
 assert_file_contains "$PAGE" "CREDITS.md" "the Backups page notes its MIT derivation"
-# The vendored editor is MIT and byte-identical; it carries no palwarden nav at all
-# (it never had one), so it is deliberately NOT given the Backups tab. The two
-# first-party nav-bearing pages are.
-assert_rc 0 git -C "$REPO" diff --quiet -- webui/PalWorldSettingsEditor.html
-assert_file_not_contains "$REPO/webui/PalWorldSettingsEditor.html" "backups.html" \
-  "the vendored editor is untouched, nav included"
-for nav_page in "$PAGE" "$DASH" "$EDITOR"; do
+# Every nav-bearing page links to every tab. The settings editor is a fork of
+# the MIT upstream (see CREDITS.md) and carries the palwarden nav too — shown
+# only in live mode, but present in the file.
+for nav_page in "$PAGE" "$DASH" "$EDITOR" "$REPO/webui/PalWorldSettingsEditor.html"; do
   assert_file_contains "$nav_page" 'href="backups.html"' \
     "$(basename "$nav_page") links to the Backups tab"
   assert_file_contains "$nav_page" 'href="palwarden.html"' \
@@ -747,11 +744,11 @@ assert_file_not_contains "$PAGE" "WEBUI_PASSWORD" "no credential baked into the 
 #    valid name would fail the page's stale pattern and never reach the API that
 #    accepts it.
 structural="$(python3 - "$PAGE" "$DASH" "$EDITOR" "$REPO/sbin/palwarden-jobd" \
-  "$REPO/lib/palwarden_archive.py" <<'PY'
+  "$REPO/lib/palwarden_archive.py" "$REPO/webui/palwarden-ui.css" <<'PY'
 import re
 import sys
 
-page_path, dash_path, editor_path, jobd_path, archive_path = sys.argv[1:6]
+page_path, dash_path, editor_path, jobd_path, archive_path, shared_css_path = sys.argv[1:7]
 src = open(page_path, encoding="utf-8").read()
 bad = []
 
@@ -803,8 +800,11 @@ if not style:
 else:
     css = style.group(1)
     root = re.search(r":root\s*\{.*?\}", css, re.S)
-    if not root:
-        bad.append("no :root token block")
+    # The design tokens moved to the shared stylesheet; a page without its own
+    # :root must link palwarden-ui.css (whose token blocks test_webui_jobs.sh
+    # checks) and keep its own <style> colourless.
+    if not root and "palwarden-ui.css" not in src:
+        bad.append("no :root token block and no shared stylesheet")
     outside = css.replace(root.group(0), "") if root else css
     for pattern in COLOR_PATTERNS:
         for m in re.finditer(pattern, outside):
@@ -825,6 +825,9 @@ def classes(text):
 
 known = classes(open(dash_path, encoding="utf-8").read())
 known |= classes(open(editor_path, encoding="utf-8").read())
+# The shared component vocabulary (sidebar, sections, accents) is defined in
+# palwarden-ui.css; every class it styles is part of the sanctioned set.
+known |= set(re.findall(r"\.([A-Za-z][\w-]+)", open(shared_css_path, encoding="utf-8").read()))
 for cls in sorted(classes(src)):
     # A dynamic suffix ("pw-pill pw-pill--" + state) leaves a prefix token behind;
     # accept it only when it really is the prefix of a class the vocabulary has.

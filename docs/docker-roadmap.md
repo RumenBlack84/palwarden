@@ -29,8 +29,9 @@ lacks. Each of these is now resolved (see [Increments](#increments)):
   sampling) works over `127.0.0.1:8212` inside the container unchanged.
 - The **telemetry DB**, **config apply/snapshot/rollback**, and **Discord notify**
   are plain files + HTTP; they only need their directories mounted as volumes.
-- The **web UI** is static — serve it on `127.0.0.1:8088` (or an internal port)
-  the same way.
+- The **web UI** has since grown a control plane (`palwarden-webui` +
+  `palwarden-jobd`, including a live settings editor); it still serves on
+  `127.0.0.1:8088` the same way.
 
 ## Proposed shape
 

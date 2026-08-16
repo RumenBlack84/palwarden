@@ -1,0 +1,267 @@
+/* SPDX-License-Identifier: AGPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Brian Grant */
+/*
+ * palwarden shared UI: one palette and one navigation for every page.
+ *
+ * The design tokens are the settings editor's (the look the other pages adopt):
+ * purple-gradient backdrop, elevated cards, Segoe UI, light + dark themes via
+ * body[data-theme] with the theme kept in localStorage under 'theme'.
+ *
+ * The --pw-* variables are the component vocabulary the dashboard, Backups and
+ * Engine.ini pages were built on; they are ALIASED onto the editor tokens here,
+ * which is what re-skins those pages without rewriting their component CSS.
+ * Raw colors appear only in the token blocks below (:root and the theme
+ * override) — everywhere else, including page styles, uses variables; the
+ * structural test enforces this.
+ */
+
+:root {
+  color-scheme: light;
+  /* Light theme (the settings editor's) */
+  --bg-primary: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  --bg-secondary: white;
+  --bg-tertiary: #f7fafc;
+  --text-primary: #2d3748;
+  --text-secondary: #4a5568;
+  --text-muted: #718096;
+  --border-color: #e2e8f0;
+  --shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
+  --header-gradient: linear-gradient(135deg, #5a67d8 0%, #6b46c1 100%);
+  --input-bg: white;
+  --input-border: #e2e8f0;
+  --input-focus: #5a67d8;
+  --section-bg: white;
+  --section-border: #e2e8f0;
+  --tooltip-bg: #2d3748;
+  --tooltip-text: white;
+  /* Status colors (light-legible) */
+  --status-ok: #2f855a;
+  --status-warn: #b7791f;
+  --status-bad: #c53030;
+  --status-idle: #718096;
+  --scrim: rgba(0, 0, 0, 0.6);
+  --elevation: rgba(0, 0, 0, 0.25);
+  /* Section accent stripes — the editor's own set, identical in both themes */
+  --accent-indigo: #5a67d8;
+  --accent-green: #48bb78;
+  --accent-orange: #ed8936;
+  --accent-purple: #9f7aea;
+  --accent-blue: #4299e1;
+  --accent-gold: #d69e2e;
+  --accent-red: #e53e3e;
+  --accent-teal: #38b2ac;
+}
+
+[data-theme="dark"] {
+  color-scheme: dark;
+  --bg-primary: linear-gradient(135deg, #1a202c 0%, #2d3748 100%);
+  --bg-secondary: #1a202c;
+  --bg-tertiary: #2d3748;
+  --text-primary: #f7fafc;
+  --text-secondary: #e2e8f0;
+  --text-muted: #a0aec0;
+  --border-color: #4a5568;
+  --shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+  --header-gradient: linear-gradient(135deg, #2d3748 0%, #4a5568 100%);
+  --input-bg: #2d3748;
+  --input-border: #4a5568;
+  --input-focus: #63b3ed;
+  --section-bg: #180d0d;
+  --section-border: #4a5568;
+  --tooltip-bg: #1a202c;
+  --tooltip-text: #f7fafc;
+  --status-ok: #7ddc86;
+  --status-warn: #f0c674;
+  --status-bad: #f28b82;
+  --status-idle: #8b93a1;
+  --scrim: rgba(0, 0, 0, 0.6);
+  --elevation: rgba(0, 0, 0, 0.45);
+}
+
+/* The component vocabulary the first-party pages are built on, re-pointed at
+   the editor palette. Pages must not define these themselves any more. */
+:root, [data-theme="dark"] {
+  /* NOT the gradient: --pw-bg was historically both the page backdrop and the
+     control/button background, and a gradient inside an <input> reads as
+     broken. Controls get the flat input surface; the gradient backdrop is
+     applied to body.pw-with-sidebar below. */
+  --pw-bg: var(--input-bg);
+  --pw-surface: var(--bg-secondary);
+  --pw-surface-2: var(--bg-tertiary);
+  --pw-border: var(--border-color);
+  --pw-fg: var(--text-primary);
+  --pw-fg-muted: var(--text-muted);
+  --pw-ok: var(--status-ok);
+  --pw-warn: var(--status-warn);
+  --pw-bad: var(--status-bad);
+  --pw-idle: var(--status-idle);
+  --pw-accent: var(--input-focus);
+  --pw-scrim: var(--scrim);
+  --pw-shadow: var(--elevation);
+  --pw-space-1: 4px; --pw-space-2: 8px; --pw-space-3: 16px; --pw-space-4: 24px;
+  --pw-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  --pw-sans: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+  --pw-sidebar-w: 252px;
+  --pw-sidebar-w-collapsed: 64px;
+}
+
+/* --- collapsible sidebar navigation ---------------------------------------
+   Markup is static in every page (nav works without JS); palwarden-ui.js only
+   adds collapse/expand and the theme toggle. Collapsed, it shows icons only. */
+.pw-sidebar {
+  position: fixed;
+  top: 0; left: 0; bottom: 0;
+  width: var(--pw-sidebar-w);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 14px 10px;
+  background: var(--bg-secondary);
+  border-right: 1px solid var(--border-color);
+  box-shadow: 2px 0 12px var(--elevation);
+  z-index: 50;
+  overflow: hidden;
+  transition: width 0.2s ease, background 0.3s ease;
+}
+body.pw-sidebar-collapsed .pw-sidebar { width: var(--pw-sidebar-w-collapsed); }
+
+.pw-sidebar__brand {
+  font-family: var(--pw-mono);
+  font-size: 1.05rem;
+  letter-spacing: 0.08em;
+  color: var(--text-primary);
+  padding: 6px 12px 16px;
+  white-space: nowrap;
+}
+
+.pw-sidebar__item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: none;
+  background: none;
+  font: inherit;
+  font-size: 0.92rem;
+  color: var(--text-secondary);
+  text-decoration: none;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.pw-sidebar__item:hover { background: var(--bg-tertiary); color: var(--text-primary); }
+.pw-sidebar__item[aria-current="page"] { background: var(--header-gradient); color: white; }
+.pw-sidebar__item svg { width: 20px; height: 20px; flex: none; }
+.pw-sidebar__item .pw-sidebar__emoji { width: 20px; flex: none; text-align: center; }
+body.pw-sidebar-collapsed .pw-sidebar__label { display: none; }
+.pw-sidebar__spacer { flex: 1; }
+/* The collapse chevron points back toward the content when collapsed. */
+#pw-sidebar-toggle svg { transition: transform 0.2s ease; }
+body.pw-sidebar-collapsed #pw-sidebar-toggle svg { transform: rotate(180deg); }
+
+/* Content sits to the right of the sidebar. Class-qualified so it beats each
+   page's own `body { padding }` and `body { background }` on specificity,
+   whatever the order. The gradient backdrop is the editor's signature. */
+body.pw-with-sidebar {
+  padding-left: calc(var(--pw-sidebar-w) + 20px);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: var(--pw-sans);
+  transition: background 0.3s ease, color 0.3s ease;
+}
+body.pw-with-sidebar.pw-sidebar-collapsed { padding-left: calc(var(--pw-sidebar-w-collapsed) + 20px); }
+
+/* --- shared page furniture in the editor's style -------------------------- */
+.pw-page-header {
+  background: var(--header-gradient);
+  color: white;
+  border-radius: 12px 12px 0 0;
+  padding: 24px 30px;
+}
+.pw-page-header h1 { margin: 0; font-size: 1.9em; color: white; }
+.pw-page-header p { margin: 6px 0 0; opacity: 0.9; }
+
+/* --- collapsible sections, in the settings editor's style --------------------
+   A native <details>/<summary> replica of the editor's .section/.section-header:
+   title bar on the tertiary surface with an icon, a colored accent stripe down
+   the left edge, and a ▼ that rotates when collapsed. Native disclosure gives
+   keyboard and screen-reader behavior for free. */
+.pw-section {
+  border: 1px solid var(--border-color);
+  border-left: 4px solid var(--accent-indigo);
+  border-radius: 8px;
+  background: var(--section-bg);
+  overflow: hidden;
+  margin-bottom: 20px;
+  transition: border-color 0.3s ease, background 0.3s ease;
+}
+.pw-grid > .pw-section { margin-bottom: 0; } /* the grid's gap already spaces them */
+/* Grid items stretch to the row's tallest sibling by default, so a collapsed
+   section would keep its full height as an empty box. Open sections keep the
+   equal-height rows; a collapsed one shrinks to its title bar. */
+.pw-grid > .pw-section:not([open]) { align-self: start; }
+.pw-section > .pw-section__header {
+  background: var(--bg-tertiary);
+  padding: 13px 18px;
+  font-size: 1.05em;
+  font-weight: 600;
+  color: var(--text-primary);
+  cursor: pointer;
+  user-select: none;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  border-bottom: 1px solid var(--border-color);
+  list-style: none;
+  transition: background 0.3s ease;
+}
+.pw-section__header::-webkit-details-marker { display: none; }
+.pw-section__header:hover { background: var(--border-color); }
+.pw-section__header::after {
+  content: '▼';
+  margin-left: auto;
+  font-size: 0.75em;
+  transition: transform 0.3s ease;
+}
+.pw-section:not([open]) > .pw-section__header::after { transform: rotate(-90deg); }
+.pw-section:not([open]) > .pw-section__header { border-bottom: none; }
+.pw-section__header h2 {
+  margin: 0;
+  font: inherit;
+  color: inherit;
+  letter-spacing: normal;
+  text-transform: none;
+}
+.pw-section__header svg { width: 22px; height: 22px; flex: none; }
+.pw-section__content { padding: 18px; }
+.pw-section__content > p { color: var(--text-muted); }
+.pw-section__content > p:first-child { margin-top: 0; }
+/* Accent stripes */
+.pw-section--indigo { border-left-color: var(--accent-indigo); }
+.pw-section--green  { border-left-color: var(--accent-green); }
+.pw-section--orange { border-left-color: var(--accent-orange); }
+.pw-section--purple { border-left-color: var(--accent-purple); }
+.pw-section--blue   { border-left-color: var(--accent-blue); }
+.pw-section--gold   { border-left-color: var(--accent-gold); }
+.pw-section--red    { border-left-color: var(--accent-red); }
+.pw-section--teal   { border-left-color: var(--accent-teal); }
+
+/* Page titles and their lede paragraphs sit directly on the gradient backdrop
+   (the cards start below them): white, like the editor's gradient header —
+   the default text color is unreadable on the light theme's purple. */
+body.pw-with-sidebar .pw-page > h1 { color: white; }
+body.pw-with-sidebar .pw-page > h1 + p { color: white; opacity: 0.92; }
+
+:focus-visible { outline: 2px solid var(--input-focus); outline-offset: 2px; }
+
+@media (max-width: 900px) {
+  /* Small screens start collapsed; the toggle still works. */
+  body.pw-with-sidebar { padding-left: calc(var(--pw-sidebar-w-collapsed) + 12px); }
+  body.pw-with-sidebar .pw-sidebar { width: var(--pw-sidebar-w-collapsed); }
+  body.pw-with-sidebar .pw-sidebar__label { display: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .pw-sidebar, .pw-sidebar__item, #pw-sidebar-toggle svg { transition: none !important; }
+}

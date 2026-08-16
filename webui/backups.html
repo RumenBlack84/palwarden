@@ -10,44 +10,18 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>palwarden — Backups</title>
-  <style>
+  <link rel="stylesheet" href="palwarden-ui.css">
+<script src="palwarden-ui.js" defer></script>
+<style>
     /* Design tokens — the only place raw colors appear. Shared vocabulary with
        webui/palwarden.html and the Engine.ini editor; see the design spec,
        "Component vocabulary". No component class is invented here. */
-    :root {
-      color-scheme: dark;
-      --pw-bg: #14161a; --pw-surface: #1c1f25; --pw-border: #2b2f37;
-      --pw-fg: #e6e6e6; --pw-fg-muted: #9aa4b2;
-      --pw-ok: #7ddc86; --pw-warn: #f0c674; --pw-bad: #f28b82; --pw-idle: #8b93a1;
-      --pw-accent: #8ab4f8;
-      /* Translucent blacks. Two tokens, not one: --pw-scrim dims the viewport
-         behind a modal and --pw-shadow is an elevation shadow's colour. */
-      --pw-scrim: rgba(0, 0, 0, .6); --pw-shadow: rgba(0, 0, 0, .45);
-      --pw-space-1: 4px; --pw-space-2: 8px; --pw-space-3: 16px; --pw-space-4: 24px;
-      --pw-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
-      --pw-sans: system-ui, -apple-system, "Segoe UI", sans-serif;
-    }
     * { box-sizing: border-box; }
     body { font: 14px/1.5 var(--pw-sans); margin: 0;
            background: var(--pw-bg); color: var(--pw-fg); }
     a { color: var(--pw-accent); }
     :focus-visible { outline: 2px solid var(--pw-accent); outline-offset: 2px; }
 
-    /* pw-nav: slim header bar with the wordmark and a segmented tab control. */
-    .pw-nav { display: flex; align-items: center; justify-content: space-between;
-              gap: var(--pw-space-3); padding: var(--pw-space-2) var(--pw-space-4);
-              border-bottom: 1px solid var(--pw-border); background: var(--pw-surface);
-              flex-wrap: wrap; }
-    .pw-nav__wordmark { font-family: var(--pw-mono); font-size: 1.1rem;
-                         letter-spacing: .08em; color: var(--pw-fg); }
-    .pw-nav__tabs { display: flex; gap: 2px; background: var(--pw-bg);
-                    border: 1px solid var(--pw-border); border-radius: 8px; padding: 2px; }
-    .pw-tab { font-family: var(--pw-sans); font-size: .82rem; color: var(--pw-fg-muted);
-              text-decoration: none; padding: var(--pw-space-1) var(--pw-space-3);
-              border-radius: 6px; }
-    .pw-tab:hover { color: var(--pw-fg); }
-    .pw-tab[aria-current="page"] { background: var(--pw-surface); color: var(--pw-fg);
-                                    border: 1px solid var(--pw-border); }
 
     .pw-page { padding: var(--pw-space-4); }
     .pw-page > h1 { font-family: var(--pw-mono); font-size: 1.8rem; font-weight: 600;
@@ -59,13 +33,8 @@
        single full-width stack, each one a table-ish list that reads badly in a
        narrow column — so the grid rules (.pw-grid, .pw-card--wide and .pw-card's
        column span) are deliberately absent rather than defined-and-inert. */
-    .pw-card { background: var(--pw-surface); border: 1px solid var(--pw-border);
-               border-radius: 6px; padding: var(--pw-space-3);
-               margin-bottom: var(--pw-space-3); }
-    .pw-card > h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .1em;
-                    color: var(--pw-fg-muted); margin: 0 0 var(--pw-space-2);
-                    font-family: var(--pw-sans); }
-    .pw-card > p { color: var(--pw-fg-muted); margin: 0 0 var(--pw-space-2); }
+    /* Card visuals come from the shared .pw-section component (the editor's
+       collapsible boxes). */
     .pw-card code, .pw-card pre { font-family: var(--pw-mono); }
     .pw-card pre { margin: 0; overflow: auto; }
 
@@ -148,15 +117,16 @@
     }
   </style>
 </head>
-<body>
-<nav class="pw-nav">
-  <span class="pw-nav__wordmark">palwarden</span>
-  <div class="pw-nav__tabs">
-    <a class="pw-tab" href="palwarden.html">Dashboard</a>
-    <a class="pw-tab" href="PalWorldSettingsEditor.html">Server settings</a>
-    <a class="pw-tab" href="EngineIniPerformanceEditor.html">Engine.ini performance</a>
-    <a class="pw-tab" href="backups.html" aria-current="page">Backups</a>
-  </div>
+<body class="pw-with-sidebar" data-theme="dark">
+<nav class="pw-sidebar" aria-label="palwarden">
+  <div class="pw-sidebar__brand"><span class="pw-sidebar__label">palwarden</span></div>
+  <a class="pw-sidebar__item" href="palwarden.html" title="Dashboard"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 14a8 8 0 1 1 16 0"/><path d="M12 14l4-4"/><path d="M6 20h12"/></svg><span class="pw-sidebar__label">Dashboard</span></a>
+  <a class="pw-sidebar__item" href="PalWorldSettingsEditor.html" title="Server settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="4" y1="7" x2="12" y2="7"/><line x1="18" y1="7" x2="20" y2="7"/><circle cx="15" cy="7" r="2"/><line x1="4" y1="12" x2="6" y2="12"/><line x1="12" y1="12" x2="20" y2="12"/><circle cx="9" cy="12" r="2"/><line x1="4" y1="17" x2="13" y2="17"/><line x1="19" y1="17" x2="20" y2="17"/><circle cx="16" cy="17" r="2"/></svg><span class="pw-sidebar__label">Server settings</span></a>
+  <a class="pw-sidebar__item" href="EngineIniPerformanceEditor.html" title="Engine.ini performance"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 2 4.5 13.5H11L9.5 22 18 10.5h-6.5L13 2z"/></svg><span class="pw-sidebar__label">Engine.ini performance</span></a>
+  <a class="pw-sidebar__item" href="backups.html" aria-current="page" title="Backups"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="5" rx="1"/><path d="M5 9v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V9"/><path d="M10 13h4"/></svg><span class="pw-sidebar__label">Backups</span></a>
+  <div class="pw-sidebar__spacer"></div>
+  <button class="pw-sidebar__item" id="pw-theme-toggle" type="button" title="Toggle light/dark theme"><span class="pw-sidebar__emoji">☀️</span><span class="pw-sidebar__label">Theme</span></button>
+  <button class="pw-sidebar__item" id="pw-sidebar-toggle" type="button" title="Collapse sidebar" aria-expanded="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg><span class="pw-sidebar__label">Collapse</span></button>
 </nav>
 <div class="pw-page">
   <h1>Backups</h1>
@@ -164,8 +134,9 @@
      <code>palworld-backups</code>. Everything on this page runs as a job through the
      palwarden control plane; nothing is done in the browser.</p>
 
-  <section class="pw-card">
-    <h2>Archives</h2>
+  <details class="pw-card pw-section pw-section--indigo" open>
+    <summary class="pw-section__header"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="5" rx="1"/><path d="M5 9v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V9"/><path d="M10 13h4"/></svg><h2>Archives</h2></summary>
+    <div class="pw-section__content">
     <p><strong>Download</strong> streams the archive to this browser and changes nothing.
        <strong>Restore</strong> stops the server and replaces the live world.
        <strong>Delete</strong> is the one action here with no undo, so it asks twice.</p>
@@ -174,10 +145,12 @@
       <button type="button" class="pw-btn" id="btn-backup">Create backup</button>
     </div>
     <div id="archives"></div>
-  </section>
+  </div>
+</details>
 
-  <section class="pw-card">
-    <h2>Import an archive</h2>
+  <details class="pw-card pw-section pw-section--green" open>
+    <summary class="pw-section__header"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 16V4"/><path d="M6 10l6-6 6 6"/><path d="M4 20h16"/></svg><h2>Import an archive</h2></summary>
+    <div class="pw-section__content">
     <p>Two steps on purpose: the file is first streamed to a staging area, then a
        separate job promotes it into the backups directory. Only names this project
        wrote are accepted — <code>palworld-save-&lt;UTC stamp&gt;.tar.gz</code>.
@@ -189,10 +162,12 @@
       <button type="button" class="pw-btn" id="btn-upload" disabled>Upload and import</button>
     </div>
     <p class="pw-empty" id="import-msg" aria-live="polite">No file selected.</p>
-  </section>
+  </div>
+</details>
 
-  <section class="pw-card">
-    <h2>Scheduled backups</h2>
+  <details class="pw-card pw-section pw-section--orange" open>
+    <summary class="pw-section__header"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg><h2>Scheduled backups</h2></summary>
+    <div class="pw-section__content">
     <p>Read from the schedule file by <code>palworld-backups --if-due</code> on every
        tick. Saving rewrites all four values together — a partial save is refused by
        the worker on purpose, so a field left out cannot silently revert to a default.
@@ -230,12 +205,15 @@
     </div>
     <!-- The worker's refusal is shown here verbatim, via textContent. -->
     <p class="pw-empty" id="schedule-msg" aria-live="polite">Loading the schedule…</p>
-  </section>
+  </div>
+</details>
 
-  <section class="pw-card">
-    <h2>Job progress</h2>
+  <details class="pw-card pw-section pw-section--blue" open>
+    <summary class="pw-section__header"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="9" y1="6" x2="20" y2="6"/><line x1="9" y1="12" x2="20" y2="12"/><line x1="9" y1="18" x2="20" y2="18"/><circle cx="5" cy="6" r="1"/><circle cx="5" cy="12" r="1"/><circle cx="5" cy="18" r="1"/></svg><h2>Job progress</h2></summary>
+    <div class="pw-section__content">
     <pre class="pw-log pw-empty" id="joblog" aria-live="polite">No job started from this page yet.</pre>
-  </section>
+  </div>
+</details>
 </div>
 
 <!-- Three dialogs, one per decision, rather than one element reused: the two

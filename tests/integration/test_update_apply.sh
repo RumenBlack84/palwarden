@@ -40,7 +40,9 @@ cp "$REPO/tests/fixtures/fake-steamcmd" "$WORK/fake-steamcmd"; chmod +x "$WORK/f
 chmod -R a+rwX "$WORK/server"
 
 echo "  building $IMG ..."
-docker build -q -f "$REPO/docker/Dockerfile" -t "$IMG" "$REPO" >/dev/null 2>&1 || { fail "build failed"; assert_report; exit 1; }
+# See test_docker.sh on PALWARDEN_DOCKER_BUILD_OPTS (word-split on purpose).
+read -ra BUILD_OPTS <<< "${PALWARDEN_DOCKER_BUILD_OPTS:-}"
+docker build "${BUILD_OPTS[@]}" -q -f "$REPO/docker/Dockerfile" -t "$IMG" "$REPO" >/dev/null 2>&1 || { fail "build failed"; assert_report; exit 1; }
 
 docker rm -f "$C" >/dev/null 2>&1 || true
 docker run -d --name "$C" \

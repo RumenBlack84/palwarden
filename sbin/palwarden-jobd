@@ -55,6 +55,25 @@ SAVE_BACKUP_DIR = Path(os.environ.get("PALWARDEN_SAVE_BACKUP_DIR", "/opt/palworl
 # palworld-backups' tick. Same variable that tool uses, so one override moves the
 # writer and the reader together.
 SCHEDULE_ENV = Path(os.environ.get("PALWORLD_BACKUP_SCHEDULE", "/etc/palworld/backup.env"))
+# UI-saved PalWorldSettings values, written by settings_save and applied *after*
+# settings.env by palworld-config-apply-env — same variable that script reads, so
+# one override moves the writer and the reader together. Like the backup schedule,
+# the compose file points this at the palwarden-state volume; the bare-metal
+# default under /etc/palworld is genuinely persistent on a real host.
+SETTINGS_OVERRIDES = Path(os.environ.get(
+    "PALWORLD_SETTINGS_OVERRIDES", "/etc/palworld/settings-overrides.env"))
+# The live game config: settings_save validates every requested key and value
+# against the shapes *actually in this file* (the same schema config_apply will
+# use), so a value that would be silently dropped at apply time is refused at
+# the form instead. Same variable palwarden-webui and the apply script read.
+CONFIG_FILE = Path(os.environ.get(
+    "PALWORLD_CONFIG_FILE",
+    "/opt/palworld/server/Pal/Saved/Config/LinuxServer/PalWorldSettings.ini"))
+# Same variable (and the same reasoning) as palwarden-webui's PARSER_BIN: the
+# module we load for its key resolver / value renderer is a Python script, not
+# one of the stub *commands* PALWARDEN_SBIN_DIR points tests at.
+PARSER_BIN = Path(os.environ.get(
+    "PALWARDEN_PARSER_BIN", "/usr/local/bin/palworld-config-parser"))
 # Deliberately NOT derived from SBIN: SBIN is where *invoked commands* live
 # (tests point it at stub binaries), but the module we load here for its
 # setting definitions is palwarden-jobd's own neighbour — same directory in
@@ -164,6 +183,26 @@ def load_engine_config_module():
 _engine = load_engine_config_module()
 SETTING_BY_ENV = _engine.SETTING_BY_ENV
 normalize_value = _engine.normalize_value
+
+
+def load_parser_module():
+    """Load palworld-config-parser for its resolver/renderer, not a copy of them.
+
+    settings_save must agree exactly with what config_apply will later do —
+    which env name finds which INI key, what value shape each key accepts, how
+    an env file reads back — and the only way two moments in time agree exactly
+    is to run the same code at both. Same pattern as load_engine_config_module
+    above and palwarden-webui's load_parser_module.
+    """
+    loader = importlib.machinery.SourceFileLoader("palwarden_cfg_parser_for_jobd", str(PARSER_BIN))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = module
+    loader.exec_module(module)
+    return module
+
+
+_parser = load_parser_module()
 
 
 # --- parameter validators ---------------------------------------------------
@@ -333,6 +372,86 @@ def validate_settings(params: dict) -> dict[str, str]:
         if isinstance(value, bool) or not isinstance(value, (str, int, float)):
             raise ValueError(f"{key} value must be a string or number, got {value!r}")
         normalised[key] = normalize_value(setting, str(value))
+    return normalised
+
+
+# PalWorldSettings has ~119 keys; the whole form is well under this. The cap is
+# a body-size backstop like the API's 64 KiB limit, not a schema.
+GAME_SETTINGS_MAX = 200
+GAME_KEY_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}")
+# Keys the web UI must never write, normalised: the REST API is the control
+# plane's own lifeline — graceful save-on-stop, telemetry, health, the update
+# flow all ride on it. A settings_save of RESTAPIEnabled=False would land in
+# the overrides file, which is applied *after* settings.env on every boot, so
+# one browser click would force the API off permanently and cut off the very
+# tooling the operator would use to recover. These stay managed through
+# settings.env (ADMIN_PASSWORD implies REST on; PALWORLD_REST_PORT sets the
+# port), exactly like the password keys in _parser.SECRET_KEYS.
+REST_LIFELINE_KEYS = frozenset({"restapienabled", "restapiport"})
+
+
+def validate_game_settings(params: dict) -> dict[str, str]:
+    """Validate PalWorldSettings values against the live config's own shape.
+
+    Unlike validate_settings (engine), there is no hardcoded table of the game's
+    ~119 keys to rot: the live PalWorldSettings.ini *is* the schema, exactly as
+    it is for palworld-config-parser at apply time — and it is that parser's own
+    resolver and renderer doing the checking here, so "refused at the form" and
+    "would have been dropped at apply" can never disagree. Returns
+    {canonical INI key: raw value string} ready for the overrides env file.
+
+    The two password keys are refused outright: they are managed through
+    settings.env (rendered from ADMIN_PASSWORD at container start), the UI
+    redacts them on read, and the overrides file is deliberately 0644 tuning,
+    not a secret store. The REST API keys are refused too — see
+    REST_LIFELINE_KEYS on why a browser must not be able to cut the control
+    plane's own management path.
+    """
+    raw = params.get("settings")
+    if not isinstance(raw, dict) or not raw:
+        raise ValueError("settings must be a non-empty object")
+    if len(raw) > GAME_SETTINGS_MAX:
+        raise ValueError(f"settings carries {len(raw)} keys; refusing more than {GAME_SETTINGS_MAX}")
+    try:
+        text = CONFIG_FILE.read_text(errors="ignore")
+    except OSError as exc:
+        raise ValueError(
+            f"cannot read {CONFIG_FILE} to validate against ({exc.strerror}); "
+            "the apply would fail the same way") from None
+    match = re.search(r"^OptionSettings=\((.*)\)[ \t]*$", text, re.MULTILINE)
+    if match is None:
+        raise ValueError(f"no OptionSettings=(...) line in {CONFIG_FILE}")
+    parts = _parser.split_settings(match.group(1))
+    keys, by_norm = _parser.index_keys(parts)
+    normalised: dict[str, str] = {}
+    for key, value in raw.items():
+        if not isinstance(key, str) or not GAME_KEY_RE.fullmatch(key):
+            raise ValueError(f"setting names must match {GAME_KEY_RE.pattern!r}, got {key!r}")
+        # A JSON UI naturally posts numbers as numbers; bool is an int subclass,
+        # rejected explicitly rather than stored as "True"/"1" by accident.
+        if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+            raise ValueError(f"{key} value must be a string or number, got {value!r}")
+        value = str(value)
+        if len(value) > 256 or not (value == "" or value.isprintable()):
+            raise ValueError(f"{key} value must be <=256 printable characters")
+        ini_key = _parser.EXCEPTIONS.get(key) or by_norm.get(_parser.normalise(key))
+        if ini_key is None or ini_key not in keys:
+            raise ValueError(f"no matching Palworld setting for {key!r} in the live config")
+        if _parser.normalise(ini_key) in _parser.SECRET_KEYS:
+            raise ValueError(f"{ini_key} is managed via settings.env, not the web UI")
+        if _parser.normalise(ini_key) in REST_LIFELINE_KEYS:
+            raise ValueError(
+                f"{ini_key} is the control plane's own management path and cannot be "
+                "changed from the web UI (it would cut off telemetry, graceful "
+                "save-on-stop and updates); it is managed via settings.env "
+                "(ADMIN_PASSWORD / PALWORLD_REST_PORT)")
+        if ini_key in normalised:
+            raise ValueError(f"{key!r} resolves to {ini_key}, which the request already sets")
+        _, _, old_raw = parts[keys[ini_key]].partition("=")
+        _, error = _parser.render_value(ini_key, old_raw, value)
+        if error is not None:
+            raise ValueError(error)
+        normalised[ini_key] = value
     return normalised
 
 
@@ -514,6 +633,64 @@ def write_engine_env(settings: dict[str, str]) -> None:
     for key, value in merged.items():
         if reparsed.get(key) != value:
             raise ValueError(f"engine.env write did not round-trip for {key}")
+
+
+def write_settings_overrides(settings: dict[str, str]) -> None:
+    """Atomically merge already-validated game settings into SETTINGS_OVERRIDES.
+
+    The same contract as write_engine_env, for the same reasons: a *merge*
+    (dropping a key the request happened not to include would silently unmanage
+    it — the next config_apply would stop asserting it and an env-driven or
+    game-rewritten value would win), never destructive on failure, and verified
+    by re-reading what landed through the *consumer's own reader* —
+    palworld-config-parser's read_env_file, the exact function config_apply
+    will feed this file to.
+
+    Values are always written quoted (read_env_file unquotes and unescapes with
+    the mirror of _parser.escape), so a value containing spaces, `#` or quotes
+    round-trips byte-for-byte instead of depending on env-file lexing luck.
+    """
+    SETTINGS_OVERRIDES.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+    merged: dict[str, str] = {}
+    existing = _read_nofollow_text(SETTINGS_OVERRIDES)
+    if existing is not None:
+        merged.update(_parser.read_env_file(_AlreadyRead(existing)))
+    merged.update(settings)
+    lines = [
+        "# Generated by palwarden-jobd (settings_save). Do not edit by hand;",
+        "# use the PalWorld settings editor instead. Applied after settings.env",
+        "# by palworld-config-apply-env, so these values win over PALWORLD_CFG_*.",
+        f"# Written: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}",
+        "",
+    ]
+    for key, value in sorted(merged.items()):
+        lines.append(f'{key}="{_parser.escape(value)}"')
+    text = "\n".join(lines) + "\n"
+
+    # Same shape as write_engine_env's temp write, and for the same reasons:
+    # unguessable name, O_CREAT|O_EXCL|O_NOFOLLOW, fchmod on the descriptor.
+    # 0644 on purpose — validate_game_settings refuses the password keys, so
+    # this file is tuning, never a secret store.
+    tmp = SETTINGS_OVERRIDES.with_name(
+        f"{SETTINGS_OVERRIDES.name}.tmp.{os.getpid()}.{secrets.token_hex(4)}")
+    fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o644)
+    try:
+        os.fchmod(fd, 0o644)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+        tmp.replace(SETTINGS_OVERRIDES)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+    # Round-trip through an O_NOFOLLOW descriptor, exactly like write_engine_env.
+    verify_fd = os.open(SETTINGS_OVERRIDES, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(verify_fd, "r") as fh:  # fdopen takes ownership of the fd
+        written = fh.read()
+    reparsed = _parser.read_env_file(_AlreadyRead(written))
+    for key, value in merged.items():
+        if reparsed.get(key) != value:
+            raise ValueError(f"settings overrides write did not round-trip for {key}")
 
 
 def _parse_schedule_text(text: str) -> dict[str, str]:
@@ -725,15 +902,30 @@ def _argv_api_save(_params: dict) -> list[list[str]]:
 
 def _argv_engine_save_apply_restart(params: dict) -> list[list[str]]:
     # engine_save itself writes no command (build_commands handles it before
-    # calling here); this only builds the apply + restart steps that follow.
+    # calling here); this only builds the restart that follows. The apply runs
+    # *inside* the restart (--apply-engine), after the server has fully
+    # stopped: the game rewrites its config files from memory as it exits, so
+    # an apply issued while it still runs is silently clobbered mid-shutdown.
     wait = validate_wait(params)
-    restart = [str(SBIN / "palworld-graceful-restart")]
+    restart = [str(SBIN / "palworld-graceful-restart"), "--apply-engine"]
     if wait is not None:
         restart += ["--wait", str(wait)]
-    return [
-        [str(SBIN / "palworld-engine-config"), "apply"],
-        restart,
-    ]
+    return [restart]
+
+
+def _argv_settings_save_apply_restart(params: dict) -> list[list[str]]:
+    # settings_save itself writes no command (build_commands handles the file
+    # write before calling here); this builds the restart that follows. The
+    # apply runs *inside* the restart (--apply-config), after the server has
+    # fully stopped — the game rewrites its config from memory as it exits, so
+    # an apply issued while it still runs is silently clobbered mid-shutdown
+    # (observed on v1.0.3). The apply script applies settings.env first and the
+    # overrides file just written second, so the operator's values win.
+    wait = validate_wait(params)
+    restart = [str(SBIN / "palworld-graceful-restart"), "--apply-config"]
+    if wait is not None:
+        restart += ["--wait", str(wait)]
+    return [restart]
 
 
 def _argv_backup_import(params: dict) -> list[list[str]]:
@@ -770,6 +962,11 @@ ACTIONS: dict[str, dict] = {
     "backup": {"argv": _argv_backup, "disruptive": False, "params": ()},
     "mark": {"argv": _argv_mark, "disruptive": False, "params": ("text",)},
     "engine_save": {"argv": None, "disruptive": False, "params": ("settings",)},
+    # The PalWorldSettings twins of engine_save / engine_save_apply_restart:
+    # same file-write-first shape, different validator and different env file.
+    "settings_save": {"argv": None, "disruptive": False, "params": ("settings",)},
+    "settings_save_apply_restart": {"argv": _argv_settings_save_apply_restart,
+                                    "disruptive": True, "params": ("settings", "wait")},
     "graceful_restart": {"argv": _argv_graceful_restart, "disruptive": True,
                          "params": ("wait", "message")},
     "graceful_stop": {"argv": _argv_graceful_stop, "disruptive": True,
@@ -845,12 +1042,16 @@ def validate_params(action: str, params: dict) -> tuple[dict | None, str | None]
             normalised["confirm"] = True  # already proven to be exactly True
         if action in ("engine_save", "engine_save_apply_restart"):
             normalised["settings"] = validate_settings(params)
-        # A different table and a different file, so deliberately not the branch
+        # A different schema and a different file, so deliberately not the branch
         # above: `settings` names the payload slot, not one schema.
+        if action in ("settings_save", "settings_save_apply_restart"):
+            normalised["settings"] = validate_game_settings(params)
+        # Same slot again, third schema (the four BACKUP_* keys).
         if action == "backup_schedule_save":
             normalised["settings"] = validate_schedule(params)
         if action in ("graceful_restart", "graceful_stop", "update_apply",
-                      "engine_save_apply_restart", "backup_restore"):
+                      "engine_save_apply_restart", "settings_save_apply_restart",
+                      "backup_restore"):
             normalised["wait"] = validate_wait(params)
         if action in ("graceful_restart", "graceful_stop"):
             normalised["message"] = validate_message(params)
@@ -996,6 +1197,17 @@ def run_job(job: dict) -> int:
             jobs.update_job(job_id, state="failed", exit_code=1, finished_at=int(time.time()))
             return 1
         jobs.append_output(job_id, "wrote engine.env\n")
+
+    # The PalWorldSettings twin of the branch above: write the overrides file
+    # first so a bad write fails the job before any apply/restart runs.
+    if action in ("settings_save", "settings_save_apply_restart"):
+        try:
+            write_settings_overrides(params["settings"])
+        except (OSError, ValueError) as exc:
+            jobs.append_output(job_id, f"settings_save failed: {exc}\n")
+            jobs.update_job(job_id, state="failed", exit_code=1, finished_at=int(time.time()))
+            return 1
+        jobs.append_output(job_id, f"wrote {SETTINGS_OVERRIDES.name}\n")
 
     # The other file-only action. Separate branch, not an extra name in the tuple
     # above: it writes a different file through a different writer, and the two share

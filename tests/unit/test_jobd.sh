@@ -43,12 +43,23 @@ stub_tools
 
 # ENGINE_ENV/BACKUP_DIR/LOCK all live under $WORK: the worker now takes its
 # flock in every mode, so the default /run path would fail for a non-root test.
+# The live config settings_save validates against; a real full-shaped file so
+# key resolution and value rendering behave exactly as they will in production.
+cp "$DIR/../fixtures/PalWorldSettings.full.ini" "$WORK/PalWorldSettings.ini"
+# Exported (not set per-call in jobd() alone) because jobd module-loads the
+# parser at import time, and several checks below import jobd from inline
+# python of their own — every one of them needs the dev-checkout path.
+export PALWARDEN_PARSER_BIN="$DIR/../../bin/palworld-config-parser"
+
 jobd() {
   PALWARDEN_JOBS_DIR="$WORK/jobs" PYTHONPATH="$LIB" \
   PALWARDEN_SBIN_DIR="$WORK/bin" PALWORLD_ENGINE_ENV="${ENGINE_ENV_OVERRIDE:-$WORK/etc/engine.env}" \
   PALWORLD_BACKUP_DIR="$WORK/backups" PALWARDEN_JOBD_LOCK="$WORK/jobd.lock" \
   PALWARDEN_UPLOAD_DIR="$WORK/uploads" PALWARDEN_SAVE_BACKUP_DIR="$WORK/savebackups" \
   PALWORLD_BACKUP_SCHEDULE="${SCHEDULE_OVERRIDE:-$WORK/etc/backup.env}" \
+  PALWARDEN_PARSER_BIN="$DIR/../../bin/palworld-config-parser" \
+  PALWORLD_CONFIG_FILE="${CONFIG_FILE_OVERRIDE:-$WORK/PalWorldSettings.ini}" \
+  PALWORLD_SETTINGS_OVERRIDES="$WORK/etc/settings-overrides.env" \
     python3 "$JOBD" "$@"
 }
 enqueue() {  # enqueue <action> <json-params>
@@ -178,29 +189,33 @@ EOF
 assert_eq "$excl" "refused" "a symlink at the temp name it does use is refused, not followed"
 assert_file_contains "$WORK/victim-env2" "DO-NOT-CLOBBER" "the victim of that attempt is intact"
 
-# --- the composite action runs its steps in order and stops on failure ----
+# --- the composite action: the apply rides INSIDE the restart --------------
+# Not a separate argv before it: applying while the server still runs is lost
+# work (the game rewrites its config from memory as it exits and clobbers the
+# freshly-applied file mid-shutdown — observed on v1.0.3). --apply-engine tells
+# palworld-graceful-restart to run the apply after the server has fully
+# stopped; the ordering inside that window is that tool's own test's business
+# (test_graceful_restart.sh).
 : > "$WORK/argv.log"
 id="$(enqueue engine_save_apply_restart '{"settings": {"NET_SERVER_MAX_TICK_RATE": "60"}, "wait": 30, "confirm": true}')"
 jobd --once >/dev/null 2>&1
 assert_eq "$(state_of "$id")" "succeeded" "composite action succeeds"
-log="$(cat "$WORK/argv.log")"
-assert_contains "$log" "palworld-engine-config apply" "applied the config"
-assert_contains "$log" "palworld-graceful-restart" "restarted the server"
-apply_line="$(grep -n 'engine-config apply' "$WORK/argv.log" | cut -d: -f1 | head -1)"
-restart_line="$(grep -n 'graceful-restart' "$WORK/argv.log" | cut -d: -f1 | head -1)"
-if [ "$apply_line" -lt "$restart_line" ]; then pass; else fail "apply must run before restart"; fi
+assert_file_contains "$WORK/argv.log" "palworld-graceful-restart --apply-engine --wait 30" \
+  "the restart carries the apply flag and the wait"
+assert_file_not_contains "$WORK/argv.log" "engine-config apply" \
+  "no separate apply argv before the restart (it would race the game's exit write)"
 
-# a failing apply must NOT reach the restart
-cat > "$WORK/bin/palworld-engine-config" <<'EOF'
+# a failing restart (which reports a failed in-window apply as nonzero) fails the job
+cat > "$WORK/bin/palworld-graceful-restart" <<'EOF2'
 #!/usr/bin/env bash
-echo "apply exploded" >&2; exit 7
-EOF
-chmod +x "$WORK/bin/palworld-engine-config"
-: > "$WORK/argv.log"
+echo "apply exploded inside the restart window" >&2; exit 1
+EOF2
+chmod +x "$WORK/bin/palworld-graceful-restart"
 id="$(enqueue engine_save_apply_restart '{"settings": {"NET_SERVER_MAX_TICK_RATE": "60"}, "wait": 30, "confirm": true}')"
 jobd --once >/dev/null 2>&1
-assert_eq "$(state_of "$id")" "failed" "composite fails when apply fails"
-assert_file_not_contains "$WORK/argv.log" "graceful-restart" "no restart after a failed apply"
+assert_eq "$(state_of "$id")" "failed" "composite fails when the restart (or its in-window apply) fails"
+assert_contains "$(output_of "$id")" "apply exploded" "the failure reason reaches the job output"
+stub_tools
 
 # --- disruptive actions require confirm ---------------------------------
 id="$(enqueue graceful_restart '{"wait": 30}')"
@@ -517,6 +532,7 @@ roundtrip="$(
   PALWARDEN_JOBD_LOCK="$WORK/jobd.lock" \
   PALWARDEN_UPLOAD_DIR="$WORK/uploads" PALWARDEN_SAVE_BACKUP_DIR="$WORK/savebackups" \
   PALWORLD_BACKUP_SCHEDULE="$WORK/etc/backup.env" \
+  PALWORLD_CONFIG_FILE="$WORK/PalWorldSettings.ini" \
   python3 - "$JOBD" "$ARCHIVE" <<'EOF'
 import importlib.machinery, importlib.util, sys
 
@@ -543,6 +559,8 @@ SAMPLES = {
 # actions bring their own sample rather than the shared one being widened to
 # something every validator would accept — which would defeat the check.
 OVERRIDES = {
+    "settings_save": {"settings": {"ExpRate": "2"}},
+    "settings_save_apply_restart": {"settings": {"ExpRate": "2"}},
     "backup_schedule_save": {"settings": {"BACKUP_ENABLED": True,
                                           "BACKUP_INTERVAL_HOURS": 24,
                                           "BACKUP_RETENTION_DAYS": 14,
@@ -936,5 +954,106 @@ jobd --once >/dev/null 2>&1
 assert_eq "$(state_of "$id")" "failed" "backup_delete does not take a wait"
 assert_contains "$(output_of "$id")" "it takes: backup, confirm" "and lists backup and confirm only"
 assert_eq "$(wc -c < "$WORK/argv.log" | tr -d ' ')" "0" "the over-specified delete never ran"
+
+# --- settings_save: the PalWorldSettings twin of engine_save ---------------
+# Validation is against the live config's own shapes (the fixture file), via
+# palworld-config-parser's resolver/renderer — the same code config_apply runs.
+OVERRIDES="$WORK/etc/settings-overrides.env"
+rm -f "$OVERRIDES"
+: > "$WORK/argv.log"
+id="$(enqueue settings_save '{"settings": {"ExpRate": 2, "ServerName": "My Server", "bIsPvP": "True"}}')"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "succeeded" "settings_save succeeds"
+assert_file_contains "$OVERRIDES" 'ExpRate="2"' "wrote the numeric setting"
+assert_file_contains "$OVERRIDES" 'ServerName="My Server"' "wrote the quoted string setting"
+assert_file_contains "$OVERRIDES" 'bIsPvP="True"' "wrote the boolean setting"
+assert_eq "$(wc -c < "$WORK/argv.log" | tr -d ' ')" "0" "settings_save is file-only; no command ran"
+
+# env-style names resolve exactly like config_apply resolves them
+id="$(enqueue settings_save '{"settings": {"EXP_RATE": "3", "IS_PVP": "False"}}')"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "succeeded" "env-style names accepted"
+assert_file_contains "$OVERRIDES" 'ExpRate="3"' "EXP_RATE resolved to the canonical INI key and merged"
+assert_file_contains "$OVERRIDES" 'bIsPvP="False"' "IS_PVP resolved through the b-prefix rule"
+assert_file_contains "$OVERRIDES" 'ServerName="My Server"' "unsubmitted key preserved by the merge"
+
+# refusals: each one is told at the form, not silently dropped at apply time
+id="$(enqueue settings_save '{"settings": {"NotAPalworldKey": "1"}}')"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "failed" "unknown game setting rejected"
+assert_contains "$(output_of "$id")" "no matching Palworld setting" "explains the unknown key"
+
+id="$(enqueue settings_save '{"settings": {"AdminPassword": "hunter2"}}')"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "failed" "AdminPassword refused"
+assert_contains "$(output_of "$id")" "settings.env" "points at the right mechanism"
+assert_file_not_contains "$OVERRIDES" "hunter2" "the refused secret never landed in the file"
+
+id="$(enqueue settings_save '{"settings": {"SERVER_PASSWORD": "hunter2"}}')"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "failed" "ServerPassword refused under its env-style alias too"
+
+# the REST API keys are the control plane's own lifeline: a saved
+# RESTAPIEnabled=False would ride the overrides file and win over settings.env
+# on every boot, permanently cutting off telemetry/graceful-stop/updates
+id="$(enqueue settings_save '{"settings": {"RESTAPIEnabled": "False"}}')"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "failed" "RESTAPIEnabled refused"
+assert_contains "$(output_of "$id")" "control plane" "explains why REST cannot be changed here"
+id="$(enqueue settings_save '{"settings": {"REST_API_PORT": "9999"}}')"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "failed" "RESTAPIPort refused under its env-style alias too"
+assert_file_not_contains "$OVERRIDES" "RESTAPI" "no REST key ever lands in the overrides file"
+
+id="$(enqueue settings_save '{"settings": {"ExpRate": "not-a-number"}}')"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "failed" "value that does not fit the live shape rejected"
+
+id="$(enqueue settings_save '{"settings": {"CrossplayPlatforms": "Steam"}}')"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "failed" "tuple-valued setting rejected"
+
+id="$(enqueue settings_save '{"settings": {"bIsPvP": true}}')"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "failed" "JSON boolean value rejected (send the string)"
+
+id="$(enqueue settings_save '{"settings": {"ExpRate": "4", "EXP_RATE": "5"}}')"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "failed" "two aliases of one key in a single request refused"
+
+id="$(enqueue settings_save '{"settings": {}}')"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "failed" "empty settings object refused"
+
+# a quote in a string value round-trips through the always-quoted env format
+id="$(enqueue settings_save '{"settings": {"ServerDescription": "say \"hi\" (PvE)"}}')"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "succeeded" "string with quotes and parens accepted"
+assert_file_contains "$OVERRIDES" 'ServerDescription="say \"hi\" (PvE)"' "quotes escaped in the env file"
+
+# --- settings_save_apply_restart: write, then apply, then restart ----------
+: > "$WORK/argv.log"
+id="$(enqueue settings_save_apply_restart '{"settings": {"ExpRate": "5"}, "wait": 30, "confirm": true}')"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "succeeded" "settings_save_apply_restart succeeds"
+assert_file_contains "$OVERRIDES" 'ExpRate="5"' "composite wrote the overrides file"
+assert_file_contains "$WORK/argv.log" "palworld-graceful-restart --apply-config --wait 30" \
+  "then restarted with the apply inside the stop window and the wait"
+assert_file_not_contains "$WORK/argv.log" "palworld-config-apply-env" \
+  "no separate apply argv before the restart (it would race the game's exit write)"
+
+# the composite is disruptive: no confirm, no run
+id="$(enqueue settings_save_apply_restart '{"settings": {"ExpRate": "5"}}')"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "failed" "settings_save_apply_restart requires confirm"
+
+# an unreadable live config refuses the save with a reason, exactly as the
+# later apply would have failed — but at the form instead of after a restart
+: > "$WORK/argv.log"
+id="$(enqueue settings_save_apply_restart '{"settings": {"ExpRate": "6"}, "confirm": true}')"
+CONFIG_FILE_OVERRIDE="$WORK/no-such-config.ini" jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "failed" "missing live config refuses the save"
+assert_contains "$(output_of "$id")" "cannot read" "explains why"
+assert_eq "$(wc -c < "$WORK/argv.log" | tr -d ' ')" "0" "no apply or restart after a refused save"
 
 assert_report

@@ -22,6 +22,10 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+      # "default" = BuildKit's normal sandboxed network. Set
+      # PALWARDEN_BUILD_NETWORK=host in .env on hosts whose bridge-network DNS
+      # cannot resolve (some CI sandboxes / systemd-resolved-only hosts).
+      network: ${PALWARDEN_BUILD_NETWORK:-default}
     image: palwarden:latest
     container_name: palwarden
     profiles: ["embedded"]
@@ -55,6 +59,13 @@ services:
       # queue and the telemetry DB, for the same reason. The bare-metal default is
       # unchanged: /etc/palworld is genuinely persistent on a real host.
       PALWORLD_BACKUP_SCHEDULE: /var/lib/palworld/backup.env
+      # Settings saved from the web settings editor (palwarden-jobd's
+      # settings_save), on the palwarden-state volume for exactly the reason
+      # backup.env is: a value saved in the browser must survive
+      # `docker compose up --force-recreate`. Applied after settings.env on
+      # every start, so a saved value wins over its PALWORLD_CFG_* variable.
+      # Embedded-only: external mode has no local PalWorldSettings.ini to apply to.
+      PALWORLD_SETTINGS_OVERRIDES: /var/lib/palworld/settings-overrides.env
       # Scheduled world-save backups. These SEED the file above on the first start
       # only — the Backups page owns it afterwards (it is rewritten by
       # palwarden-jobd's backup_schedule_save), so re-rendering it on every `up`
@@ -107,6 +118,10 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+      # "default" = BuildKit's normal sandboxed network. Set
+      # PALWARDEN_BUILD_NETWORK=host in .env on hosts whose bridge-network DNS
+      # cannot resolve (some CI sandboxes / systemd-resolved-only hosts).
+      network: ${PALWARDEN_BUILD_NETWORK:-default}
     image: palwarden:latest
     container_name: palwarden-external
     profiles: ["external"]

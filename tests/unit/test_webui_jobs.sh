@@ -25,11 +25,14 @@ WORK="$(mktemp -d)"
 JOBS="$WORK/queue/jobs"
 PORT=18097
 PORT_RO=18096
+PORT_OH=18095
 PID=""
 PID_RO=""
+PID_OH=""
 cleanup() {
   [ -n "$PID" ] && kill "$PID" 2>/dev/null
   [ -n "$PID_RO" ] && kill "$PID_RO" 2>/dev/null
+  [ -n "$PID_OH" ] && kill "$PID_OH" 2>/dev/null
   chmod u+w "$WORK/nowrite" 2>/dev/null
   rm -rf "$WORK"
 }
@@ -49,7 +52,10 @@ cat > "$WORK/sbin/palworld-health-report" <<'EOF'
 echo '{"service":{"active_state":"active"}}'
 EOF
 chmod +x "$WORK/sbin/"*
-printf '[/Script/Pal.PalGameWorldSettings]\nOptionSettings=(ServerName="Ygg")\n' \
+# AdminPassword and ExpRate are here for the settings_save contract checks:
+# the secret key must be refused *as a secret* (not merely as unresolvable),
+# and a numeric key must reject a non-numeric value.
+printf '[/Script/Pal.PalGameWorldSettings]\nOptionSettings=(ServerName="Ygg",AdminPassword="",ExpRate=1.000000,RESTAPIEnabled=True)\n' \
   > "$WORK/cfg/PalWorldSettings.ini"
 
 # A real rollback source, so engine_rollback's validator has something valid to
@@ -201,6 +207,36 @@ assert_eq "$(code -u "$CREDS" -H "$TOKHDR" \
   -H 'Content-Type: application/json' -d '{"action":"backup"}' "$U/api/jobs")" "202" \
   "loopback Origin on a tunnelled port is accepted"
 
+# --- PALWARDEN_WEBUI_ORIGIN_HOSTS: the vetted non-loopback allowlist --------
+# Opt-in, default empty (every 403 above is the default posture). Listing a
+# host trusts pages served from that *name*; the token and Basic auth still
+# apply, and an unlisted (rebinding) name is still refused.
+PALWARDEN_WEBUI_ORIGIN_HOSTS=" Trusted.Example , vm.tailnet.test " \
+  start_server "$PORT_OH" "$JOBS" "$WORK/server-oh.log"
+PID_OH=$!
+UOH="http://127.0.0.1:$PORT_OH"
+assert_eq "$(code -u "$CREDS" -H "$TOKHDR" -H 'Origin: http://trusted.example:8088' -X POST \
+  -H 'Content-Type: application/json' -d '{"action":"backup"}' "$UOH/api/jobs")" "202" \
+  "a listed Origin host is accepted (any port, case-insensitive, whitespace-tolerant)"
+assert_eq "$(code -u "$CREDS" -H "$TOKHDR" -H 'Origin: https://VM.Tailnet.TEST' -X POST \
+  -H 'Content-Type: application/json' -d '{"action":"backup"}' "$UOH/api/jobs")" "202" \
+  "a second listed host is accepted regardless of scheme and case"
+assert_eq "$(code -u "$CREDS" -H "$TOKHDR" -H 'Origin: http://evil.example' -X POST \
+  -H 'Content-Type: application/json' -d '{"action":"backup"}' "$UOH/api/jobs")" "403" \
+  "an unlisted Origin is still refused with the knob set"
+assert_eq "$(code -u "$CREDS" -H "$TOKHDR" -H "Origin: http://rebind.example:$PORT_OH" \
+  -H "Host: rebind.example:$PORT_OH" -X POST -H 'Content-Type: application/json' \
+  -d '{"action":"backup"}' "$UOH/api/jobs")" "403" \
+  "a rebound unlisted name is still refused (the list does not become Origin==Host)"
+assert_eq "$(code -u "$CREDS" -H "$TOKHDR" -H 'Origin: http://trusted.example' \
+  -H 'Sec-Fetch-Site: cross-site' -X POST -H 'Content-Type: application/json' \
+  -d '{"action":"backup"}' "$UOH/api/jobs")" "403" \
+  "Sec-Fetch-Site still refuses a cross-site fetch even with a listed Origin"
+assert_eq "$(code -u "$CREDS" -X POST -H 'Origin: http://trusted.example' \
+  -H 'Content-Type: application/json' -d '{"action":"backup"}' "$UOH/api/jobs")" "403" \
+  "the token is still required for a listed Origin"
+kill "$PID_OH" 2>/dev/null; PID_OH=""
+
 # --- bad requests are 400, with a reason -----------------------------------
 assert_eq "$(post_json '{"action":"nope"}')" "400" "unknown action rejected"
 assert_contains "$(post_body '{"action":"nope"}')" "not an allowed action" "400 says why"
@@ -222,6 +258,20 @@ assert_eq "$(post_json '{"action":"engine_save","params":{"settings":{"NET_SERVE
   "202" "a numeric setting value is accepted"
 assert_eq "$(post_json '{"action":"engine_save","params":{"settings":{"NOT_A_SETTING":60}}}')" \
   "400" "an unknown setting key is rejected"
+# settings_save shares the worker's validators the same way: validated against
+# the live config's own shapes, and the password keys refused outright
+assert_eq "$(post_json '{"action":"settings_save","params":{"settings":{"ServerName":"Muninn"}}}')" \
+  "202" "a game setting present in the live config is accepted"
+assert_eq "$(post_json '{"action":"settings_save","params":{"settings":{"NotAPalworldKey":"1"}}}')" \
+  "400" "a game setting key absent from the live config is rejected"
+assert_eq "$(post_json '{"action":"settings_save","params":{"settings":{"AdminPassword":"hunter2"}}}')" \
+  "400" "the password keys are refused at the API too"
+assert_eq "$(post_json '{"action":"settings_save","params":{"settings":{"RESTAPIEnabled":"False"}}}')" \
+  "400" "the REST lifeline keys are refused at the API too"
+assert_eq "$(post_json '{"action":"settings_save","params":{"settings":{"ExpRate":"lots"}}}')" \
+  "400" "a value that does not fit the live shape is rejected"
+assert_eq "$(post_json '{"action":"settings_save_apply_restart","params":{"settings":{"ServerName":"Muninn"}}}')" \
+  "400" "the disruptive settings composite requires confirm"
 
 # --- params are a whitelist, so junk never reaches the queue ---------------
 # The worker's validate_params used to return a *copy* of params, so any key the
@@ -418,16 +468,61 @@ assert_eq "$states" "queued" "the web process only ever queued jobs, never ran o
 # the page actually speaks it: the right two actions, the token header, the
 # confirm gate on the disruptive one, and a payload the validators above accept.
 EDITOR="$REPO/webui/EngineIniPerformanceEditor.html"
-VENDORED="$REPO/webui/PalWorldSettingsEditor.html"
+SETTINGS="$REPO/webui/PalWorldSettingsEditor.html"
 
-# provenance: first-party header on ours, byte-identical vendored file next to it
+# provenance: first-party headers on the Engine editor; the settings editor is
+# a FORK of the MIT upstream (no longer byte-identical, by decision): its
+# header keeps the MIT attribution and marks only the palwarden additions as
+# first-party AGPL. CREDITS.md records the derivation.
 assert_file_contains "$EDITOR" "SPDX-License-Identifier: AGPL-3.0-or-later" \
   "the Engine editor carries the AGPL identifier"
 assert_file_contains "$EDITOR" "SPDX-FileCopyrightText: 2026 Brian Grant" \
   "the Engine editor carries our copyright"
 assert_file_contains "$EDITOR" "CREDITS.md" "the Engine editor notes its MIT derivation"
-assert_rc 0 git -C "$REPO" diff --quiet -- webui/PalWorldSettingsEditor.html
-assert_rc 0 test -f "$VENDORED"
+assert_file_contains "$SETTINGS" "LICENSE.upstream-mit" \
+  "the settings editor keeps the upstream MIT attribution"
+assert_file_contains "$SETTINGS" "CREDITS.md" "the settings editor points at the provenance record"
+
+# the settings editor's live controls: one load control, two mutating ones
+assert_file_contains "$SETTINGS" 'id="btn-live-load"' "the settings editor has a Load Live Config control"
+assert_file_contains "$SETTINGS" 'id="btn-live-save"' "the settings editor has a Save to Server control"
+assert_file_contains "$SETTINGS" 'id="btn-live-apply"' "the settings editor has a Save, Apply and Restart control"
+assert_file_contains "$SETTINGS" "'settings_save'" "Save enqueues settings_save"
+assert_file_contains "$SETTINGS" "'settings_save_apply_restart'" \
+  "Save and apply enqueues settings_save_apply_restart"
+assert_file_contains "$SETTINGS" "X-Palwarden-Token" "the settings editor sends the token header"
+assert_file_contains "$SETTINGS" "sessionStorage.getItem" "the token is read from sessionStorage"
+# the upstream theme toggle legitimately uses localStorage; the token must not.
+if grep 'localStorage' "$SETTINGS" | grep -qiv theme; then
+  fail "the settings editor uses localStorage for something other than the theme (the token must stay in sessionStorage)"
+else
+  pass
+fi
+assert_file_contains "$SETTINGS" 'class="pw-confirm"' "the disruptive path has a pw-confirm dialog"
+assert_file_contains "$SETTINGS" "confirm: true" "the disruptive body carries confirm: true"
+# no HTML-parsing sink: the page renders server-supplied error/output text.
+# (It keeps upstream styling, so it is deliberately NOT in the design-token
+# structural check below — but the injection-sink rule applies in full.)
+if grep -qE 'innerHTML|insertAdjacentHTML|document\.write' "$SETTINGS"; then
+  fail "the settings editor grew an HTML-parsing sink; server-influenced text must go through textContent"
+else
+  pass
+fi
+# the excluded keys are named (refused server-side, skipped and hidden client-side)
+assert_file_contains "$SETTINGS" "AdminPassword" "the settings editor knows the excluded password keys"
+assert_file_contains "$SETTINGS" "RESTAPIEnabled" "and the REST lifeline keys"
+assert_file_contains "$SETTINGS" "CrossplayPlatforms" "and the unsupported tuple key"
+assert_file_contains "$SETTINGS" "pw-live-hidden" \
+  "live mode hides the unsaveable fields instead of offering dead controls"
+# upstream bug, fixed in the fork: a later layout rule set `display: flex` on
+# the success/error banners, overriding their default `display: none` and
+# rendering both permanently as empty green/red bars. The layout rule must
+# never set display — showMessage() owns that via inline style.
+if awk '/\.success-message, \.error-message \{/,/\}/' "$SETTINGS" | grep -q 'display:'; then
+  fail "the shared banner layout rule sets display, resurfacing the empty-banner bug"
+else
+  pass
+fi
 
 # the two controls, and only those two: apply-without-restart is deliberately absent
 assert_file_contains "$EDITOR" 'id="btn-save"' "the editor has a Save control"
@@ -466,7 +561,7 @@ assert_file_contains "$EDITOR" 'id="toast"' "outcomes go in a pw-toast"
 # API's strings and the Backups page renders archive names and job output too, so
 # the reasoning is identical; checking only the editor would let the guard pass
 # while a sibling page grew the exact hole it exists to prevent.
-structural="$(python3 - "$EDITOR" "$REPO/webui/palwarden.html" "$REPO/webui/backups.html" <<'PY'
+structural="$(python3 - "$EDITOR" "$REPO/webui/palwarden.html" "$REPO/webui/backups.html" "$REPO/webui/palwarden-ui.css" <<'PY'
 import re, sys
 
 # Every way a string can become markup instead of text. The 403 reflects the
@@ -514,6 +609,8 @@ COLOR_PATTERNS = (
 
 bad = []
 for path in sys.argv[1:]:
+    if path.endswith(".css"):
+        continue  # the shared stylesheet gets its own check below (2b)
     name = path.rsplit("/", 1)[-1]
     src = open(path, encoding="utf-8").read()
 
@@ -528,15 +625,18 @@ for path in sys.argv[1:]:
                 continue
             bad.append("%s: %s used (%r)" % (name, label, arg or m.group(0)))
 
-    # 2. Raw colours only inside the :root token block.
+    # 2. Raw colours only inside token blocks. The tokens live in the shared
+    #    stylesheet (palwarden-ui.css, checked below); a page's own <style>
+    #    must be colourless outside a :root block, and a page with no :root at
+    #    all must link the shared stylesheet.
     style = re.search(r"<style>(.*?)</style>", src, re.S)
     if not style:
         bad.append("%s: no <style> block" % name)
     else:
         css = style.group(1)
         root = re.search(r":root\s*\{.*?\}", css, re.S)
-        if not root:
-            bad.append("%s: no :root token block" % name)
+        if not root and 'palwarden-ui.css' not in src:
+            bad.append("%s: no :root token block and no shared stylesheet" % name)
         outside = css.replace(root.group(0), "") if root else css
         for pattern in COLOR_PATTERNS:
             for m in re.finditer(pattern, outside):
@@ -545,6 +645,15 @@ for path in sys.argv[1:]:
     # 3. No inline style attributes.
     if re.search(r"\sstyle=", src):
         bad.append("%s: inline style attribute" % name)
+
+# 2b. The shared stylesheet: raw colours only inside the token blocks
+#     (:root and the [data-theme] theme override).
+shared = open(sys.argv[len(sys.argv) - 1], encoding="utf-8").read()
+tokens = re.compile(r"(?::root|\[data-theme=[^\]]*\])[^{]*\{[^}]*\}")
+outside = tokens.sub("", shared)
+for pattern in COLOR_PATTERNS:
+    for m in re.finditer(pattern, outside):
+        bad.append("palwarden-ui.css: raw colour outside the token blocks: %s" % m.group(0))
 
 # 4. The POSTed params objects mention no key other than settings/confirm, and
 #    no JSON boolean inside settings. Editor only (argv[1]).

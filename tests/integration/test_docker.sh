@@ -38,7 +38,10 @@ wait_up() { docker exec "$1" sh -c 'i=0; until s6-svstat /run/service/'"$2"' 2>/
 services_of() { docker exec "$1" ls /etc/s6-overlay/s6-rc.d/user/contents.d/ 2>/dev/null | tr '\n' ' '; }
 
 echo "  building $IMG ..."
-if ! docker build -q -f "$REPO/docker/Dockerfile" -t "$IMG" "$REPO" >/dev/null 2>&1; then
+# PALWARDEN_DOCKER_BUILD_OPTS: extra `docker build` options, word-split on
+# purpose (e.g. --network=host on hosts whose bridge-network DNS cannot resolve).
+read -ra BUILD_OPTS <<< "${PALWARDEN_DOCKER_BUILD_OPTS:-}"
+if ! docker build "${BUILD_OPTS[@]}" -q -f "$REPO/docker/Dockerfile" -t "$IMG" "$REPO" >/dev/null 2>&1; then
   fail "image build failed"; assert_report; exit 1
 fi
 
