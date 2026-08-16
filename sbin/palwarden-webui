@@ -308,8 +308,24 @@ def check_token(headers, creds: dict[str, str]) -> bool:
     return hmac.compare_digest(supplied, expected)
 
 
+# Extra Origin hosts accepted for mutations, opt-in: exact hostnames or IP
+# literals, comma-separated, compared case-insensitively against the Origin
+# header's host only (never scheme or port — see origin_host_allowed on why).
+# Empty (the default) means loopback-only, the posture this control shipped
+# with. Listing a host here states: "pages served from this name are as trusted
+# as pages served from localhost." That is exactly as strong as the operator's
+# control of the name — list only names that resolve to this machine on a
+# network you trust (a VPN/tailnet hostname, a LAN address). The anti-rebinding
+# property survives: a rebinding attacker's page carries the *attacker's*
+# hostname in Origin, which is not in this list.
+EXTRA_ORIGIN_HOSTS = frozenset(
+    host.strip().lower()
+    for host in os.environ.get("PALWARDEN_WEBUI_ORIGIN_HOSTS", "").split(",")
+    if host.strip())
+
+
 def origin_host_allowed(origin: str) -> bool:
-    """Is this Origin's *host* a loopback name or address?
+    """Is this Origin's *host* a loopback name or address (or explicitly listed)?
 
     This is a same-*machine* check, not a same-origin one, and the difference
     matters. Only the host is compared, never the scheme or port: the documented
@@ -328,13 +344,15 @@ def origin_host_allowed(origin: str) -> bool:
     independently (a cross-origin page cannot set it without a preflight we never
     answer).
 
-    A non-loopback BIND is deliberately *not* allowed here: it would have to be
-    accepted by hostname, and there is no vetted list of those (the removed
-    PALWARDEN_WEBUI_ORIGIN_HOSTS knob was an untested relaxation of a security
-    control). Consequence if someone sets PALWARDEN_WEBUI_BIND to a routable
-    address anyway: reads keep working, but a browser loaded from that address
-    sends its own Origin and every mutation is refused with a 403 naming the
-    host. That fails closed; the supported remote path is the SSH tunnel.
+    A non-loopback BIND works only with an explicit opt-in: by default, reads
+    keep working but a browser loaded from a routable address sends its own
+    Origin and every mutation is refused with a 403 naming the host — that
+    fails closed, and the zero-configuration remote path remains the SSH
+    tunnel. `PALWARDEN_WEBUI_ORIGIN_HOSTS` (see EXTRA_ORIGIN_HOSTS above) is
+    the vetted list for deployments that serve the UI on a trusted network
+    directly. An earlier version of this knob was removed for being an
+    untested relaxation of a security control; this one is exercised by
+    tests/unit/test_webui_jobs.sh, including the rebinding case.
     """
     try:
         host = urllib.parse.urlsplit(origin.strip()).hostname
@@ -346,6 +364,8 @@ def origin_host_allowed(origin: str) -> bool:
         return False
     host = host.lower()
     if host == "localhost":
+        return True
+    if host in EXTRA_ORIGIN_HOSTS:
         return True
     try:
         return ipaddress.ip_address(host).is_loopback
