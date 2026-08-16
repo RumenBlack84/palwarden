@@ -1,10 +1,20 @@
 <!DOCTYPE html>
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+<!-- Derived from the MIT-licensed Palworld Dedicated Server Config Creator
+     (BlinkZer0); the upstream notice is retained at LICENSE.upstream-mit and
+     the derivation is recorded in CREDITS.md. The form, styling and offline
+     generate/copy workflow are upstream's work. The palwarden additions
+     (SPDX-FileCopyrightText: 2026 Brian Grant, AGPL-3.0-or-later) are the
+     live control plane integration: nav, Load Live Config, the changed-keys
+     diff, and the settings_save / settings_save_apply_restart jobs. -->
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Palworld Server Settings Editor</title>
-    <style>
+    <link rel="stylesheet" href="palwarden-ui.css">
+<script src="palwarden-ui.js" defer></script>
+<style>
         * {
             margin: 0;
             padding: 0;
@@ -97,35 +107,6 @@
 
         .header-text {
             flex: 1;
-        }
-
-        .theme-toggle {
-            background: rgba(255, 255, 255, 0.2);
-            border: 2px solid rgba(255, 255, 255, 0.3);
-            border-radius: 50px;
-            width: 50px;
-            height: 50px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            cursor: pointer;
-            transition: all 0.3s ease;
-            backdrop-filter: blur(10px);
-        }
-
-        .theme-toggle:hover {
-            background: rgba(255, 255, 255, 0.3);
-            border-color: rgba(255, 255, 255, 0.5);
-            transform: scale(1.1);
-        }
-
-        .theme-icon {
-            font-size: 1.5em;
-            transition: transform 0.3s ease;
-        }
-
-        .theme-toggle:hover .theme-icon {
-            transform: rotate(15deg);
         }
 
         .controls {
@@ -618,8 +599,12 @@
             color: #742a2a;
         }
 
+        /* Layout only — deliberately no `display` here. An upstream bug set
+           `display: flex` in this later rule, overriding the `display: none`
+           defaults above (same specificity, later wins), so both banners
+           rendered permanently as empty green/red bars. showMessage() shows
+           them with an inline `display: flex`, which these then lay out. */
         .success-message, .error-message {
-            display: flex;
             align-items: center;
             gap: 10px;
         }
@@ -754,6 +739,24 @@
         .slider-value.value-extreme {
             color: #e53e3e;
         }
+
+        /* --- palwarden live-integration additions (see header comment) ------
+           Styled with the editor's own theme variables so both themes work. */
+        .pw-joblog { max-height: 14em; overflow: auto; margin: 10px 0;
+                     padding: 10px 14px; border-radius: 8px; white-space: pre-wrap;
+                     word-break: break-word; font-size: 0.85em;
+                     background: var(--bg-tertiary); color: var(--text-primary);
+                     border: 1px solid var(--border-color); }
+        .pw-confirm { background: var(--bg-secondary); color: var(--text-primary);
+                      border: 1px solid var(--border-color); border-radius: 10px;
+                      padding: 24px; max-width: 34em; }
+        .pw-confirm::backdrop { background: rgba(0, 0, 0, 0.6); }
+        .pw-confirm > h2 { margin: 0 0 8px; font-size: 1.1em; }
+        .pw-confirm > p { margin: 0 0 16px; white-space: pre-wrap; }
+        .pw-confirm-actions { display: flex; gap: 10px; justify-content: flex-end; }
+        /* Fields this page can never save live are hidden while it is serving
+           as the live editor; opened as a local file everything is shown. */
+        .pw-live-hidden { display: none !important; }
     </style>
 
     <!-- SVG Icon Definitions -->
@@ -916,6 +919,16 @@
     </svg>
 </head>
 <body>
+<nav class="pw-sidebar" id="pw-nav" hidden aria-label="palwarden">
+  <div class="pw-sidebar__brand"><span class="pw-sidebar__label">palwarden</span></div>
+  <a class="pw-sidebar__item" href="palwarden.html" title="Dashboard"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 14a8 8 0 1 1 16 0"/><path d="M12 14l4-4"/><path d="M6 20h12"/></svg><span class="pw-sidebar__label">Dashboard</span></a>
+  <a class="pw-sidebar__item" href="PalWorldSettingsEditor.html" aria-current="page" title="Server settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="4" y1="7" x2="12" y2="7"/><line x1="18" y1="7" x2="20" y2="7"/><circle cx="15" cy="7" r="2"/><line x1="4" y1="12" x2="6" y2="12"/><line x1="12" y1="12" x2="20" y2="12"/><circle cx="9" cy="12" r="2"/><line x1="4" y1="17" x2="13" y2="17"/><line x1="19" y1="17" x2="20" y2="17"/><circle cx="16" cy="17" r="2"/></svg><span class="pw-sidebar__label">Server settings</span></a>
+  <a class="pw-sidebar__item" href="EngineIniPerformanceEditor.html" title="Engine.ini performance"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 2 4.5 13.5H11L9.5 22 18 10.5h-6.5L13 2z"/></svg><span class="pw-sidebar__label">Engine.ini performance</span></a>
+  <a class="pw-sidebar__item" href="backups.html" title="Backups"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="5" rx="1"/><path d="M5 9v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V9"/><path d="M10 13h4"/></svg><span class="pw-sidebar__label">Backups</span></a>
+  <div class="pw-sidebar__spacer"></div>
+  <button class="pw-sidebar__item" id="pw-theme-toggle" type="button" title="Toggle light/dark theme"><span class="pw-sidebar__emoji">☀️</span><span class="pw-sidebar__label">Theme</span></button>
+  <button class="pw-sidebar__item" id="pw-sidebar-toggle" type="button" title="Collapse sidebar" aria-expanded="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg><span class="pw-sidebar__label">Collapse</span></button>
+</nav>
     <div class="container">
         <div class="header">
             <div class="header-content">
@@ -923,9 +936,6 @@
                     <h1>⚙️ Palworld Server Settings Editor</h1>
                     <p>Configure your dedicated server settings with ease</p>
                 </div>
-                <button id="theme-toggle" class="theme-toggle" onclick="toggleTheme()" title="Toggle Dark/Light Mode">
-                    <span class="theme-icon">🌙</span>
-                </button>
             </div>
         </div>
 
@@ -964,6 +974,20 @@
                 <input type="file" id="fileInput" accept=".ini" onchange="loadFromFile(event)">
             </div>
             <button class="btn btn-primary" onclick="loadFromText()">Load from INI Text</button>
+            <!-- Live controls: shown only when this page is served by palwarden-webui
+                 (they talk to /api/jobs); opened as a local file it stays the
+                 upstream offline editor. -->
+            <button class="btn btn-primary" id="btn-live-load" onclick="loadLiveConfig()" hidden>
+                🔌 Load Live Config
+            </button>
+            <button class="btn btn-secondary" id="btn-live-save" onclick="liveSave(false)" hidden
+                    title="Write changed settings to the server's overrides file (applied on next apply + restart)">
+                💾 Save to Server
+            </button>
+            <button class="btn btn-danger" id="btn-live-apply" onclick="liveSave(true)" hidden
+                    title="Save, then gracefully restart the server, applying the changes while it is stopped">
+                🚀 Save, Apply &amp; Restart
+            </button>
             <div class="spacer"></div>
             <button class="btn btn-secondary" onclick="generateINI()">✅ Generate INI Output</button>
             <button class="btn btn-secondary" onclick="copyToClipboard()">📋 Copy to Clipboard</button>
@@ -982,6 +1006,20 @@
             <svg class="message-icon"><use href="#icon-error"/></svg>
             <span></span>
         </div>
+
+        <!-- Live control plane log. Server-influenceable text: written only via
+             textContent, never parsed as HTML. -->
+        <pre id="joblog" class="pw-joblog" hidden></pre>
+
+        <dialog id="confirm-dialog" class="pw-confirm" aria-labelledby="confirm-title"
+                aria-describedby="confirm-body">
+            <h2 id="confirm-title">Save, apply and restart?</h2>
+            <p id="confirm-body"></p>
+            <div class="pw-confirm-actions">
+                <button id="confirm-cancel" class="btn btn-secondary" type="button" autofocus>Cancel</button>
+                <button id="confirm-ok" class="btn btn-danger" type="button">Save, apply and restart</button>
+            </div>
+        </dialog>
 
         <div class="content">
             <form id="settingsForm">
@@ -1702,31 +1740,13 @@
             content.classList.toggle('collapsed');
         }
 
-        // Theme toggle functionality
-        function toggleTheme() {
-            const body = document.body;
-            const themeIcon = document.querySelector('.theme-icon');
-            const currentTheme = body.getAttribute('data-theme');
-            
-            if (currentTheme === 'dark') {
-                body.setAttribute('data-theme', 'light');
-                themeIcon.textContent = '🌙';
-                localStorage.setItem('theme', 'light');
-            } else {
-                body.setAttribute('data-theme', 'dark');
-                themeIcon.textContent = '☀️';
-                localStorage.setItem('theme', 'dark');
-            }
-        }
-
-        // Initialize theme on page load
+        // Theme: applied here at load (works offline too); the toggle itself is
+        // the sidebar button, handled by palwarden-ui.js — the same localStorage theme
+        // key, so the choice is shared with every palwarden page. The
+        // upstream header toggle was removed in favour of that unified control.
         function initializeTheme() {
             const savedTheme = localStorage.getItem('theme') || 'dark'; // Default to dark
-            const body = document.body;
-            const themeIcon = document.querySelector('.theme-icon');
-            
-            body.setAttribute('data-theme', savedTheme);
-            themeIcon.textContent = savedTheme === 'dark' ? '☀️' : '🌙';
+            document.body.setAttribute('data-theme', savedTheme);
         }
 
         // Get all crossplay platforms
@@ -1822,8 +1842,8 @@
             }
         }
 
-        // Parse INI content and populate form
-        function parseINI(content) {
+        // Extract the raw OptionSettings key=value map (values keep their quotes)
+        function extractSettings(content) {
             let match = content.match(/OptionSettings\=\((.*)\)/s);
             if (!match) {
                 const parenOnly = content.match(/^\s*\((.*)\)\s*$/s);
@@ -1874,6 +1894,12 @@
             if (currentKey) {
                 settings[currentKey] = currentValue.trim();
             }
+            return settings;
+        }
+
+        // Parse INI content and populate form
+        function parseINI(content) {
+            const settings = extractSettings(content);
 
             // Populate form fields
             Object.keys(settings).forEach(key => {
@@ -1905,6 +1931,7 @@
             }
             // Re-sync sliders after parsing INI content
             initializeSliders();
+            return settings;
         }
 
         // Reset to defaults
@@ -2401,8 +2428,319 @@
             initializeSliders();
         }
 
+        // --- palwarden live control plane -----------------------------------
+        // Same machinery as the Engine.ini performance editor: mutations need
+        // HTTP Basic (the browser already holds it for this page) plus the API
+        // token in X-Palwarden-Token, fetched from GET /api/token and kept in
+        // sessionStorage only. The custom header is the CSRF defence: a
+        // cross-origin page cannot set it without a preflight the server never
+        // grants. Every string logged below is server-influenceable and only
+        // ever reaches the DOM through textContent.
+        const LIVE_MODE = location.protocol === 'http:' || location.protocol === 'https:';
+        const TOKEN_KEY = 'palwarden-token';
+        const POLL_INTERVAL_MS = 2000;
+        // ~15 minutes: graceful-restart warns players for up to 300 s before
+        // stopping, then waits for REST readiness. On expiry the UI says so
+        // and points at the job id rather than polling forever.
+        const POLL_MAX_ATTEMPTS = 450;
+        const POLL_MAX_STATUS_FAILURES = 10;
+        const JOB_TERMINAL = ['succeeded', 'failed'];
+        // Never sent live, and hidden from the form in live mode (jobd refuses
+        // each of them from this path anyway; skipping here means one stray
+        // change cannot fail the whole save): the password keys are managed
+        // via settings.env, the REST API keys are the control plane's own
+        // lifeline (disabling REST from this page would cut off telemetry,
+        // graceful save-on-stop and updates — permanently, since the overrides
+        // file wins over settings.env on every boot), and CrossplayPlatforms
+        // is tuple-valued, which the config parser does not support.
+        const LIVE_EXCLUDED = {
+            'AdminPassword': 'passwords are managed via settings.env',
+            'ServerPassword': 'passwords are managed via settings.env',
+            'RESTAPIEnabled': 'the REST API is the control plane’s own management path; set it via settings.env (ADMIN_PASSWORD)',
+            'RESTAPIPort': 'the REST API is the control plane’s own management path; set it via settings.env (PALWORLD_REST_PORT)',
+            'CrossplayPlatforms': 'tuple-valued settings are not supported',
+        };
+        // Raw values from the last "Load Live Config" — the diff baseline.
+        let liveValues = null;
+
+        function $id(id) { return document.getElementById(id); }
+        function errText(e) { return String((e && e.message) || e); }
+        function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+        function jlog(line) {
+            const pre = $id('joblog');
+            pre.hidden = false;
+            const atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 4;
+            pre.textContent += line + '\n';
+            if (atBottom) pre.scrollTop = pre.scrollHeight;
+        }
+
+        function setLiveBusy(busy) {
+            ['btn-live-load', 'btn-live-save', 'btn-live-apply'].forEach(id => { $id(id).disabled = busy; });
+        }
+
+        // Resolves to the token, or throws with something the operator can act
+        // on. Cached in sessionStorage; the cache is cleared on a 403 so a
+        // rotated token self-heals on the next click.
+        async function apiToken() {
+            const cached = sessionStorage.getItem(TOKEN_KEY);
+            if (cached) return cached;
+            let unauthenticated = false;
+            try {
+                const res = await fetch('/api/token', { headers: { 'Accept': 'application/json' } });
+                if (res.status === 401) { unauthenticated = true; throw new Error('HTTP 401'); }
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                const json = await res.json();
+                const payload = json && json.data;
+                if (!json || json.ok === false || !payload || !payload.token) {
+                    throw new Error((json && json.error) ? json.error : 'the response carried no token');
+                }
+                const t = String(payload.token);
+                sessionStorage.setItem(TOKEN_KEY, t);
+                return t;
+            } catch (e) {
+                if (unauthenticated) {
+                    throw new Error('not signed in any more (GET /api/token answered 401) — ' +
+                        'reload this page and re-enter the web UI credentials');
+                }
+                const why = errText(e);
+                jlog('could not fetch the API token (' + why + '); asking for it instead');
+                const typed = window.prompt('palwarden could not supply the API token (' + why + '). ' +
+                    'Enter WEBUI_TOKEN from /etc/palworld/webui.env. Kept in this tab only.');
+                if (typed) { sessionStorage.setItem(TOKEN_KEY, typed); return typed; }
+                throw new Error('no API token available: ' + why);
+            }
+        }
+
+        async function postJob(action, params) {
+            const tok = await apiToken();
+            const res = await fetch('/api/jobs', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'X-Palwarden-Token': tok },
+                body: JSON.stringify({ action: action, params: params }),
+            });
+            let json = null;
+            try { json = await res.json(); } catch (e) { json = null; }
+            if (res.status === 202 && json && json.id) return json.id;
+            let msg = (json && json.error) ? json.error : ('HTTP ' + res.status);
+            const b = json && json.blocked_by;
+            if (b) msg += ' [blocked by ' + b.action + ' ' + b.id + ' (' + b.state + ')]';
+            if (res.status === 403) {
+                sessionStorage.removeItem(TOKEN_KEY);
+                msg += ' — the API token was refused; it has been discarded, so retrying re-fetches it';
+            }
+            throw new Error(msg);
+        }
+
+        // {outcome:'done', job} | {outcome:'expired'} | {outcome:'unreachable', detail}
+        async function pollJob(id) {
+            let last = '';
+            let failures = 0;
+            for (let i = 0; i < POLL_MAX_ATTEMPTS; i++) {
+                if (i > 0) await sleep(POLL_INTERVAL_MS);
+                let job = null;
+                try {
+                    const res = await fetch('/api/jobs/' + encodeURIComponent(id), { headers: { 'Accept': 'application/json' } });
+                    let json = null;
+                    try { json = await res.json(); } catch (e) { json = null; }
+                    if (!res.ok || !json || json.ok === false || !json.data) {
+                        throw new Error((json && json.error) ? json.error : ('job status: HTTP ' + res.status));
+                    }
+                    job = json.data;
+                } catch (e) {
+                    const detail = errText(e);
+                    failures++;
+                    jlog('status check failed (' + failures + '/' + POLL_MAX_STATUS_FAILURES + '): ' + detail);
+                    if (failures >= POLL_MAX_STATUS_FAILURES) return { outcome: 'unreachable', detail: detail };
+                    continue;
+                }
+                failures = 0;
+                const state = String(job.state || 'unknown');
+                if (state !== last) { jlog('state: ' + state); last = state; }
+                if (JOB_TERMINAL.includes(state)) return { outcome: 'done', job: job };
+            }
+            return { outcome: 'expired' };
+        }
+
+        // Returns true only when the job reached "succeeded".
+        async function runLiveJob(action, params) {
+            setLiveBusy(true);
+            try {
+                jlog('POST /api/jobs ' + action);
+                const id = await postJob(action, params);
+                jlog('job ' + id + ' accepted');
+                const res = await pollJob(id);
+                if (res.outcome === 'expired') {
+                    const msg = 'job ' + id + ' is still unfinished after ' +
+                        Math.round(POLL_MAX_ATTEMPTS * POLL_INTERVAL_MS / 60000) +
+                        ' minutes; this page stopped polling. Check /api/jobs/' + id + ' or the dashboard.';
+                    jlog(msg); showMessage('errorMessage', msg); return false;
+                }
+                // "we lost the status endpoint", NOT "the job failed": jobd
+                // runs independently of this page.
+                if (res.outcome === 'unreachable') {
+                    const msg = 'job status unreachable (' + res.detail + ') — the job may still be running. ' +
+                        action + ' is job ' + id + '; check /api/jobs/' + id + ' or the dashboard for its outcome.';
+                    jlog(msg); showMessage('errorMessage', msg); return false;
+                }
+                const job = res.job;
+                if (job.output) jlog(String(job.output));
+                if (job.state === 'succeeded') {
+                    jlog(action + ' succeeded');
+                    showMessage('successMessage', action + ' succeeded');
+                    return true;
+                }
+                const msg = action + ' failed (exit ' + String(job.exit_code) + '); see the log above';
+                jlog(msg); showMessage('errorMessage', msg);
+                return false;
+            } catch (e) {
+                const msg = errText(e); jlog('error: ' + msg); showMessage('errorMessage', msg);
+                return false;
+            } finally {
+                setLiveBusy(false);
+            }
+        }
+
+        // showModal() is the platform's own focus trap: the rest of the
+        // document goes inert and Esc fires cancel/close, which resolves this
+        // as a cancellation.
+        function confirmDisruptive(message) {
+            return new Promise(resolve => {
+                const dlg = $id('confirm-dialog'), ok = $id('confirm-ok'), cancel = $id('confirm-cancel');
+                $id('confirm-body').textContent = message;
+                let settled = false;
+                function finish(result) {
+                    if (settled) return;
+                    settled = true;
+                    ok.removeEventListener('click', onOk);
+                    cancel.removeEventListener('click', onCancel);
+                    dlg.removeEventListener('close', onClose);
+                    resolve(result);
+                }
+                function onOk() { finish(true); dlg.close(); }
+                function onCancel() { finish(false); dlg.close(); }
+                function onClose() { finish(false); }
+                ok.addEventListener('click', onOk);
+                cancel.addEventListener('click', onCancel);
+                dlg.addEventListener('close', onClose);
+                dlg.showModal();
+            });
+        }
+
+        function stripOuterQuotes(v) {
+            const s = String(v);
+            return (s.length >= 2 && s[0] === '"' && s[s.length - 1] === '"') ? s.slice(1, -1) : s;
+        }
+
+        // Semantic comparison, because the game normalises what it writes:
+        // "60.000000" is the same setting as "60", and quoting is presentation.
+        function sameValue(a, b) {
+            const ua = stripOuterQuotes(a), ub = stripOuterQuotes(b);
+            if (ua === ub) return true;
+            if (ua !== '' && ub !== '') {
+                const na = Number(ua), nb = Number(ub);
+                if (!Number.isNaN(na) && !Number.isNaN(nb)) return na === nb;
+            }
+            return ua.toLowerCase() === ub.toLowerCase();
+        }
+
+        async function loadLiveConfig() {
+            setLiveBusy(true);
+            try {
+                const resp = await fetch('current/PalWorldSettings.ini?ts=' + Date.now());
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                const txt = await resp.text();
+                liveValues = parseINI(txt);
+                const n = Object.keys(liveValues).length;
+                jlog('loaded live PalWorldSettings.ini (' + txt.length + ' bytes, ' + n + ' settings)');
+                showMessage('successMessage', 'Live config loaded (' + n + ' settings).');
+            } catch (e) {
+                const msg = errText(e);
+                jlog('could not load live config: ' + msg);
+                showMessage('errorMessage', 'Could not load live config: ' + msg);
+            } finally {
+                setLiveBusy(false);
+            }
+        }
+
+        // The keys whose form value differs from the loaded live config, as
+        // {key: unquoted string}. Only *changes* are sent: the overrides file
+        // is a merge, and a key never touched in the browser must stay owned
+        // by whatever set it (PALWORLD_CFG_* or the game's own default).
+        function changedSettings() {
+            if (!liveValues) {
+                showMessage('errorMessage', 'Load Live Config first — the save sends only what you changed.');
+                return null;
+            }
+            const current = extractSettings(buildINIContent());
+            const changed = {};
+            Object.keys(current).forEach(key => {
+                if (!(key in liveValues)) {
+                    jlog(key + ' is not in the live config (older server build?); skipped');
+                    return;
+                }
+                if (sameValue(current[key], liveValues[key])) return;
+                if (key in LIVE_EXCLUDED) {
+                    jlog(key + ' changed but cannot be saved from this page (' + LIVE_EXCLUDED[key] + ')');
+                    return;
+                }
+                changed[key] = stripOuterQuotes(current[key]);
+            });
+            return changed;
+        }
+
+        async function liveSave(applyRestart) {
+            if ($id('confirm-dialog').open) return;
+            const changed = changedSettings();
+            if (changed === null) return;
+            const keys = Object.keys(changed).sort();
+            if (keys.length === 0) {
+                jlog('nothing to save: no changes compared to the live config');
+                showMessage('errorMessage', 'No changes compared to the live config.');
+                return;
+            }
+            if (applyRestart) {
+                const okToGo = await confirmDisruptive(
+                    'This saves ' + keys.length + ' setting(s) to the server and gracefully restarts ' +
+                    'it, applying them to PalWorldSettings.ini while the server is stopped (an apply ' +
+                    'while it runs would be lost to the game’s own exit-time config write): players ' +
+                    'are warned in-game and the world is saved before it goes down (up to 300 s with ' +
+                    'players online, 15 s on an empty server).\n\nKeys: ' + keys.join(', '));
+                if (!okToGo) { jlog('save, apply and restart cancelled'); return; }
+                const ok = await runLiveJob('settings_save_apply_restart', { settings: changed, confirm: true });
+                // The live file changed under us; re-baseline so the next diff is honest.
+                if (ok) await loadLiveConfig();
+            } else {
+                const ok = await runLiveJob('settings_save', { settings: changed });
+                if (ok) jlog('saved to the server’s overrides file; values take effect on the next apply + restart');
+            }
+        }
+
+        // In live mode, hide the fields this page can never save so nobody is
+        // offered a control that silently does nothing. The inputs stay in the
+        // DOM (display:none), so parseINI()/buildINIContent() keep working over
+        // the full key set; hiding the password fields also keeps AdminPassword
+        // (which Load Live Config fills from the raw live file) off the screen.
+        // Opened as a local file (the offline generate/copy workflow) nothing
+        // is hidden and the live controls stay hidden instead.
+        function initLiveMode() {
+            if (!LIVE_MODE) return;
+            $id('pw-nav').hidden = false;
+            document.body.classList.add('pw-with-sidebar');
+            ['btn-live-load', 'btn-live-save', 'btn-live-apply'].forEach(id => { $id(id).hidden = false; });
+            Object.keys(LIVE_EXCLUDED).forEach(key => {
+                // CrossplayPlatforms renders as platform_* checkboxes, not one input.
+                const input = key === 'CrossplayPlatforms'
+                    ? document.querySelector('[id^="platform_"]')
+                    : document.getElementById(key);
+                const group = input && input.closest('.form-group');
+                if (group) group.classList.add('pw-live-hidden');
+            });
+        }
+
         // Initialize - set default values
         document.addEventListener('DOMContentLoaded', function() {
+            initLiveMode();
             // Initialize theme (dark mode as default)
             initializeTheme();
             

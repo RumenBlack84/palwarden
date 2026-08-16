@@ -36,7 +36,7 @@ join-info publishing.
 | `systemd/` | `*.service` / `*.timer` units for the server and its background jobs (installed to `/etc/systemd/system`). |
 | `needrestart/` | Hooks so unattended `apt` upgrades don't hard-restart the server outside the graceful flow. |
 | `config/` | `settings.env.example` (config template), `engine.env` (Engine.ini tuning state) and `backup.env` (world-save backup schedule). |
-| `webui/` | The control-plane dashboard plus client-side HTML editors for server settings and Engine.ini. |
+| `webui/` | The control-plane dashboard plus HTML editors for server settings and Engine.ini, both wired live to the server through the control plane. |
 | `docs/` | Architecture, per-tool reference, config guide, backlog, Docker roadmap, and the original export artifacts. |
 | `docker/` | All-in-one container image, compose stack, and s6 service definitions. |
 | `tests/` | Unit + docker integration test suites (`./tests/run.sh`). |
@@ -239,11 +239,12 @@ mapping is in [`CREDITS.md`](CREDITS.md):
   interface for our config-apply flow. Its prebuilt binary has since been
   replaced by our own Python implementation, so no third-party executable ships
   here.
-- **BlinkZer0/Palworld-Dedicated-Server-Config-Creator** (MIT) — vendored as
-  `webui/PalWorldSettingsEditor.html`, the one third-party file under `webui/`;
-  its MIT notice is retained at `webui/LICENSE.upstream-mit`. The Engine.ini
-  editor and the dashboard are first-party AGPL, with only the page shell and form
-  idiom of the former derived from that upstream.
+- **BlinkZer0/Palworld-Dedicated-Server-Config-Creator** (MIT) — forked as
+  `webui/PalWorldSettingsEditor.html` with the palwarden live control plane
+  integrated (see `CREDITS.md`); its MIT notice is retained at
+  `webui/LICENSE.upstream-mit`. The Engine.ini editor and the dashboard are
+  first-party AGPL, with only the page shell and form idiom of the former
+  derived from that upstream.
 
 Palworld is a trademark of Pocketpair. This tooling is unofficial and not
 affiliated with or endorsed by Pocketpair.
