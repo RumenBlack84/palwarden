@@ -692,6 +692,17 @@ done
 assert_file_contains "$PAGE" 'href="backups.html" aria-current="page"' \
   "the Backups page marks its own tab as current"
 
+# The dashboard's FPS card must read the field names palworld-fps actually
+# emits. The originals (low_1 / "1%_low") were guessed in a plan doc before the
+# sampler existed, and the lows silently showed n/a forever.
+for key in "low_1pct" "low_0_1pct"; do
+  assert_file_contains "$DASH" "$key" "the dashboard reads $key from /api/fps"
+  assert_file_contains "$REPO/sbin/palworld-fps" "\"$key\"" \
+    "palworld-fps emits $key (the name the dashboard reads)"
+done
+assert_file_not_contains "$DASH" '1%_low' \
+  "the dashboard no longer reads the guessed 1%_low key"
+
 # the four actions this page is allowed to enqueue, and no other
 for action in "'backup'" "'backup_import'" "'backup_restore'" "'backup_delete'" \
               "'backup_schedule_save'"; do
