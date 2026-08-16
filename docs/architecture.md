@@ -140,6 +140,33 @@ Two things this split deliberately does *not* do:
   unprivileged web user on purpose, because that user is the one writing job
   files; root only reads and updates them. Root ownership breaks every button.
 
+### The settings editor
+
+`webui/PalWorldSettingsEditor.html` is a fork of the MIT upstream settings
+editor (see `CREDITS.md`) with the live control plane integrated directly into
+the page — the full ~90-field form gained **Load Live Config**, which fills the
+form from `GET /current/PalWorldSettings.ini`, and save buttons that diff the
+form against that baseline and send only the *changed* keys as a
+`settings_save` (file-only) or `settings_save_apply_restart` (disruptive) job.
+Served over HTTP it is the live editor (fields the page can never save —
+passwords, the REST API keys, `CrossplayPlatforms` — are hidden); opened as a
+local file it remains upstream's offline generate/copy editor. jobd validates
+every key and value against the live config's own shapes using
+`palworld-config-parser`'s resolver/renderer — the exact code `config_apply`
+runs later — refuses the password keys (managed via `settings.env`) and the
+REST API keys (the control plane's own lifeline), and merge-writes
+`PALWORLD_SETTINGS_OVERRIDES` (`/etc/palworld/settings-overrides.env` on bare
+metal, `/var/lib/palworld/settings-overrides.env` in the container — on the
+`palwarden-state` volume for the same reason the backup schedule is).
+`palworld-config-apply-env` applies that file in a second parser pass after
+`settings.env`, on every apply including the container's boot-time one: a value
+saved in the browser wins over its `PALWORLD_CFG_*` variable and is re-asserted
+on every start, while an untouched key stays owned by whatever set it. The
+disruptive composite applies **inside the restart window**
+(`palworld-graceful-restart --apply-config`), after the server has fully
+stopped — the game rewrites its config from memory as it exits, so an apply
+against a running server is silently clobbered.
+
 ### The backup panel
 
 `webui/backups.html` is the same control plane applied to world saves: list,
