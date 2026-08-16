@@ -8,6 +8,11 @@ source /usr/local/lib/palworld-notify 2>/dev/null || true
 declare -F palworld_notify >/dev/null || palworld_notify() { :; }
 # Paths default to the bare-metal layout; overrides exist for the container/tests.
 config_env="${PALWORLD_SETTINGS_ENV:-/etc/palworld/settings.env}"
+# UI-saved settings from the web editor (written by palwarden-jobd's
+# settings_save). Applied *after* settings.env so a value saved in the browser
+# wins over a PALWORLD_CFG_* variable; absent on hosts that never used the
+# editor, and that is the normal case, not an error.
+overrides_env="${PALWORLD_SETTINGS_OVERRIDES:-/etc/palworld/settings-overrides.env}"
 server_dir="${PALWORLD_SERVER_DIR:-/opt/palworld/server}"
 config_file="${PALWORLD_CONFIG_FILE:-$server_dir/Pal/Saved/Config/LinuxServer/PalWorldSettings.ini}"
 backup_dir="${PALWORLD_BACKUP_DIR:-/opt/palworld/config-backups}"
@@ -36,6 +41,11 @@ chown "$PALWORLD_USER:$PALWORLD_GROUP" "$backup"
 # Apply every setting (including passwords) in one pass. The parser redacts
 # secret values in its own output, so no log scrubbing is needed here.
 "$parser_bin" --config "$config_file" --env-file "$config_env"
+# Then the web editor's overrides, so they win. One backup and one diff cover
+# both passes: the backup above was taken before either file touched the config.
+if [[ -r "$overrides_env" ]]; then
+  "$parser_bin" --config "$config_file" --env-file "$overrides_env"
+fi
 chown "$PALWORLD_USER:$PALWORLD_GROUP" "$config_file"
 chmod 0644 "$config_file"
 /usr/local/sbin/palworld-config-pretty >/dev/null 2>&1 || true
