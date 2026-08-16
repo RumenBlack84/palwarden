@@ -20,16 +20,12 @@
 
   .pw-page { padding: var(--pw-space-4); }
 
-  /* pw-banner: the nameplate + vitals readout, the signature element. */
-  .pw-banner { background: var(--pw-surface); border: 1px solid var(--pw-border);
-               border-radius: 8px; padding: var(--pw-space-4); margin-bottom: var(--pw-space-4); }
-  .pw-banner__name { display: flex; align-items: baseline; gap: var(--pw-space-3);
-                      flex-wrap: wrap; }
-  .pw-banner__name h1 { font-family: var(--pw-mono); font-size: 2.2rem; font-weight: 600;
-                         margin: 0; letter-spacing: -.01em; }
-  .pw-banner__meta { margin: var(--pw-space-2) 0 0; color: var(--pw-fg-muted);
-                      font-size: .85rem; }
+  /* pw-banner: the nameplate + vitals readout. Visually a shared .pw-section
+     tile like every other block on the page — just permanently open (a static
+     header, no disclosure), because the nameplate is the page's centerpiece. */
+  .pw-banner__meta { margin: 0; font-size: .85rem; }
   .pw-banner__meta span { font-family: var(--pw-mono); }
+  .pw-banner .pw-vitals { margin-top: var(--pw-space-3); }
 
   /* pw-vitals: four large-numeral readout cells. */
   .pw-vitals { display: grid; grid-template-columns: repeat(4, 1fr);
@@ -79,7 +75,6 @@
     .pw-vitals { grid-template-columns: 1fr; }
     .pw-vitals__cell { border-top: none; border-left: 2px solid var(--pw-border);
                         padding-top: 0; padding-left: var(--pw-space-2); }
-    .pw-banner__name h1 { font-size: 1.6rem; }
   }
   @media (prefers-reduced-motion: reduce) {
     * { transition: none !important; animation: none !important; }
@@ -100,11 +95,13 @@
   <button class="pw-sidebar__item" id="pw-sidebar-toggle" type="button" title="Collapse sidebar" aria-expanded="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg><span class="pw-sidebar__label">Collapse</span></button>
 </nav>
   <div class="pw-page">
-    <section class="pw-banner">
-      <div class="pw-banner__name">
+    <section class="pw-banner pw-section pw-section--indigo">
+      <div class="pw-section__header pw-section__header--static">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="7" rx="1"/><rect x="3" y="13" width="18" height="7" rx="1"/><line x1="7" y1="7.5" x2="7" y2="7.5"/><line x1="7" y1="16.5" x2="7" y2="16.5"/></svg>
         <h1 id="server-name">palwarden</h1>
         <span class="pw-pill pw-pill--idle" id="server-pill">UNKNOWN</span>
       </div>
+      <div class="pw-section__content">
       <p class="pw-banner__meta" id="server-meta">version — · pid —</p>
       <div class="pw-vitals" id="vitals">
         <div class="pw-vitals__cell">
@@ -124,6 +121,7 @@
           <span class="pw-vitals__label">Engine drift</span>
           <span class="pw-vitals__value" id="vital-drift">—</span>
         </div>
+      </div>
       </div>
     </section>
 

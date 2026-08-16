@@ -201,7 +201,7 @@ body.pw-with-sidebar.pw-sidebar-collapsed { padding-left: calc(var(--pw-sidebar-
 /* Grid items stretch to the row's tallest sibling by default, so a collapsed
    section would keep its full height as an empty box. Open sections keep the
    equal-height rows; a collapsed one shrinks to its title bar. */
-.pw-grid > .pw-section:not([open]) { align-self: start; }
+.pw-grid > details.pw-section:not([open]) { align-self: start; }
 .pw-section > .pw-section__header {
   background: var(--bg-tertiary);
   padding: 13px 18px;
@@ -225,8 +225,13 @@ body.pw-with-sidebar.pw-sidebar-collapsed { padding-left: calc(var(--pw-sidebar-
   font-size: 0.75em;
   transition: transform 0.3s ease;
 }
-.pw-section:not([open]) > .pw-section__header::after { transform: rotate(-90deg); }
-.pw-section:not([open]) > .pw-section__header { border-bottom: none; }
+details.pw-section:not([open]) > .pw-section__header::after { transform: rotate(-90deg); }
+details.pw-section:not([open]) > .pw-section__header { border-bottom: none; }
+/* A static (always-open) section: same title bar, no disclosure affordance.
+   For tiles that must never collapse, like the dashboard nameplate. */
+.pw-section__header--static { cursor: default; }
+.pw-section__header--static::after { content: none; }
+.pw-section__header h1,
 .pw-section__header h2 {
   margin: 0;
   font: inherit;
