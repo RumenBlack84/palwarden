@@ -11,6 +11,8 @@ empty_wait=15
 message="Server maintenance: saving and restarting in 5 minutes."
 empty_message="Server maintenance: no players are online; saving and restarting shortly."
 startup_timeout=180
+apply_config=0
+apply_engine=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --wait|-w) waittime="$2"; shift 2 ;;
@@ -18,9 +20,48 @@ while [[ $# -gt 0 ]]; do
     --message|-m) message="$2"; shift 2 ;;
     --empty-message) empty_message="$2"; shift 2 ;;
     --startup-timeout) startup_timeout="$2"; shift 2 ;;
-    *) echo "Usage: $0 [--wait seconds] [--empty-wait seconds] [--message text] [--empty-message text] [--startup-timeout seconds]" >&2; exit 64 ;;
+    --apply-config) apply_config=1; shift ;;
+    --apply-engine) apply_engine=1; shift ;;
+    *) echo "Usage: $0 [--wait seconds] [--empty-wait seconds] [--message text] [--empty-message text] [--startup-timeout seconds] [--apply-config] [--apply-engine]" >&2; exit 64 ;;
   esac
 done
+
+# --apply-config / --apply-engine run the corresponding apply tool in the one
+# window where it is safe: after the server has fully stopped and before it is
+# started again. Editing the live config while the game runs is lost work — the
+# server rewrites its config files from memory as it exits, so an apply that
+# lands mid-shutdown is silently clobbered within the same second (observed on
+# v1.0.3.101283; the file carried the applied values for a fraction of a second
+# and the game's own exit write put the old ones back). Fixed flags rather than
+# a generic --pre-start command: the callers include palwarden-jobd, whose
+# security model is fixed argv templates with no arbitrary-command slot.
+#
+# Failures never leave the server down: the apply's exit code is recorded and
+# the start still happens, then the script exits nonzero so the caller (a jobd
+# composite the operator is watching) sees the apply itself failed.
+apply_bin="${PALWORLD_APPLY_BIN:-/usr/local/sbin/palworld-config-apply-env}"
+engine_bin="${PALWARDEN_ENGINE_CONFIG_BIN:-/usr/local/sbin/palworld-engine-config}"
+apply_rc=0
+run_applies() {
+  if (( apply_config )); then
+    if "$apply_bin"; then
+      echo "applied settings while the server was stopped."
+    else
+      apply_rc=1
+      palworld_notify error "config apply failed while the server was stopped; starting the server anyway."
+      echo "config apply failed (server will still be started)" >&2
+    fi
+  fi
+  if (( apply_engine )); then
+    if "$engine_bin" apply; then
+      echo "applied Engine.ini while the server was stopped."
+    else
+      apply_rc=1
+      palworld_notify error "Engine.ini apply failed while the server was stopped; starting the server anyway."
+      echo "Engine.ini apply failed (server will still be started)" >&2
+    fi
+  fi
+}
 
 # In-container: the server is an s6 longrun, and its stop handler already
 # forwards SIGINT so the world saves. A graceful restart is therefore an s6
@@ -33,8 +74,10 @@ if [[ "${PALWARDEN_CONTAINER:-0}" == "1" ]]; then
   palworld_notify start "graceful restart requested (container); restarting the server service (SIGINT save)."
   /usr/local/sbin/palworld-fps mark "graceful restart requested" --category restart --details "container s6 restart" >/dev/null 2>&1 || true
   # Bring the service down (s6 sends the service's down-signal = SIGINT, so the
-  # world saves), wait until it's fully down, then bring it back up.
+  # world saves), wait until it's fully down, run any requested config applies
+  # while nothing can rewrite the files, then bring it back up.
   s6-svc -wD -T $(( startup_timeout * 1000 )) -d "$svcdir" || true
+  run_applies
   s6-svc -u "$svcdir"
   # Only wait for REST readiness when the API is actually configured. palworld-api
   # exits 2 for "not enabled / no ADMIN_PASSWORD", which waiting cannot fix — and
@@ -45,21 +88,21 @@ if [[ "${PALWARDEN_CONTAINER:-0}" == "1" ]]; then
     palworld_notify success "server service restarted (container); REST API not configured, so readiness was not checked."
     echo "server service restarted; REST API not configured (skipped readiness check)."
     /usr/local/sbin/palworld-fps mark "graceful restart completed" --category restart --details "container s6 restart; REST not configured" >/dev/null 2>&1 || true
-    exit 0
+    exit "$apply_rc"
   fi
   deadline=$((SECONDS + startup_timeout))
   until sudo "$api_bin" info >/dev/null 2>&1; do
     if (( SECONDS >= deadline )); then
       palworld_notify warning "server restart issued, but REST API not ready within ${startup_timeout}s."
       echo "REST API not ready within ${startup_timeout}s after restart" >&2
-      exit 0
+      exit "$apply_rc"
     fi
     sleep 3
   done
   palworld_notify success "server service restarted (container); REST API healthy."
   echo "server service restarted; REST API healthy."
   /usr/local/sbin/palworld-fps mark "graceful restart completed" --category restart --details "container s6 restart" >/dev/null 2>&1 || true
-  exit 0
+  exit "$apply_rc"
 fi
 
 selected_wait="$waittime"
@@ -82,6 +125,10 @@ fi
 palworld_notify start "graceful restart requested; ${player_context}; saving, stopping, then starting palworld.service again."
 /usr/local/sbin/palworld-fps mark "graceful restart requested" --category restart --details "wait=${selected_wait}s; message=${selected_message}; ${player_context}" >/dev/null 2>&1 || true
 /usr/local/sbin/palworld-graceful-stop --wait "$selected_wait" --message "$selected_message"
+
+# The server is stopped: the only window where a config apply cannot be
+# clobbered by the game's own exit-time rewrite (see run_applies above).
+run_applies
 
 palworld_notify start "palworld.service is stopped; starting server now."
 sudo systemctl start palworld.service
@@ -121,7 +168,7 @@ while true; do
     printf '%s\n' "$api_output" >&2
     /usr/local/sbin/palworld-fps mark "graceful restart completed" --category restart --details "REST not configured" >/dev/null 2>&1 || true
     systemctl is-active palworld.service
-    exit 0
+    exit "$apply_rc"
   fi
   if (( SECONDS >= api_deadline )); then
     palworld_notify error "restart warning: palworld.service is active, but REST API did not become ready within ${startup_timeout}s. Last API check: ${api_output}"
@@ -138,3 +185,4 @@ palworld_notify success "server is back up after graceful restart; REST API heal
 /usr/local/sbin/palworld-fps mark "graceful restart completed" --category restart --details "server=${servername}; version=${version}" >/dev/null 2>&1 || true
 printf '%s\n' "$api_output"
 systemctl is-active palworld.service
+exit "$apply_rc"
