@@ -246,12 +246,16 @@ async function refresh() {
     const err = payloadError(f);
     if (err) throw new Error(err);
     const w = ((f.data || {}).windows || {})["24h"] || {};
+    // palworld-fps emits raw floats (avg, low_1pct, low_0_1pct); one decimal
+    // matches its own text output, and null (empty window) stays "n/a".
+    const fps1 = (v) => (typeof v === "number" ? v.toFixed(1) : "n/a");
     put("fps", [
-      ["avg (24h)", w.avg ?? "n/a"],
-      ["1% low", w.low_1 ?? w["1%_low"] ?? "n/a"],
+      ["avg (24h)", fps1(w.avg)],
+      ["1% low", fps1(w.low_1pct)],
+      ["0.1% low", fps1(w.low_0_1pct)],
       ["samples", w.samples ?? "n/a"],
     ]);
-    vital("fps", w.avg ?? "n/a");
+    vital("fps", fps1(w.avg));
   } catch (e) { putEmpty("fps", String(e && e.message || e)); vital("fps", "n/a"); }
 
   try {
