@@ -194,14 +194,12 @@ assert_file_contains "$REAL_ROOT/palwarden.html" "pw-card" "uses the card compon
 assert_file_contains "$REAL_ROOT/palwarden.html" "pw-pill--ok" "uses state pills"
 # it must not ship a hardcoded credential
 assert_file_not_contains "$REAL_ROOT/palwarden.html" "WEBUI_PASSWORD" "no credential baked into the page"
-# and the vendored editor must remain byte-identical, so upstream syncs stay
-# trivial and the MIT attribution stays clean. Only PalWorldSettingsEditor.html
-# is genuinely vendored; EngineIniPerformanceEditor.html is first-party (it
-# references engine.env, palworld-engine-config and current/Engine.ini, none of
-# which exist upstream) and carries our own SPDX header, so it is deliberately
-# NOT pinned here — it owns the control-plane Save buttons. See the design spec,
-# "Editing Engine.ini from the browser", and tests/unit/test_webui_jobs.sh.
-assert_rc 0 git -C "$DIR/../.." diff --quiet -- webui/PalWorldSettingsEditor.html
+# PalWorldSettingsEditor.html was pinned byte-identical to upstream here for a
+# while; it is now a deliberate FORK (2026-08, upstream is not tracked) carrying
+# the live control plane, so the pin is gone. What must survive the fork is the
+# upstream attribution — the MIT notice pointer stays in the file's header.
+assert_file_contains "$DIR/../../webui/PalWorldSettingsEditor.html" "LICENSE.upstream-mit" \
+  "the forked settings editor keeps its upstream MIT attribution"
 
 # --- payloadError() handles the API's {ok: false} convention ---------------
 # The API reports tool failures as HTTP 200 with {ok: false, error: "..."} so
