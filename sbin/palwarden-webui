@@ -45,6 +45,7 @@ import secrets
 import socketserver
 import subprocess
 import sys
+import tempfile
 import urllib.parse
 from pathlib import Path
 
@@ -94,6 +95,12 @@ UPLOAD_DIR = Path(os.environ.get("PALWARDEN_UPLOAD_DIR", "/var/lib/palworld/uplo
 SECRET_KEYS = {"adminpassword", "serverpassword"}
 # Windows palworld-fps accepts for `report --window`.
 FPS_REPORT_WINDOWS = {"5m", "60m", "24h", "7d"}
+# Windows the graph endpoint will render. `palworld-fps graph` itself takes any
+# duration; this allowlist is the network-facing boundary (never pass an
+# unvetted string to a tool), and it doubles as a load cap — each render is a
+# matplotlib subprocess, so the set of distinct graphs a caller can demand
+# stays small and enumerable.
+FPS_GRAPH_WINDOWS = {"1h", "4h", "12h", "24h", "7d"}
 WINDOW_RE = re.compile(r"^\d{1,4}[mhd]$")
 REALM = "palwarden"
 
@@ -590,6 +597,34 @@ def ep_fps(query: dict) -> dict:
     window = pick_window(query, "24h", FPS_REPORT_WINDOWS)
     return run_tool_json([str(SBIN / "palworld-fps"), "report", "--json",
                           "--no-live", "--window", window])
+
+
+def render_fps_graph(window: str, theme: str) -> tuple[bytes | None, str | None]:
+    """Render one FPS graph PNG: (png_bytes, None) or (None, why_not).
+
+    The tool writes into a private temp directory that is removed before this
+    returns — nothing accumulates on disk, and two concurrent requests can
+    never hand each other a half-written file. 60 s, not run_tool's default
+    30: each render is a fresh python importing matplotlib, and the 7d window
+    plots ~7000 points on a machine that is also running the game server.
+    """
+    with tempfile.TemporaryDirectory(prefix="palwarden-fps-graph-") as td:
+        out = Path(td) / f"fps-{window}.png"
+        result = run_tool([str(SBIN / "palworld-fps"), "graph",
+                           "--window", window, "--theme", theme,
+                           "--output", str(out)], timeout=60)
+        if not result["ok"]:
+            return None, result["error"]
+        if result["returncode"] != 0:
+            # The common case is a fresh install: "no successful FPS samples
+            # for window …". Pass the tool's own words through; the page shows
+            # them in place of the image.
+            detail = result["stderr"].strip() or f"exit {result['returncode']}"
+            return None, detail
+        try:
+            return out.read_bytes(), None
+        except OSError as exc:
+            return None, f"graph was not written: {exc}"
 
 
 def ep_events(query: dict) -> dict:
@@ -1178,6 +1213,35 @@ class Handler(http.server.BaseHTTPRequestHandler):
         finally:
             os.close(fd)
 
+    def _send_fps_graph(self, query: dict) -> None:
+        """GET /api/fps/graph?window=1h: the Discord FPS graph, as a PNG.
+
+        Not a READ_ENDPOINTS entry for the same reason as the archive download:
+        those are `(query) -> dict` JSON wrappers, and this response is bytes.
+        A failure, though, IS answered in the house JSON shape (200 with
+        ok:false, like every read endpoint) — the page distinguishes the two by
+        Content-Type, and "no samples yet" on a fresh install is a fact to
+        display, not an HTTP error.
+        """
+        window = pick_window(query, "1h", FPS_GRAPH_WINDOWS)
+        # Same rule as the window: an allowlisted value or the default, never
+        # the caller's string. The page sends its body[data-theme].
+        theme = (query.get("theme") or ["light"])[0]
+        if theme not in ("light", "dark"):
+            theme = "light"
+        png, error = render_fps_graph(window, theme)
+        if png is None:
+            self._send_json(200, {"ok": False, "error": error})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(png)))
+        # no-store: the whole point of the page's dropdown is a current view,
+        # and each render is stamped with its generation time anyway.
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(png)
+
     def _enqueue(self) -> None:
         """POST /api/jobs: validate, then write a job file. Nothing else, ever."""
         # Basic auth is already established by the caller. It is not enough on
@@ -1292,6 +1356,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self._send_jobs(parsed.path)
                 except CLIENT_GONE as exc:
                     self._note_client_gone("answering the job API", exc)
+                except Exception as exc:  # never leak a traceback to the browser
+                    self._send_json_safely(
+                        500, {"ok": False, "error": f"internal error: {exc}"})
+                return
+            if parsed.path == "/api/fps/graph":
+                try:
+                    self._send_fps_graph(urllib.parse.parse_qs(parsed.query))
+                except CLIENT_GONE as exc:
+                    self._note_client_gone("sending the FPS graph", exc)
                 except Exception as exc:  # never leak a traceback to the browser
                     self._send_json_safely(
                         500, {"ok": False, "error": f"internal error: {exc}"})

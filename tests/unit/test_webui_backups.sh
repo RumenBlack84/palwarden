@@ -703,6 +703,22 @@ done
 assert_file_not_contains "$DASH" '1%_low' \
   "the dashboard no longer reads the guessed 1%_low key"
 
+# The performance graph tile: its dropdown must offer exactly the windows the
+# server's FPS_GRAPH_WINDOWS allowlist will render (anything else silently
+# falls back server-side, which would make the dropdown lie), defaulting to
+# the last hour.
+for win in "1h" "4h" "12h" "24h" "7d"; do
+  assert_file_contains "$DASH" "value=\"$win\"" "the graph dropdown offers $win"
+  assert_file_contains "$REPO/sbin/palwarden-webui" "\"$win\"" \
+    "the webui graph allowlist accepts $win"
+done
+assert_file_contains "$DASH" 'value="1h" selected' "the graph defaults to the last hour"
+assert_file_contains "$DASH" "/api/fps/graph" "the graph is fetched from the graph endpoint"
+assert_file_contains "$DASH" "encodeURIComponent" "the picked window is URL-encoded"
+assert_file_contains "$DASH" 'theme=' "the graph request carries the page theme"
+assert_file_contains "$DASH" 'attributeFilter: ["data-theme"]' \
+  "a theme flip re-renders the graph"
+
 # the four actions this page is allowed to enqueue, and no other
 for action in "'backup'" "'backup_import'" "'backup_restore'" "'backup_delete'" \
               "'backup_schedule_save'"; do
