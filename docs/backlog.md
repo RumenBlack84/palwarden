@@ -177,7 +177,89 @@ Purpose:
 - Correlate crashes/restarts with FPS drops and config changes.
 - Feed daily health report.
 
+## 9. Per-player stats board (save-derived)
+
+Recorded: 2026-08-16. Grow the Players tab (shipped with presence tracking —
+see `docs/superpowers/specs/2026-08-16-player-presence-design.md`) into a full
+stats board using the save files themselves.
+
+What the saves hold per player (verified against the production world,
+2026-08-16, game v1.0.x):
+
+- `Players/<uid>.sav`: appearance (full character-creator state), quest and
+  recipe progress, and `RecordData` — an itemized activity ledger: every item
+  ever crafted with counts, captures per pal species, paldeck unlocks, fish
+  per species, dungeons/towers cleared, NPC talk counts, fast-travel unlocks,
+  camps conquered. A genuine playstyle fingerprint.
+- `Level.sav` character blobs: nickname, level, exp, HP; pal ownership counts.
+- NOT in any save: playtime (that is why presence tracking exists), SteamIDs
+  (presence captures those from the REST players call).
+
+Implementation notes, learned the hard way:
+
+- Saves are **PlM magic = Oodle-compressed** (since ~0.6). Pure-python
+  `palworld-save-tools` (MIT) parses the GVAS but needs `pyooz` (PyPI wheel)
+  for decompression — the increment's one new dependency (verify license
+  before vendoring anything). The upstream tool lags the game: v1.0 saves
+  needed a hand-patched `SetProperty` reader, and the guild-blob decoder is
+  broken upstream. Any parser we ship must degrade per-field, not crash.
+- Player `.sav` files parse in well under a second. The full `Level.sav` is
+  ~100 MB decompressed and takes minutes + ~700 MB RAM in pure python —
+  never do that on the game host per request. The needed character blobs are
+  findable by scanning the decompressed bytes and parsing only those (~seconds).
+- Read copies, never the live files: the game rewrites saves on autosave and
+  at exit. Copy, check the header, retry on a torn read.
+- Shape: a `palworld-player-stats` tool producing a JSON snapshot on an
+  mtime-based cache, a read endpoint, and the Players page rendering the
+  extra sections per card. Data freshness = last autosave.
+
+## 10. Discord milestone announcements
+
+Recorded: 2026-08-16. A periodic job diffs successive save-derived snapshots
+(item 9's reader) and announces transitions via the existing `palworld-notify`
+webhook: new tower boss defeated, level thresholds (50/60/70/max — not every
+level), first crafts of curated legendary items.
+
+Design constraints settled during feasibility review:
+
+- **Rollback safety is the hard requirement**: the announced-set must persist
+  independently of the snapshot (announce only never-before-announced
+  milestones), or restoring a backup replays weeks of achievements into
+  Discord when the flags regress and re-appear.
+- Latency is autosave interval + poll interval (~10–30 min after the fact);
+  set expectations rather than forcing saves.
+- Needs curated tables that are content work, not code work: tower-boss ID →
+  friendly name, and a legendary-item ID list (IDs shift across patches).
+- Levels come from the `Level.sav` character-blob scan; boss flags and craft
+  counts from the per-player `.sav` (`TowerBossDefeatFlag`,
+  `NormalBossDefeatFlag`, `CraftItemCount`).
+
+## 11. Player save export
+
+Recorded: 2026-08-16. Let a departing player take their character with them.
+The honest constraint: **a character is not contained in `Players/<uid>.sav`**
+— level, inventory contents, and owned pals live in `Level.sav`, so there are
+two tiers:
+
+- **Tier 1 (small):** a jobd export action that zips `Players/<uid>.sav` +
+  `_dps.sav` + a manifest, served through the same authenticated download
+  pattern as backup archives. The player grafts it into their own world with
+  the community character-transfer tools. Frame it as "your save files +
+  instructions", not "click to play single-player".
+- **Tier 2 (deep):** perform the surgery ourselves — extract the character
+  blob, owned pals, and inventory containers from `Level.sav` and inject them
+  into a fresh single-player world. Proven possible (community transfer
+  scripts do it) but it *writes* save data in a format that drifts every
+  game patch; a bug corrupts someone's exported character. Only attempt after
+  the item-9 reader has survived a couple of game updates unmodified.
+
 ## Prioritized next steps
 
 1. ~~Add crash/restart watchdog summary.~~ — done, see item 8.
 2. Consider wiring health report failures into alert-only notifications.
+3. Stats board (item 9) — first, it forces the save reader into existence
+   with zero risk (pure reads).
+4. Milestone announcements (item 10) — same reader plus a diff store and the
+   curated name tables.
+5. Export tier 1 (item 11) — cheap, any time; tier 2 waits for reader
+   maturity across game patches.
