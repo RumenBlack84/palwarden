@@ -134,6 +134,18 @@ assert_eq "$(q "SELECT COUNT(*) FROM player_sessions WHERE player_uid = 'EF576CE
 assert_eq "$(q "SELECT total_play_ms FROM player_identity WHERE player_uid = 'EF576CE7000000000000000000000000';")" "0" \
   "the new player's playtime starts at zero, not at the veteran's"
 
+# --- a loading player's placeholder playerId never becomes an identity ---------
+# While a player loads in, the REST API lists them with playerId "None"
+# (observed on v1.0.3; some builds send all zeros). Both must be skipped, or
+# every login funnels through one shared phantom identity keyed on the
+# placeholder.
+printf '{"players": [{"name": "SnaxRenamed", "playerId": "022E0173000000000000000000000000", "userId": "steam_76561198000000001", "level": 81}, {"name": "Tolbi", "playerId": "EF576CE7000000000000000000000000", "userId": "steam_76561198000000002", "level": 72}, {"name": "Grimnyr", "playerId": "None", "userId": "steam_76561198000000003", "level": 1}, {"name": "Bryli", "playerId": "00000000000000000000000000000000", "userId": "steam_76561198000000004", "level": 1}]}\n' > "$WORK/players.json"
+sample >/dev/null 2>&1
+assert_eq "$(q 'SELECT COUNT(*) FROM player_identity;')" "2" \
+  "placeholder playerIds (None / all zeros) create no identity"
+assert_eq "$(q "SELECT COUNT(*) FROM player_sessions WHERE player_uid IN ('None', '00000000000000000000000000000000');")" "0" \
+  "placeholder playerIds open no session"
+
 # --- ip / ping / location are never stored (spec: Deliberately not stored) -----
 schema="$(q "SELECT sql FROM sqlite_master WHERE name IN ('player_identity', 'player_sessions')")"
 for banned in ip ping location; do

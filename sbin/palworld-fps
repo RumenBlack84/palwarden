@@ -176,7 +176,12 @@ def record_presence(con: sqlite3.Connection, players: list[dict[str, Any]],
     seen = 0
     for player in players:
         uid = str(player.get("playerId") or "").strip()
-        if not uid:
+        # While a player is still loading in, the REST API lists them with the
+        # placeholder playerId "None" (observed on v1.0.3; some builds report
+        # all zeros instead) — a real sighting, but not an identity. Counting
+        # it would fold every player's loading screen into one shared phantom
+        # row, so skip it; their session starts once the real uid appears.
+        if not uid or uid == "None" or uid.strip("0") == "":
             continue
         seen += 1
         name = str(player.get("name") or "")
