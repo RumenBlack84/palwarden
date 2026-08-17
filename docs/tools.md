@@ -326,6 +326,17 @@ server's upload ceiling, not part of the schedule): an over-cap upload is answer
 still streaming a large file often sees only a transport error — the Backups page
 uses this number to refuse such a file before sending it, naming both sizes.
 
+`GET /api/fps/graph?window=1h&theme=dark` renders the same two-panel PNG
+`palworld-fps` posts to Discord and answers it as `image/png`
+(`Cache-Control: no-store`). `window` is allowlisted to `1h | 4h | 12h | 24h |
+7d` and `theme` to `light | dark` (anything else falls back to `1h` / `light`);
+the dashboard sends its own `body[data-theme]` and re-renders on a theme flip.
+Each request is a fresh `palworld-fps graph` subprocess, which is why
+the dashboard refreshes this on demand rather than on its 15 s loop. A failed
+render (typically "no successful FPS samples" on a fresh install) is answered in
+the house JSON shape, and the dashboard shows the tool's message in place of the
+image.
+
 `GET /api/backups/<name>/download` streams one archive
 (`Content-Type: application/gzip`, `Content-Disposition: attachment`,
 `Cache-Control: no-store`). Basic auth only — it is a read. The name must match
@@ -474,6 +485,7 @@ the container (both run it as root; see
 |------------|---------|
 | `sample [--retention-days N]` | Pull one FPS/player sample from the REST API and store it (driven by the 15s timer). Prunes old rows. |
 | `report [--window 24h] [--graph FILE.png]` | Text stats (avg / 1% low / 0.1% low, player avg/max) over a window; optional two-panel PNG (FPS + player count) with event markers. |
+| `graph --output FILE.png [--window 1h] [--theme light\|dark]` | Render only the PNG — no stats, no live REST fetch. The window is any duration (`1h`, `4h`, `12h`, …), not just the report presets, and `--theme dark` draws on the web UI's dark card surface (Discord keeps the light default); this is what `GET /api/fps/graph` shells out to. |
 | `discord [--window] [--dry-run]` | Post the report + graph to Discord. |
 | `mark TEXT --category C [--details ...]` | Add an operational event marker. |
 | `events [--window] [--json]` | List recent markers. |

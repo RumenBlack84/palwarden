@@ -498,8 +498,14 @@ def format_summary(summary: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def make_graph(con: sqlite3.Connection, output: Path, window: str) -> Path:
-    seconds = WINDOW_SECONDS[window]
+def make_graph(con: sqlite3.Connection, output: Path, window: str,
+               theme: str = "light") -> Path:
+    # Any parse_duration spelling works ("1h", "4h", "12h"), not only the
+    # WINDOW_SECONDS presets — the web UI's graph views need windows the
+    # summary tables never compute stats for.
+    seconds = parse_duration(window)
+    if seconds <= 0:
+        raise ValueError(f"window must be positive, got {window!r}")
     series = graph_series_for_window(con, seconds)
     if not series["good"]:
         raise RuntimeError(f"no successful FPS samples for window {window}")
@@ -507,8 +513,18 @@ def make_graph(con: sqlite3.Connection, output: Path, window: str) -> Path:
     import matplotlib
 
     matplotlib.use("Agg")
-    import matplotlib.dates as mdates
     import matplotlib.pyplot as plt
+
+    # Global process state, which is fine here: every render is its own
+    # subprocess. dark_background flips all the default colors (text, ticks,
+    # legend frames); the two facecolor overrides below then swap its pure
+    # black for the web UI's dark card surface. The data-series colors are
+    # explicit and bright enough for either background, so they stay put.
+    # Discord keeps the default light look — only the web UI asks for dark.
+    if theme == "dark":
+        plt.style.use("dark_background")
+
+    import matplotlib.dates as mdates
     from matplotlib.ticker import MaxNLocator
 
     fig, (ax, ax_players) = plt.subplots(
@@ -520,6 +536,12 @@ def make_graph(con: sqlite3.Connection, output: Path, window: str) -> Path:
         constrained_layout=True,
         gridspec_kw={"height_ratios": [3, 1]},
     )
+    if theme == "dark":
+        # The web UI's dark card surface (--bg-secondary), so the PNG sits
+        # flush in the tile instead of floating as a black rectangle.
+        fig.patch.set_facecolor("#1a202c")
+        ax.set_facecolor("#1a202c")
+        ax_players.set_facecolor("#1a202c")
     times = series["times"]
     fps = series["fps"]
     ax.plot(times, fps, label="serverfps", color="#3b82f6", linewidth=1.2)
@@ -557,9 +579,12 @@ def make_graph(con: sqlite3.Connection, output: Path, window: str) -> Path:
             ax.text(event_time, ax.get_ylim()[1], label, rotation=90, va="top", ha="right", fontsize=7, color="#fde68a")
     ax.legend(loc="lower left")
     ax_players.legend(loc="upper left")
-    if window in {"5m", "60m"}:
+    # Tick labels keyed off the duration, not the preset name, so arbitrary
+    # windows pick a sensible format: within a shift, time of day is enough;
+    # up to two days the date disambiguates midnight; beyond that, dates only.
+    if seconds <= 12 * 3600:
         ax_players.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
-    elif window == "24h":
+    elif seconds <= 48 * 3600:
         ax_players.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
     else:
         ax_players.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d"))
@@ -567,7 +592,10 @@ def make_graph(con: sqlite3.Connection, output: Path, window: str) -> Path:
     failures = sum(1 for r in series["rows"] if not r["ok"])
     fig.text(0.01, 0.01, f"samples={len(series['good'])} api_failures={failures} events={len(graph_events)} generated={datetime.now().astimezone().isoformat(timespec='seconds')}", fontsize=8)
     output.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output, format="png")
+    # facecolor explicitly from the figure: savefig otherwise uses the style's
+    # savefig.facecolor (pure black under dark_background), discarding the
+    # card-surface override above at the moment it matters.
+    fig.savefig(output, format="png", facecolor=fig.get_facecolor())
     plt.close(fig)
     return output
 
@@ -632,6 +660,19 @@ def report(args: argparse.Namespace) -> int:
     return 0
 
 
+def graph_only(args: argparse.Namespace) -> int:
+    """Render just the PNG — no summary, no live REST fetch.
+
+    This is the web UI's entry point: it wants the picture for an arbitrary
+    window and nothing else, and summarize() would recompute stats for every
+    preset window (plus hit the REST API) on each request for no reader.
+    """
+    con = connect(Path(args.db))
+    graph_path = make_graph(con, Path(args.output), args.window, theme=args.theme)
+    print(f"graph={graph_path}")
+    return 0
+
+
 def discord(args: argparse.Namespace) -> int:
     con = connect(Path(args.db))
     try:
@@ -676,6 +717,16 @@ def main() -> int:
     p_report.add_argument("--graph", help="PNG output path")
     p_report.add_argument("--window", choices=sorted(WINDOW_SECONDS), default="24h")
     p_report.set_defaults(func=report)
+
+    p_graph = sub.add_parser("graph", help="render only the FPS/players PNG for a window")
+    # Free-form on purpose (parse_duration spellings like 1h/4h/12h), unlike
+    # report/discord whose --window also names a stats preset. Callers that
+    # face the network (palwarden-webui) keep their own allowlist.
+    p_graph.add_argument("--window", default="1h", help="duration, e.g. 1h, 4h, 24h, 7d")
+    p_graph.add_argument("--output", required=True, help="PNG output path")
+    p_graph.add_argument("--theme", choices=["light", "dark"], default="light",
+                         help="palette for the rendered PNG (the web UI passes its own)")
+    p_graph.set_defaults(func=graph_only)
 
     p_discord = sub.add_parser("discord", help="post summary + graph to Discord webhook")
     p_discord.add_argument("--timeout", type=int, default=5)

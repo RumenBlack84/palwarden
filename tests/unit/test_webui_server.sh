@@ -31,6 +31,16 @@ EOF
 cat > "$WORK/sbin/palworld-fps" <<EOF
 #!/usr/bin/env bash
 echo "\$@" >> "$WORK/fps-argv.log"
+if [ "\${1:-}" = "graph" ]; then
+  out=""
+  while [ \$# -gt 0 ]; do
+    if [ "\$1" = "--output" ]; then out="\$2"; fi
+    shift
+  done
+  printf 'FAKE-PNG-BYTES' > "\$out"
+  echo "graph=\$out"
+  exit 0
+fi
 echo '{"windows":{"24h":{"avg":59.5}}}'
 EOF
 cat > "$WORK/sbin/palworld-service-events" <<'EOF'
@@ -117,6 +127,48 @@ assert_eq "$(code -u "$CREDS" "$U/api/fps?window=;rm%20-rf%20/")" "200" "hostile
 last_fps_argv="$(tail -n 1 "$WORK/fps-argv.log")"
 assert_contains "$last_fps_argv" "--window 24h" "hostile window becomes the sanitised fallback in the tool's argv"
 assert_not_contains "$last_fps_argv" "rm -rf" "hostile window string never reaches the tool"
+
+# --- the FPS graph endpoint --------------------------------------------------
+assert_eq "$(code "$U/api/fps/graph")" "401" "the graph requires auth"
+graph_hdrs="$(curl -s -u "$CREDS" -D - -o "$WORK/graph.out" "$U/api/fps/graph?window=4h")"
+assert_contains "$graph_hdrs" "image/png" "the graph is answered as a PNG"
+assert_contains "$graph_hdrs" "no-store" "the graph is never cached"
+assert_eq "$(cat "$WORK/graph.out")" "FAKE-PNG-BYTES" "the body is the tool's PNG bytes, verbatim"
+assert_contains "$(tail -n 1 "$WORK/fps-argv.log")" "graph --window 4h --theme light --output" \
+  "a picked window reaches the tool's graph subcommand"
+body -u "$CREDS" "$U/api/fps/graph" > /dev/null
+assert_contains "$(tail -n 1 "$WORK/fps-argv.log")" "--window 1h" \
+  "no window means the last hour, the page's default view"
+# The graph allowlist is its own, not FPS_REPORT_WINDOWS: 60m is a valid report
+# window but not a graph view, so it must fall back rather than leak through.
+body -u "$CREDS" "$U/api/fps/graph?window=60m" > /dev/null
+assert_contains "$(tail -n 1 "$WORK/fps-argv.log")" "--window 1h" \
+  "a report-only window falls back to the graph default"
+body -u "$CREDS" "$U/api/fps/graph?window=..%2f..%2fetc" > /dev/null
+assert_contains "$(tail -n 1 "$WORK/fps-argv.log")" "--window 1h" \
+  "a hostile window becomes the sanitised fallback"
+# The theme is allowlisted the same way: dark passes through, anything else
+# (including nothing) renders the light default.
+body -u "$CREDS" "$U/api/fps/graph?theme=dark" > /dev/null
+assert_contains "$(tail -n 1 "$WORK/fps-argv.log")" "--theme dark" \
+  "the page's dark theme reaches the tool"
+body -u "$CREDS" "$U/api/fps/graph?theme=blink" > /dev/null
+assert_contains "$(tail -n 1 "$WORK/fps-argv.log")" "--theme light" \
+  "an unknown theme falls back to light"
+# A failing render (fresh install: no samples yet) answers in the house JSON
+# shape with the tool's own words, not a broken image or a traceback.
+cp "$WORK/sbin/palworld-fps" "$WORK/fps-stub.bak"
+cat > "$WORK/sbin/palworld-fps" <<'EOF'
+#!/usr/bin/env bash
+echo "no successful FPS samples for window 1h" >&2
+exit 1
+EOF
+chmod +x "$WORK/sbin/palworld-fps"
+graph_fail="$(body -u "$CREDS" "$U/api/fps/graph")"
+assert_contains "$graph_fail" '"ok": false' "a failed render reports ok:false"
+assert_contains "$graph_fail" "no successful FPS samples" \
+  "the tool's own message is passed through to the page"
+cp "$WORK/fps-stub.bak" "$WORK/sbin/palworld-fps"
 
 # a tool that exits non-zero with empty stdout must surface as ok:false, not a
 # silently-successful empty payload (the dashboard's error path depends on this

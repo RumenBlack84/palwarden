@@ -55,6 +55,16 @@
      collapsible boxes); only the grid placement is this page's business. */
   .pw-card { grid-column: span 2; }
   .pw-card--wide { grid-column: span 3; }
+  .pw-card--full { grid-column: span 6; }
+
+  /* pw-graph: the rendered FPS/players PNG and its window picker. */
+  .pw-graph__controls { display: flex; align-items: center; gap: var(--pw-space-2);
+                        margin-bottom: var(--pw-space-3); }
+  .pw-graph__controls label { color: var(--pw-fg-muted); }
+  .pw-graph__controls select { background: var(--pw-bg); color: var(--pw-fg);
+                               border: 1px solid var(--pw-border); border-radius: 6px;
+                               padding: var(--pw-space-1) var(--pw-space-2); font: inherit; }
+  .pw-graph__img { display: block; width: 100%; height: auto; border-radius: 6px; }
 
   /* pw-stats: label/value grid. Labels are prose, values are monospace. */
   .pw-stats { display: grid; grid-template-columns: auto 1fr;
@@ -69,7 +79,7 @@
   @media (max-width: 900px) {
     .pw-vitals { grid-template-columns: repeat(2, 1fr); }
     .pw-grid { grid-template-columns: 1fr; }
-    .pw-card, .pw-card--wide { grid-column: span 1; }
+    .pw-card, .pw-card--wide, .pw-card--full { grid-column: span 1; }
   }
   @media (max-width: 480px) {
     .pw-vitals { grid-template-columns: 1fr; }
@@ -128,6 +138,20 @@
     <div class="pw-grid">
       <details class="pw-card pw-card--wide pw-section pw-section--indigo" open><summary class="pw-section__header"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 14a8 8 0 1 1 16 0"/><path d="M12 14l4-4"/><path d="M6 20h12"/></svg><h2>Performance</h2></summary><div class="pw-section__content"><dl class="pw-stats" id="fps"></dl></div></details>
       <details class="pw-card pw-card--wide pw-section pw-section--red" open><summary class="pw-section__header"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.34-5.66"/><path d="M20 4v4h-4"/></svg><h2>Restarts &amp; outages</h2></summary><div class="pw-section__content"><dl class="pw-stats" id="events"></dl></div></details>
+      <details class="pw-card pw-card--full pw-section pw-section--blue" open><summary class="pw-section__header"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3v18h18"/><path d="M6 15l4-5 3 3 5-7"/></svg><h2>Performance graph</h2></summary><div class="pw-section__content">
+        <div class="pw-graph__controls">
+          <label for="fps-graph-window">Window</label>
+          <select id="fps-graph-window">
+            <option value="1h" selected>Last hour</option>
+            <option value="4h">Last 4 hours</option>
+            <option value="12h">Last 12 hours</option>
+            <option value="24h">Last 24 hours</option>
+            <option value="7d">Full week</option>
+          </select>
+        </div>
+        <p class="pw-empty" id="fps-graph-status">…</p>
+        <img class="pw-graph__img" id="fps-graph" alt="Server FPS and player count over the selected window" hidden>
+      </div></details>
       <details class="pw-card pw-section pw-section--purple" open><summary class="pw-section__header"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 2 4.5 13.5H11L9.5 22 18 10.5h-6.5L13 2z"/></svg><h2>Engine.ini</h2></summary><div class="pw-section__content"><pre class="pw-log" id="engine" aria-live="polite">…</pre></div></details>
       <details class="pw-card pw-section pw-section--teal" open><summary class="pw-section__header"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="5" rx="1"/><path d="M5 9v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V9"/><path d="M10 13h4"/></svg><h2>Backups</h2></summary><div class="pw-section__content"><pre class="pw-log" id="backups" aria-live="polite">…</pre></div></details>
       <details class="pw-card pw-section pw-section--gold" open><summary class="pw-section__header"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l9 5-9 5-9-5 9-5z"/><path d="M3 13l9 5 9-5"/></svg><h2>Snapshots</h2></summary><div class="pw-section__content"><pre class="pw-log" id="snapshots" aria-live="polite">…</pre></div></details>
@@ -350,8 +374,59 @@ async function pollJobs(attempt) {
   }
 }
 
+// --- performance graph -------------------------------------------------------
+// The same PNG palworld-fps posts to Discord, rendered on demand for the window
+// picked in the dropdown. Fetched as a blob rather than pointed at with an
+// <img src>: a failure comes back as JSON ({ok:false, error: "..."}), and the
+// tool's message ("no successful FPS samples...") belongs in the page, not
+// behind a broken-image icon. Deliberately NOT part of refresh()'s 15 s loop —
+// every render is a matplotlib subprocess on the game server's machine.
+const GRAPH_REFRESH_MS = 5 * 60 * 1000;
+let graphEpoch = 0;
+
+async function loadGraph() {
+  const epoch = ++graphEpoch; // a slow response must not overwrite a newer pick
+  const win = document.getElementById("fps-graph-window").value;
+  const img = document.getElementById("fps-graph");
+  const status = document.getElementById("fps-graph-status");
+  status.hidden = false;
+  status.textContent = "Rendering graph…";
+  try {
+    // The render matches the page: matplotlib has no CSS variables, so the
+    // server is told which palette to draw with.
+    const theme = document.body.dataset.theme === "dark" ? "dark" : "light";
+    const res = await fetch("/api/fps/graph?window=" + encodeURIComponent(win)
+                            + "&theme=" + theme);
+    if (!res.ok) throw new Error("/api/fps/graph -> HTTP " + res.status);
+    const type = res.headers.get("Content-Type") || "";
+    if (!type.startsWith("image/png")) {
+      throw new Error(payloadError(await res.json()) || "no graph available");
+    }
+    const blob = await res.blob();
+    if (epoch !== graphEpoch) return;
+    const previous = img.src;
+    img.src = URL.createObjectURL(blob);
+    img.hidden = false;
+    status.hidden = true;
+    if (previous) URL.revokeObjectURL(previous);
+  } catch (e) {
+    if (epoch !== graphEpoch) return;
+    status.hidden = false;
+    status.textContent = String(e && e.message || e);
+  }
+}
+
+document.getElementById("fps-graph-window").addEventListener("change", loadGraph);
+// Theme flips re-render the graph so it never sits as a white slab on a dark
+// page (or vice versa). Observed via body[data-theme] rather than the toggle
+// button, so this keeps working however palwarden-ui.js chooses to switch it.
+new MutationObserver(loadGraph)
+  .observe(document.body, { attributes: true, attributeFilter: ["data-theme"] });
+
 refresh();
 setInterval(refresh, 15000);
+loadGraph();
+setInterval(loadGraph, GRAPH_REFRESH_MS);
 pollJobs();
 </script>
 </body>
