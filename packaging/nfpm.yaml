@@ -1,0 +1,136 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Brian Grant
+#
+# nfpm packaging manifest — one source of truth for .deb, .rpm and Arch
+# packages. Build with (see packaging/README.md):
+#
+#   VERSION=0.1.0 nfpm package -f packaging/nfpm.yaml -p deb       -t dist/
+#   VERSION=0.1.0 nfpm package -f packaging/nfpm.yaml -p rpm       -t dist/
+#   VERSION=0.1.0 nfpm package -f packaging/nfpm.yaml -p archlinux -t dist/
+#
+# Paths mirror install.sh exactly (including /usr/local — the scripts and
+# units hardcode it, and moving them is a separate refactor). Directory
+# ownership and the service account are NOT baked into the payload: they are
+# declared in the sysusers.d/tmpfiles.d files shipped below and applied by
+# the postinstall script, then re-enforced by systemd on every boot.
+
+name: palwarden
+arch: all
+platform: linux
+version: ${VERSION}
+maintainer: Brian Grant <bgrant@example.invalid>
+description: |
+  Operational tooling for a Palworld dedicated server: systemd units,
+  graceful save-aware restarts, config management, scheduled backups,
+  telemetry and a web control panel.
+vendor: palwarden
+homepage: https://github.com/RumenBlack84/palwarden
+license: AGPL-3.0-or-later
+
+depends:
+  - bash
+  - python3
+overrides:
+  deb:
+    recommends:
+      - needrestart
+  archlinux:
+    depends:
+      - bash
+      - python
+
+contents:
+  # 1. Operational scripts, helper binary, libraries (install.sh step 1).
+  - src: sbin/*
+    dst: /usr/local/sbin/
+    file_info:
+      mode: 0755
+  - src: bin/palworld-config-parser
+    dst: /usr/local/bin/palworld-config-parser
+    file_info:
+      mode: 0755
+  - src: lib/*
+    dst: /usr/local/lib/
+    file_info:
+      mode: 0755
+
+  # 2. systemd units and timers. /usr/lib, not /etc: package-owned units
+  #    belong in the vendor tree, and units are found there identically.
+  - src: systemd/*.service
+    dst: /usr/lib/systemd/system/
+    file_info:
+      mode: 0644
+  - src: systemd/*.timer
+    dst: /usr/lib/systemd/system/
+    file_info:
+      mode: 0644
+
+  # 3. needrestart hooks (conffiles: they live in /etc).
+  - src: needrestart/conf.d/*
+    dst: /etc/needrestart/conf.d/
+    type: config
+    file_info:
+      mode: 0644
+  - src: needrestart/restart.d/*
+    dst: /etc/needrestart/restart.d/
+    type: config
+    file_info:
+      mode: 0755
+
+  # 4. Config templates. engine.env and backup.env are live tuning state the
+  #    web UI rewrites, so "config|noreplace": rpm keeps the on-disk file and
+  #    drops the new one as .rpmnew; dpkg keeps the operator's file on
+  #    unattended upgrades. This replaces install.sh's keep-unless
+  #    --force-config logic. settings.env.example is a pure template and may
+  #    be refreshed on upgrade.
+  - src: config/settings.env.example
+    dst: /etc/palworld/settings.env.example
+    type: config
+    file_info:
+      mode: 0644
+  - src: config/engine.env
+    dst: /etc/palworld/engine.env
+    type: config|noreplace
+    file_info:
+      mode: 0644
+  - src: config/backup.env
+    dst: /etc/palworld/backup.env
+    type: config|noreplace
+    file_info:
+      mode: 0644
+
+  # 5. Web UI + reference docs under /opt/palworld/tools (install.sh step 5),
+  #    including the `current` symlink into the live config dir that the
+  #    editors fetch through.
+  - src: webui/*
+    dst: /opt/palworld/tools/config-webui/
+    file_info:
+      mode: 0644
+  - src: docs/config-tools.md
+    dst: /opt/palworld/tools/config-tools.md
+    file_info:
+      mode: 0644
+  - src: docs/backlog.md
+    dst: /opt/palworld/tools/backlog.md
+    file_info:
+      mode: 0644
+  - src: /opt/palworld/server/Pal/Saved/Config/LinuxServer
+    dst: /opt/palworld/tools/config-webui/current
+    type: symlink
+
+  # 6. Service account + runtime directory tree, declared once and enforced
+  #    by systemd on every boot (self-healing, unlike install.sh's one-shot
+  #    `install -d` calls). The postinstall script applies both immediately.
+  - src: packaging/sysusers.d/palwarden.conf
+    dst: /usr/lib/sysusers.d/palwarden.conf
+    file_info:
+      mode: 0644
+  - src: packaging/tmpfiles.d/palwarden.conf
+    dst: /usr/lib/tmpfiles.d/palwarden.conf
+    file_info:
+      mode: 0644
+
+scripts:
+  postinstall: packaging/scripts/postinstall.sh
+  preremove: packaging/scripts/preremove.sh
+  postremove: packaging/scripts/postremove.sh
