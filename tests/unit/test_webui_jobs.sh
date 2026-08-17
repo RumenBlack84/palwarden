@@ -561,7 +561,7 @@ assert_file_contains "$EDITOR" 'id="toast"' "outcomes go in a pw-toast"
 # API's strings and the Backups page renders archive names and job output too, so
 # the reasoning is identical; checking only the editor would let the guard pass
 # while a sibling page grew the exact hole it exists to prevent.
-structural="$(python3 - "$EDITOR" "$REPO/webui/palwarden.html" "$REPO/webui/backups.html" "$REPO/webui/palwarden-ui.css" <<'PY'
+structural="$(python3 - "$EDITOR" "$REPO/webui/palwarden.html" "$REPO/webui/backups.html" "$REPO/webui/players.html" "$REPO/webui/palwarden-ui.css" <<'PY'
 import re, sys
 
 # Every way a string can become markup instead of text. The 403 reflects the

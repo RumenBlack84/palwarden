@@ -140,6 +140,19 @@ Two things this split deliberately does *not* do:
   unprivileged web user on purpose, because that user is the one writing job
   files; root only reads and updates them. Root ownership breaks every button.
 
+### Player presence & the Players tab
+
+Palworld persists no playtime (the save format was checked exhaustively —
+see `docs/superpowers/specs/2026-08-16-player-presence-design.md`), so
+palwarden observes it: the 15-second `palworld-fps sample` tick also calls
+`GET /v1/api/players` and folds who it sees into identity rows and
+grace-window sessions in `metrics.sqlite3`. The Players tab reads the rollup
+via `GET /api/playtime`. Two contracts matter: the metrics and presence
+passes fail independently (a REST outage is a gap in observation, never a
+sampler error), and playtime is **tracked-since**, not all-time — the page
+says so. The REST payload's `ip`/`ping`/`location` are deliberately never
+stored.
+
 ### The settings editor
 
 `webui/PalWorldSettingsEditor.html` is a fork of the MIT upstream settings

@@ -669,6 +669,7 @@ assert_eq "$(code -u "$CREDS" -X POST -H "$TOKHDR" -d '{}' "$U/api/nope")" "404"
 PAGE="$REPO/webui/backups.html"
 DASH="$REPO/webui/palwarden.html"
 EDITOR="$REPO/webui/EngineIniPerformanceEditor.html"
+PLAYERS="$REPO/webui/players.html"
 
 assert_file_exists "$PAGE" "the Backups page exists"
 assert_file_contains "$PAGE" "SPDX-License-Identifier: AGPL-3.0-or-later" \
@@ -679,7 +680,7 @@ assert_file_contains "$PAGE" "CREDITS.md" "the Backups page notes its MIT deriva
 # Every nav-bearing page links to every tab. The settings editor is a fork of
 # the MIT upstream (see CREDITS.md) and carries the palwarden nav too — shown
 # only in live mode, but present in the file.
-for nav_page in "$PAGE" "$DASH" "$EDITOR" "$REPO/webui/PalWorldSettingsEditor.html"; do
+for nav_page in "$PAGE" "$DASH" "$EDITOR" "$PLAYERS" "$REPO/webui/PalWorldSettingsEditor.html"; do
   assert_file_contains "$nav_page" 'href="backups.html"' \
     "$(basename "$nav_page") links to the Backups tab"
   assert_file_contains "$nav_page" 'href="palwarden.html"' \
@@ -688,7 +689,28 @@ for nav_page in "$PAGE" "$DASH" "$EDITOR" "$REPO/webui/PalWorldSettingsEditor.ht
     "$(basename "$nav_page") links to the Server settings tab"
   assert_file_contains "$nav_page" 'href="EngineIniPerformanceEditor.html"' \
     "$(basename "$nav_page") links to the Engine.ini tab"
+  assert_file_contains "$nav_page" 'href="players.html"' \
+    "$(basename "$nav_page") links to the Players tab"
 done
+
+# --- the Players page (spec: player presence design, "Reading it back") --------
+assert_file_exists "$PLAYERS" "the Players page exists"
+assert_file_contains "$PLAYERS" "SPDX-License-Identifier: AGPL-3.0-or-later" \
+  "the Players page carries the AGPL identifier"
+assert_file_contains "$PLAYERS" "SPDX-FileCopyrightText: 2026 Brian Grant" \
+  "the Players page carries our copyright"
+assert_file_contains "$PLAYERS" 'href="players.html" aria-current="page"' \
+  "the Players page marks its own tab as current"
+assert_file_contains "$PLAYERS" '"/api/playtime"' \
+  "the Players page reads the playtime endpoint"
+assert_file_contains "$PLAYERS" "tracked since" \
+  "the page says playtime is tracked-since, not all-time"
+assert_file_contains "$PLAYERS" "textContent" \
+  "player names are rendered as text, never markup"
+assert_file_not_contains "$PLAYERS" "innerHTML" \
+  "no HTML sink anywhere near player-controlled names"
+assert_file_contains "$PLAYERS" "No players seen yet" \
+  "an empty history gets a friendly message"
 assert_file_contains "$PAGE" 'href="backups.html" aria-current="page"' \
   "the Backups page marks its own tab as current"
 

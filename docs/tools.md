@@ -227,11 +227,13 @@ The Palworld REST API authenticates with HTTP Basic `admin` + **`ADMIN_PASSWORD`
 `REST_API_ENABLED=True` and a non-empty `ADMIN_PASSWORD`.
 
 ### `palworld-api`
-`/usr/local/sbin/palworld-api {save|stop [seconds] [message]|info|metrics}`
+`/usr/local/sbin/palworld-api {save|stop [seconds] [message]|info|metrics|players}`
 
 Low-level client against `127.0.0.1:${REST_API_PORT}`. `info` returns
 server/version JSON; `metrics` returns FPS/player/uptime JSON used by the
-sampler and restart logic.
+sampler and restart logic; `players` returns the online-players list
+(name, playerId, userId/SteamID, level — plus ip/ping/location, which the
+presence recorder deliberately does not store).
 
 ### `palworld-api-save` / `palworld-api-stop`
 Thin wrappers that add Discord notifications around `palworld-api save` and
@@ -314,7 +316,8 @@ it for you). With no arguments it prints help and exits — the service uses
 `--serve`.
 
 Read endpoints (Basic auth is enough): `/api/health`, `/api/fps`, `/api/events`,
-`/api/service-events`, `/api/engine`, `/api/config` (passwords redacted),
+`/api/service-events`, `/api/playtime` (the sampler's per-player presence
+rollup, feeding the Players tab), `/api/engine`, `/api/config` (passwords redacted),
 `/api/backups`, `/api/snapshots`, `/api/backup-schedule`, `/api/jobs`,
 `/api/jobs/<id>`, `/api/token`. A failing tool answers `200` with
 `{"ok": false, "error": ...}` rather than a `500`, so one broken tool cannot blank
@@ -483,9 +486,10 @@ the container (both run it as root; see
 
 | Subcommand | Purpose |
 |------------|---------|
-| `sample [--retention-days N]` | Pull one FPS/player sample from the REST API and store it (driven by the 15s timer). Prunes old rows. |
+| `sample [--retention-days N] [--presence-retention-days N]` | Pull one FPS/player sample from the REST API and store it (driven by the 15s timer). Also records **player presence**: an identity row per player (uid, SteamID, latest name/level, first/last seen, total playtime) and grace-window sessions (`PALWARDEN_PRESENCE_GRACE_MS`, default 60s). The two REST calls fail independently and never change the exit code — an outage is a gap in observation, not an error. Sessions are pruned after 90 days by default; identities and their playtime totals never are. `ip`/`ping`/`location` from the API are deliberately not stored. |
 | `report [--window 24h] [--graph FILE.png]` | Text stats (avg / 1% low / 0.1% low, player avg/max) over a window; optional two-panel PNG (FPS + player count) with event markers. |
 | `graph --output FILE.png [--window 1h] [--theme light\|dark]` | Render only the PNG — no stats, no live REST fetch. The window is any duration (`1h`, `4h`, `12h`, …), not just the report presets, and `--theme dark` draws on the web UI's dark card surface (Discord keeps the light default); this is what `GET /api/fps/graph` shells out to. |
+| `playtime [--json]` | Per-player presence rollup: identity, session count, total playtime, last-7-days playtime (sessions clamped to the window), online-now. Playtime is observed by the sampler — time before the first observed login is not included. |
 | `discord [--window] [--dry-run]` | Post the report + graph to Discord. |
 | `mark TEXT --category C [--details ...]` | Add an operational event marker. |
 | `events [--window] [--json]` | List recent markers. |
