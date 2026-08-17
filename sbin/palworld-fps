@@ -801,6 +801,71 @@ def report(args: argparse.Namespace) -> int:
     return 0
 
 
+def playtime_summary(con: sqlite3.Connection, at_ms: int,
+                     grace_ms: int = PRESENCE_GRACE_MS) -> list[dict[str, Any]]:
+    """Per-player presence rollup: identity fields plus derived durations.
+
+    play_7d clamps each session to the 7-day window's inside portion, so a
+    straddling session counts only what actually happened inside the window.
+    """
+    week_ms = 7 * 24 * 3600 * 1000
+    window_start = at_ms - week_ms
+    out: list[dict[str, Any]] = []
+    for row in con.execute(
+        "SELECT * FROM player_identity ORDER BY last_seen_ms DESC"
+    ):
+        uid = row["player_uid"]
+        sessions = 0
+        play_7d_ms = 0
+        for sess in con.execute(
+            "SELECT started_at_ms, last_seen_ms FROM player_sessions WHERE player_uid = ?",
+            (uid,),
+        ):
+            sessions += 1
+            start = max(int(sess["started_at_ms"]), window_start)
+            end = min(int(sess["last_seen_ms"]), at_ms)
+            if end > start:
+                play_7d_ms += end - start
+        out.append({
+            "player_uid": uid,
+            "steam_userid": row["steam_userid"],
+            "name": row["name"],
+            "level": row["level"],
+            "first_seen": iso_utc(int(row["first_seen_ms"])),
+            "last_seen": iso_utc(int(row["last_seen_ms"])),
+            "sessions": sessions,
+            "total_play_seconds": int(row["total_play_ms"]) // 1000,
+            "play_7d_seconds": play_7d_ms // 1000,
+            "online": at_ms - int(row["last_seen_ms"]) <= grace_ms,
+        })
+    return out
+
+
+def fmt_duration(seconds: int) -> str:
+    hours, rem = divmod(int(seconds), 3600)
+    return f"{hours}h {rem // 60:02d}m"
+
+
+def playtime(args: argparse.Namespace) -> int:
+    con = connect(Path(args.db))
+    players = playtime_summary(con, now_ms())
+    if args.json:
+        print(json.dumps({"players": players, "tracked_since_note":
+                          "playtime is observed by the sampler; time before the "
+                          "first observed login is not included"},
+                         indent=2, sort_keys=True))
+        return 0
+    if not players:
+        print("No players seen yet — presence tracking starts with the first login.")
+        return 0
+    for p in players:
+        state = "ONLINE" if p["online"] else f"last seen {p['last_seen']}"
+        print(f"{p['name']} (lv {p['level']}): {fmt_duration(p['total_play_seconds'])} total, "
+              f"{fmt_duration(p['play_7d_seconds'])} this week, "
+              f"{p['sessions']} session(s), {state}")
+    return 0
+
+
 def graph_only(args: argparse.Namespace) -> int:
     """Render just the PNG — no summary, no live REST fetch.
 
@@ -861,6 +926,10 @@ def main() -> int:
     p_report.add_argument("--graph", help="PNG output path")
     p_report.add_argument("--window", choices=sorted(WINDOW_SECONDS), default="24h")
     p_report.set_defaults(func=report)
+
+    p_playtime = sub.add_parser("playtime", help="per-player presence and playtime rollup")
+    p_playtime.add_argument("--json", action="store_true")
+    p_playtime.set_defaults(func=playtime)
 
     p_graph = sub.add_parser("graph", help="render only the FPS/players PNG for a window")
     # Free-form on purpose (parse_duration spellings like 1h/4h/12h), unlike

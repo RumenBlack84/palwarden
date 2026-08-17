@@ -192,6 +192,11 @@ con.execute("INSERT INTO player_sessions (player_uid, started_at_ms, last_seen_m
 # straddler: started 8 days ago, ended 6.5 days ago (only ~1.5d-boundary portion inside)
 con.execute("INSERT INTO player_sessions (player_uid, started_at_ms, last_seen_ms, samples) VALUES (?, ?, ?, ?)",
             ("EF576CE7000000000000000000000000", now - eight_days, now - int(6.5 * 86400 * 1000), 240))
+# Real recording credits the identity total as sessions extend; seeded history
+# must do the same or "total keeps what the window excludes" tests nothing.
+credited = 3600_000 + int(1.5 * 86400 * 1000)
+con.execute("UPDATE player_identity SET total_play_ms = total_play_ms + ? WHERE player_uid = ?",
+            (credited, "EF576CE7000000000000000000000000"))
 con.commit()
 PY
 out="$(python3 "$FPS" --db "$DB" playtime --json 2>&1)"
