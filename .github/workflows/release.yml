@@ -1,0 +1,136 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Brian Grant
+#
+# Tag-driven release pipeline. Push a tag like v1.2.3 and this:
+#   1. runs the full unit + docker integration suite,
+#   2. builds the deb/rpm/arch packages from packaging/nfpm.yaml and
+#      install-tests each one in a fresh container of its native distro,
+#   3. builds the docker image and pushes it to GHCR,
+#   4. only if ALL of that passed, cuts a GitHub release named after the tag
+#      with the three packages attached.
+name: Release
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  NFPM_VERSION: 2.47.0
+  NFPM_SHA256: 0660ca602b2d2d2ae4781a06c692b3eeb9d437ffea05b831d76e41f4a3188783
+
+jobs:
+  tests:
+    name: Unit + integration tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # node for the same reason as ci.yml: test_webui_jobs.sh executes the
+      # web UI's collectSettings() under it and fails rather than skips in CI.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Run unit + integration tests
+        run: ./tests/run.sh --integration
+
+  packages:
+    name: Build + install-test packages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Derive version from tag
+        run: |
+          # The tag is the single source of the version: v1.2.3 -> 1.2.3.
+          echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: Install nfpm (pinned + checksummed)
+        run: |
+          curl -sSfL -o nfpm.tgz \
+            "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz"
+          echo "${NFPM_SHA256}  nfpm.tgz" | sha256sum -c -
+          tar xzf nfpm.tgz nfpm && sudo mv nfpm /usr/local/bin/nfpm && rm nfpm.tgz
+
+      - name: Build deb, rpm and arch packages
+        run: |
+          mkdir -p dist
+          for p in deb rpm archlinux; do
+            nfpm package -f packaging/nfpm.yaml -p "$p" -t dist/
+          done
+          ls -l dist/
+
+      # Each package is installed with the distro's own tool in a clean
+      # container of the distro it targets, so dependency resolution and the
+      # shared maintainer scripts are exercised for real. assert-install.sh
+      # then checks the payload, the service account, and the generated
+      # credentials, and compiles the python tools under that distro's python3.
+      - name: 'Install test: deb on ubuntu:24.04'
+        run: |
+          docker run --rm -v "$PWD:/src:ro" ubuntu:24.04 sh -ec '
+            apt-get update -q
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -q /src/dist/palwarden_*.deb
+            /src/packaging/tests/assert-install.sh'
+
+      - name: 'Install test: rpm on fedora:41'
+        run: |
+          docker run --rm -v "$PWD:/src:ro" fedora:41 sh -ec '
+            dnf install -y -q /src/dist/palwarden-*.noarch.rpm
+            /src/packaging/tests/assert-install.sh'
+
+      - name: 'Install test: arch package on archlinux:base'
+        run: |
+          docker run --rm -v "$PWD:/src:ro" archlinux:base sh -ec '
+            pacman -Sy --noconfirm >/dev/null
+            pacman -U --noconfirm /src/dist/palwarden-*.pkg.tar.zst
+            /src/packaging/tests/assert-install.sh'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: dist/
+          if-no-files-found: error
+
+  docker:
+    name: Build + push docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push
+        run: |
+          # GHCR requires a lowercase repository path.
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          version="${GITHUB_REF_NAME#v}"
+          docker build -f docker/Dockerfile \
+            -t "$image:$version" -t "$image:latest" .
+          docker push "$image:$version"
+          docker push "$image:latest"
+
+  release:
+    name: Cut GitHub release
+    # The gate the whole pipeline exists for: no release unless the test
+    # suite, all three install tests, and the image build all passed.
+    needs: [tests, packages, docker]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: dist/
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "palwarden $GITHUB_REF_NAME" \
+            --generate-notes \
+            --verify-tag
