@@ -40,7 +40,8 @@ PY2
 ) ;;
   info) method=GET; path=/v1/api/info; body='' ;;
   metrics) method=GET; path=/v1/api/metrics; body='' ;;
-  *) echo "Usage: $0 {save|stop [seconds] [message]|info|metrics}" >&2; exit 64 ;;
+  players) method=GET; path=/v1/api/players; body='' ;;
+  *) echo "Usage: $0 {save|stop [seconds] [message]|info|metrics|players}" >&2; exit 64 ;;
 esac
 PALWORLD_API_METHOD="$method" PALWORLD_API_URL="http://${REST_API_HOST}:${REST_API_PORT}${path}" PALWORLD_API_PASSWORD="$ADMIN_PASSWORD" PALWORLD_API_BODY="$body" python3 - <<'PY2'
 import base64, os, sys, urllib.error, urllib.request

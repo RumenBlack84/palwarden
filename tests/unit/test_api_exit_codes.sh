@@ -76,6 +76,39 @@ assert_eq "$rc" "1" "an unreachable REST API exits 1 so the caller retries (outp
 printf 'REST_API_ENABLED=True\nADMIN_PASSWORD=x\n' > "$CFG"
 out="$(api not-an-action 2>&1)"; rc=$?
 assert_eq "$rc" "64" "an unknown action exits 64 (output: $out)"
+assert_contains "$out" "players" "the usage line names the players action"
+
+# --- players: a real action hitting the real path ------------------------------
+# A one-shot recording server, so the assertion is on the request that actually
+# went out — not on the case statement's spelling.
+PORT_REC=18131
+python3 - "$PORT_REC" "$WORK/request.log" <<'PY' &
+import http.server, sys
+port, log = int(sys.argv[1]), sys.argv[2]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        open(log, "w").write(f"{self.command} {self.path}\n")
+        body = b'{"players": []}'
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a): pass
+with http.server.HTTPServer(("127.0.0.1", port), H) as s:
+    # One request or ten seconds, whichever first — an action that never
+    # connects (the failing-test state) must not hang the suite.
+    s.timeout = 10
+    s.handle_request()
+PY
+REC_PID=$!
+sleep 0.3
+printf 'REST_API_ENABLED=True\nADMIN_PASSWORD=x\nREST_API_PORT=%s\nREST_API_HOST=127.0.0.1\n' "$PORT_REC" > "$CFG"
+out="$(api players 2>&1)"; rc=$?
+wait "$REC_PID" 2>/dev/null
+assert_eq "$rc" "0" "players succeeds against a live API (output: $out)"
+assert_contains "$out" '"players"' "players prints the API's JSON"
+assert_file_contains "$WORK/request.log" "GET /v1/api/players" \
+  "players issues GET /v1/api/players on the wire"
 
 # --- and the callers that depend on these codes still say so -------------------
 # Both branches of the readiness wait, so the bare-metal one cannot quietly lose the

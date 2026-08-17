@@ -25,7 +25,9 @@ from typing import Any
 
 DB_PATH = Path("/var/lib/palworld/metrics.sqlite3")
 RETENTION_SECONDS = 7 * 24 * 60 * 60
-API_HELPER = "/usr/local/sbin/palworld-api"
+# Env-overridable so the tests can drive `sample` against a stub helper; the
+# default is the one real path, like every other tool here.
+API_HELPER = os.environ.get("PALWORLD_API_BIN", "/usr/local/sbin/palworld-api")
 NOTIFY_ENV = Path("/etc/palworld/notify.env")
 
 WINDOW_SECONDS = {
