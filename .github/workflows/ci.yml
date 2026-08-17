@@ -2,8 +2,12 @@
 # SPDX-FileCopyrightText: 2026 Brian Grant
 name: CI
 
+# push is scoped to master (not removed): PR branches get their run from the
+# pull_request trigger alone — a bare `push:` made every PR branch run CI
+# twice — while master keeps a post-merge run so the README badge stays live.
 on:
   push:
+    branches: [master]
   pull_request:
 
 jobs:
