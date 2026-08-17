@@ -83,6 +83,33 @@ def connect(db_path: Path = DB_PATH) -> sqlite3.Connection:
         """
     )
     con.execute("CREATE INDEX IF NOT EXISTS idx_fps_events_time ON fps_events(event_at_ms)")
+    # Player presence (spec: docs/superpowers/specs/2026-08-16-player-presence-
+    # design.md). total_play_ms lives on the identity row so pruning sessions
+    # can never lose playtime. Deliberately no ip/ping/location columns.
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS player_identity (
+            player_uid    TEXT NOT NULL PRIMARY KEY,
+            steam_userid  TEXT,
+            name          TEXT NOT NULL,
+            level         INTEGER,
+            first_seen_ms INTEGER NOT NULL,
+            last_seen_ms  INTEGER NOT NULL,
+            total_play_ms INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS player_sessions (
+            player_uid    TEXT NOT NULL,
+            started_at_ms INTEGER NOT NULL,
+            last_seen_ms  INTEGER NOT NULL,
+            samples       INTEGER NOT NULL
+        )
+        """
+    )
+    con.execute("CREATE INDEX IF NOT EXISTS idx_player_sessions_uid_time ON player_sessions(player_uid, last_seen_ms)")
     return con
 
 
@@ -113,6 +140,105 @@ def fetch_metrics(timeout: int = 5) -> dict[str, Any]:
         detail = (proc.stderr or proc.stdout or "unknown API error").strip()
         raise RuntimeError(detail[:500])
     return extract_json(proc.stdout)
+
+
+# Survives one missed 15s tick plus jitter. Env-overridable both as a real
+# knob and as the lever the tests use to force session splits without sleeping.
+PRESENCE_GRACE_MS = int(os.environ.get("PALWARDEN_PRESENCE_GRACE_MS", "60000"))
+
+
+def fetch_players(timeout: int = 5) -> list[dict[str, Any]]:
+    proc = subprocess.run(
+        [API_HELPER, "players"],
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+        check=False,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "unknown API error").strip()
+        raise RuntimeError(detail[:500])
+    payload = extract_json(proc.stdout)
+    players = payload.get("players", [])
+    return players if isinstance(players, list) else []
+
+
+def record_presence(con: sqlite3.Connection, players: list[dict[str, Any]],
+                    at_ms: int, grace_ms: int = PRESENCE_GRACE_MS) -> int:
+    """Fold one tick's online-players list into identities and sessions.
+
+    A sighting within `grace_ms` of a session's tail extends it and credits the
+    identity's total with exactly the extension delta; beyond the grace it opens
+    a new session that credits nothing until its own first extension — one
+    sighting proves presence, not duration. Nothing else from the REST payload
+    is stored: ip, ping and location are deliberately dropped (see the spec).
+    """
+    seen = 0
+    for player in players:
+        uid = str(player.get("playerId") or "").strip()
+        if not uid:
+            continue
+        seen += 1
+        name = str(player.get("name") or "")
+        steam = str(player.get("userId") or "").strip() or None
+        level = player.get("level")
+        level = int(level) if isinstance(level, (int, float)) else None
+        row = con.execute(
+            "SELECT 1 FROM player_identity WHERE player_uid = ?", (uid,)
+        ).fetchone()
+        if row is None:
+            con.execute(
+                """
+                INSERT INTO player_identity
+                    (player_uid, steam_userid, name, level, first_seen_ms, last_seen_ms, total_play_ms)
+                VALUES (?, ?, ?, ?, ?, ?, 0)
+                """,
+                (uid, steam, name, level, at_ms, at_ms),
+            )
+        else:
+            # Names and levels track the latest sighting (players rename);
+            # COALESCE keeps a known steam id / level over a missing one.
+            con.execute(
+                """
+                UPDATE player_identity
+                SET steam_userid = COALESCE(?, steam_userid), name = ?,
+                    level = COALESCE(?, level), last_seen_ms = ?
+                WHERE player_uid = ?
+                """,
+                (steam, name, level, at_ms, uid),
+            )
+        session = con.execute(
+            """
+            SELECT rowid, last_seen_ms FROM player_sessions
+            WHERE player_uid = ? ORDER BY last_seen_ms DESC LIMIT 1
+            """,
+            (uid,),
+        ).fetchone()
+        if session is not None and 0 <= at_ms - int(session["last_seen_ms"]) <= grace_ms:
+            delta = at_ms - int(session["last_seen_ms"])
+            con.execute(
+                "UPDATE player_sessions SET last_seen_ms = ?, samples = samples + 1 WHERE rowid = ?",
+                (at_ms, session["rowid"]),
+            )
+            con.execute(
+                "UPDATE player_identity SET total_play_ms = total_play_ms + ? WHERE player_uid = ?",
+                (delta, uid),
+            )
+        else:
+            con.execute(
+                "INSERT INTO player_sessions (player_uid, started_at_ms, last_seen_ms, samples) VALUES (?, ?, ?, 1)",
+                (uid, at_ms, at_ms),
+            )
+    con.commit()
+    return seen
+
+
+def prune_sessions(con: sqlite3.Connection, retention_seconds: int) -> int:
+    """Prune old sessions only — identities and their totals are permanent."""
+    cutoff_ms = now_ms() - retention_seconds * 1000
+    cur = con.execute("DELETE FROM player_sessions WHERE last_seen_ms < ?", (cutoff_ms,))
+    con.commit()
+    return int(cur.rowcount or 0)
 
 
 def insert_sample(con: sqlite3.Connection, metrics: dict[str, Any] | None, error: str | None = None) -> int:
@@ -155,17 +281,30 @@ def insert_sample(con: sqlite3.Connection, metrics: dict[str, Any] | None, error
 
 def sample(args: argparse.Namespace) -> int:
     con = connect(Path(args.db))
+    # The metrics pass and the presence pass fail independently: one broken
+    # REST call must not stop the other's recording, and neither failure ever
+    # changes the exit code — a sampler that exits non-zero teaches the timer
+    # nothing and loses the next tick's data too.
     try:
         metrics = fetch_metrics(timeout=args.timeout)
         ms = insert_sample(con, metrics)
-        deleted = prune(con, args.retention_days * 86400)
-        print(f"sampled ok at {iso_utc(ms)} serverfps={metrics.get('serverfps')} deleted_old={deleted}")
-        return 0
+        note = f"ok serverfps={metrics.get('serverfps')}"
     except Exception as exc:
         ms = insert_sample(con, None, str(exc))
-        deleted = prune(con, args.retention_days * 86400)
-        print(f"sampled error at {iso_utc(ms)} error={str(exc)[:200]!r} deleted_old={deleted}")
-        return 0
+        note = f"error error={str(exc)[:200]!r}"
+    try:
+        players = fetch_players(timeout=args.timeout)
+        seen = record_presence(con, players, now_ms(), PRESENCE_GRACE_MS)
+        presence = f"players_online={seen}"
+    except Exception as exc:
+        # A gap, not an error: sessions simply do not extend. Named so an
+        # operator reading the journal can tell presence apart from metrics.
+        print(f"warning: presence pass failed: {str(exc)[:200]}", file=sys.stderr)
+        presence = "presence=skipped"
+    deleted = prune(con, args.retention_days * 86400)
+    pruned = prune_sessions(con, args.presence_retention_days * 86400)
+    print(f"sampled {note} at {iso_utc(ms)} {presence} deleted_old={deleted} pruned_sessions={pruned}")
+    return 0
 
 
 def insert_event(con: sqlite3.Connection, label: str, category: str = "manual", details: str | None = None, event_at_ms: int | None = None) -> int:
@@ -710,6 +849,9 @@ def main() -> int:
     p_sample = sub.add_parser("sample", help="collect one metrics sample into SQLite")
     p_sample.add_argument("--timeout", type=int, default=5)
     p_sample.add_argument("--retention-days", type=int, default=7)
+    # Sessions outlive the 7-day metrics window — "when was Bryli last on?"
+    # needs months, and the rows are tiny. Identities are never pruned.
+    p_sample.add_argument("--presence-retention-days", type=int, default=90)
     p_sample.set_defaults(func=sample)
 
     p_report = sub.add_parser("report", help="print summary and optionally generate graph")
