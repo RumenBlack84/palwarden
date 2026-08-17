@@ -122,8 +122,12 @@ sudo ./install.sh --dry-run
 # 2. Install the tooling (scripts, units, webui, docs, runtime dirs).
 sudo ./install.sh
 
-# 3. Create your live config from the template and edit it.
+# 3. Create your live config from the template and edit it. Group-readable by
+#    the service account: the web UI reads the REST password from it (a re-run
+#    of install.sh fixes these perms up too).
 sudo cp /etc/palworld/settings.env.example /etc/palworld/settings.env
+sudo chown root:palworld /etc/palworld/settings.env
+sudo chmod 640 /etc/palworld/settings.env
 sudo $EDITOR /etc/palworld/settings.env
 
 # 4. (Optional) Enable Discord notifications.

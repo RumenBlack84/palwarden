@@ -110,6 +110,23 @@ else
        "Create the group and 'chown root:$SVC_GROUP /etc/palworld/webui.env; chmod 0640 ...' before starting the service."
 fi
 
+# 4b². An operator-created settings.env from before the authenticated webui is
+# typically 0600 root:root — but the webui answers /api/health by running
+# palworld-health-report as $SVC_USER, which reads the REST AdminPassword from
+# this file. Unreadable, every REST-backed panel degrades (the dashboard shows
+# "?/?" players). Same posture as webui.env: root-writable only,
+# service-account-readable. The docker path does the equivalent chown in
+# entrypoint.sh; packaging/scripts/postinstall.sh mirrors this block.
+if [[ -f /etc/palworld/settings.env ]]; then
+  if getent group "$SVC_GROUP" >/dev/null 2>&1; then
+    run chown root:"$SVC_GROUP" /etc/palworld/settings.env
+    run chmod 0640 /etc/palworld/settings.env
+  else
+    echo "    note: group '$SVC_GROUP' not found; settings.env left as-is." \
+         "The web UI cannot read the REST password until it is group-readable by '$SVC_GROUP'."
+  fi
+fi
+
 # 4c. The root of the tooling's own tree, created explicitly and BEFORE anything
 # writes under it. It was root-owned only by accident: the first `install -d`
 # below happened to create it as root, so the `-o root -g root` lines further down
