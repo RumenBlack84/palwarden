@@ -1,8 +1,9 @@
 # palwarden
 
-[![CI](https://github.com/RumenBlack84/palwarden/actions/workflows/ci.yml/badge.svg)](https://github.com/RumenBlack84/palwarden/actions/workflows/ci.yml)
-[![Release](https://github.com/RumenBlack84/palwarden/actions/workflows/release.yml/badge.svg)](https://github.com/RumenBlack84/palwarden/actions/workflows/release.yml)
-[![Latest release](https://img.shields.io/github/v/release/RumenBlack84/palwarden?sort=semver)](https://github.com/RumenBlack84/palwarden/releases)
+[![CI](https://github.com/RumenBlack84/palwarden/actions/workflows/ci.yml/badge.svg)](https://github.com/RumenBlack84/palwarden/actions/workflows/ci.yml)  
+[![Release](https://github.com/RumenBlack84/palwarden/actions/workflows/release.yml/badge.svg)](https://github.com/RumenBlack84/palwarden/actions/workflows/release.yml)  
+[![Latest release](https://img.shields.io/github/v/release/RumenBlack84/palwarden?sort=semver)](https://github.com/RumenBlack84/palwarden/releases)  
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
 
 > [!WARNING]
 > **Under active development — not complete or stable.**
@@ -11,9 +12,6 @@
 > or Palworld versions. Test it against a server you can afford to break — take
 > backups first, and use it at your own risk. This notice will be removed once the
 > project is closer to done.
-
-[![CI](https://github.com/RumenBlack84/palwarden/actions/workflows/ci.yml/badge.svg)](https://github.com/RumenBlack84/palwarden/actions/workflows/ci.yml)
-[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
 
 Operational tooling for a self-hosted **Palworld dedicated server** on Linux.
 
