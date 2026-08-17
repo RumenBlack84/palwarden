@@ -1,5 +1,9 @@
 # palwarden
 
+[![CI](https://github.com/RumenBlack84/palwarden/actions/workflows/ci.yml/badge.svg)](https://github.com/RumenBlack84/palwarden/actions/workflows/ci.yml)
+[![Release](https://github.com/RumenBlack84/palwarden/actions/workflows/release.yml/badge.svg)](https://github.com/RumenBlack84/palwarden/actions/workflows/release.yml)
+[![Latest release](https://img.shields.io/github/v/release/RumenBlack84/palwarden?sort=semver)](https://github.com/RumenBlack84/palwarden/releases)
+
 > [!WARNING]
 > **Under active development — not complete or stable.**
 > `palwarden` is still being built and its interfaces, file layouts and defaults

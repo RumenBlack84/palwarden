@@ -11,7 +11,14 @@ VERSION=0.1.0 nfpm package -f packaging/nfpm.yaml -p archlinux -t dist/
 ```
 
 Run from the repo root (`src:` paths in the manifest are repo-relative).
-`VERSION` must be set; in CI derive it from the tag (`${GITHUB_REF_NAME#v}`).
+`VERSION` must be set; in CI it derives from the tag (`${GITHUB_REF_NAME#v}`).
+
+Releases are automated: pushing a `v*.*.*` tag runs
+`.github/workflows/release.yml`, which gates on the full test suite, builds
+all three packages plus the docker image (pushed to GHCR), install-tests each
+package in a fresh container of its native distro
+([`tests/assert-install.sh`](tests/assert-install.sh)), and only then cuts a
+GitHub release with the packages attached.
 
 Install on the target host with the native tool so dependencies resolve:
 
