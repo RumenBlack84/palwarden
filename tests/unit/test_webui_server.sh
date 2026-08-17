@@ -31,6 +31,10 @@ EOF
 cat > "$WORK/sbin/palworld-fps" <<EOF
 #!/usr/bin/env bash
 echo "\$@" >> "$WORK/fps-argv.log"
+if [ "\${1:-}" = "playtime" ]; then
+  echo '{"players": [{"name": "Snax", "player_uid": "022E", "online": true, "total_play_seconds": 3600}]}'
+  exit 0
+fi
 if [ "\${1:-}" = "graph" ]; then
   out=""
   while [ \$# -gt 0 ]; do
@@ -155,6 +159,14 @@ assert_contains "$(tail -n 1 "$WORK/fps-argv.log")" "--theme dark" \
 body -u "$CREDS" "$U/api/fps/graph?theme=blink" > /dev/null
 assert_contains "$(tail -n 1 "$WORK/fps-argv.log")" "--theme light" \
   "an unknown theme falls back to light"
+# --- the playtime endpoint -----------------------------------------------------
+assert_eq "$(code "$U/api/playtime")" "401" "playtime requires auth"
+pt="$(body -u "$CREDS" "$U/api/playtime")"
+assert_contains "$pt" '"ok": true' "playtime answers in the house shape"
+assert_contains "$pt" '"Snax"' "playtime returns the tool's JSON under data"
+assert_contains "$(tail -n 1 "$WORK/fps-argv.log")" "playtime --json" \
+  "the endpoint runs the playtime subcommand in JSON mode"
+
 # A failing render (fresh install: no samples yet) answers in the house JSON
 # shape with the tool's own words, not a broken image or a traceback.
 cp "$WORK/sbin/palworld-fps" "$WORK/fps-stub.bak"
@@ -168,6 +180,9 @@ graph_fail="$(body -u "$CREDS" "$U/api/fps/graph")"
 assert_contains "$graph_fail" '"ok": false' "a failed render reports ok:false"
 assert_contains "$graph_fail" "no successful FPS samples" \
   "the tool's own message is passed through to the page"
+# ...and the playtime endpoint degrades the same way while the tool is broken.
+assert_contains "$(body -u "$CREDS" "$U/api/playtime")" '"ok": false' \
+  "a failing playtime tool reports ok:false, not a blank panel"
 cp "$WORK/fps-stub.bak" "$WORK/sbin/palworld-fps"
 
 # a tool that exits non-zero with empty stdout must surface as ok:false, not a

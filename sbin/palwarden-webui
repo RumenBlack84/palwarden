@@ -639,6 +639,11 @@ def ep_service_events(query: dict) -> dict:
                           "--since", window, "--json"])
 
 
+def ep_playtime(_query: dict) -> dict:
+    """Per-player presence and playtime, as the sampler has observed it."""
+    return run_tool_json([str(SBIN / "palworld-fps"), "playtime", "--json"])
+
+
 def ep_engine(_query: dict) -> dict:
     result = run_tool([str(SBIN / "palworld-engine-config"), "status", "--check"])
     if not result["ok"]:
@@ -758,6 +763,7 @@ READ_ENDPOINTS = {
     "/api/fps": ep_fps,
     "/api/events": ep_events,
     "/api/service-events": ep_service_events,
+    "/api/playtime": ep_playtime,
     "/api/engine": ep_engine,
     "/api/config": ep_config,
     "/api/backups": ep_backups,
