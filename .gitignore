@@ -37,3 +37,4 @@ tests/fixtures/fake-server/Pal/Saved/SaveGames/0/*
 
 # Subagent-driven-development scratch state
 .superpowers/
+docker/compose.local.yaml
