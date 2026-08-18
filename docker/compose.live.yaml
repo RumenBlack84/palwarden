@@ -1,0 +1,79 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Brian Grant
+#
+# Overlay for the live test tier — nothing else. It is never used by a real
+# deployment, and compose.yaml is deliberately left untouched so the normal
+# deployment cannot drift into the test one.
+#
+# What it changes: the two volumes that hold the game install and the world
+# (palworld-server, palworld-saved) become bind mounts under a throwaway
+# testbed directory, so the ~8-10 GB SteamCMD download is done once by hand and
+# every subsequent run starts a real server in seconds. Everything else — the
+# state volume, the backup/snapshot volumes, ports, every env var — is inherited
+# from compose.yaml.
+#
+# Usage (PALWARDEN_LIVE_TESTBED defaults to $HOME/palworld-testbed in
+# tests/live/lib/testbed.sh, which exports it before invoking compose):
+#
+#   export PALWARDEN_LIVE_TESTBED="$HOME/palworld-testbed"
+#   mkdir -p "$PALWARDEN_LIVE_TESTBED/server/Pal/Saved"
+#   touch "$PALWARDEN_LIVE_TESTBED/.palwarden-live-testbed"
+#   COMPOSE_PROFILES=embedded docker compose \
+#     -f docker/compose.yaml -f docker/compose.live.yaml up -d --build
+#
+# The one-time install: the overlay pins UPDATE_ON_START=false, because a test
+# tier that re-validates the whole install on every `up` is a test tier nobody
+# waits for. So the *first* run — and only that one — must be given the download
+# explicitly:
+#
+#   UPDATE_ON_START=true COMPOSE_PROFILES=embedded docker compose \
+#     -f docker/compose.yaml -f docker/compose.live.yaml up -d --build
+#
+# ...which is the repository owner's one-time step; nothing in the suites does it.
+#
+# Separate project and container name: a live run must not be able to adopt, stop
+# or `down` a real palwarden deployment's containers on the same host. (Ports are
+# still the ones in compose.yaml, so a real deployment listening on 8088/8211
+# makes `live_up` fail loudly rather than quietly sharing state — which is the
+# behaviour we want.)
+#
+# `name:` alone is not a guarantee — COMPOSE_PROJECT_NAME, from the environment or
+# from docker/.env, overrides it — so tests/live/lib/testbed.sh passes
+# `-p palwarden-live` explicitly. This stays for the hand-run invocation above.
+name: palwarden-live
+
+services:
+  palwarden:
+    container_name: palwarden-live
+    # Its own tag, not compose.yaml's `palwarden:latest`. Containers, volumes and the
+    # network are project-scoped and so already isolated, but an image tag is not: a
+    # live `up --build` on a feature branch would retag the image the real deployment
+    # then starts from. Not destructive, but it is the one mutable resource the two
+    # projects would otherwise share. `build:` is inherited from compose.yaml.
+    image: palwarden-live:latest
+    environment:
+      # Overrides compose.yaml's ${UPDATE_ON_START:-true}. See above: the install
+      # is a deliberate one-time step, not part of a test run.
+      UPDATE_ON_START: "false"
+    # Compose merges service volumes by target path, so these two replace the
+    # named volumes at the same mount points and leave the rest alone.
+    #
+    # Long `type: bind` form with create_host_path: false on purpose. The short
+    # "src:dst" form makes Docker *create* a missing source directory, root-owned
+    # — and a root-owned testbed is unwritable by the game's uid 1000 steam
+    # account, which surfaces much later as a corrupt-looking save rather than as
+    # the typo it was. Here a missing path is an error at `up`.
+    volumes:
+      - type: bind
+        source: ${PALWARDEN_LIVE_TESTBED:?PALWARDEN_LIVE_TESTBED must point at a marked live testbed directory}/server
+        target: /opt/palworld/server
+        bind:
+          create_host_path: false
+      # Nested inside the mount above, exactly as in compose.yaml: the world lives
+      # on its own mount so it can be wiped (live_reset_world) without touching the
+      # multi-GB install beside it.
+      - type: bind
+        source: ${PALWARDEN_LIVE_TESTBED:?PALWARDEN_LIVE_TESTBED must point at a marked live testbed directory}/server/Pal/Saved
+        target: /opt/palworld/server/Pal/Saved
+        bind:
+          create_host_path: false

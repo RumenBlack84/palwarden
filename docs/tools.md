@@ -15,6 +15,7 @@ files, talk to the REST API, and touch `palworld`-owned files).
 - [Libraries](#libraries)
 - [Config parser](#palworld-config-parser)
 - [systemd units & timers](#systemd-units--timers)
+- [Test tiers](#test-tiers)
 
 ---
 
@@ -142,8 +143,9 @@ or `Config/` — see [`palwarden_archive`](#libraries).
   backup via `palworld-backup` (skipped with a printed note when there is no
   world to preserve); `palworld-graceful-stop [--wait S]`, where an
   already-stopped server is success but a stop that leaves the server *running*
-  aborts; extract into `Pal/Saved.restore-<stamp>` **beside** the target, rename
-  the live tree to `Pal/Saved.replaced-<stamp>`, rename the new tree into place;
+  aborts; extract into `Pal/Saved.restore-<stamp>` **beside** the target, then swap
+  the target's **contents** — move `Pal/Saved`'s entries into
+  `Pal/Saved.replaced-<stamp>` and the extracted tree's entries in;
   `chown -R` to `PALWORLD_USER`/`PALWORLD_GROUP`; start the service and wait for
   REST readiness (`--startup-timeout`, default 180s — the same check
   `graceful-restart` uses).
@@ -170,9 +172,56 @@ or `Config/` — see [`palwarden_archive`](#libraries).
   any group/other bits, holds that descriptor for the whole restore, and refuses
   if the scratch copy's inode changes between validation and extraction.
 
-  Any `Pal/Saved.replaced-*` trees left by earlier restores are **listed at the
-  start** of a restore (named only — never sized, never deleted), because each is
-  a full world save and nothing else ever mentions them again.
+  Any `Pal/Saved.replaced-*` **or** `Pal/Saved.restore-*` trees left by earlier
+  restores are **listed at the start** of a restore (named only — never sized,
+  never deleted), because each is a full world save and nothing else ever mentions
+  them again.
+
+  **The swap moves contents, not the directory, and is therefore not atomic.**
+  `Pal/Saved` is a *mount point* in every Docker deployment (a named volume in
+  `docker/compose.yaml`, a bind mount in `docker/compose.live.yaml`) and
+  `rename(2)` on a mount point is `EBUSY`, so renaming the directory — which is
+  what this used to do — could not succeed in any container. Moving the entries
+  works for a mount point and an ordinary directory alike, so bare metal and every
+  container share one code path; where the two directories are under different
+  *mounts* (which is exactly the mount-point case) each move falls back to a copy on
+  `EXDEV`, as `shutil.move` does.
+
+  **Free space, in the container: budget about 2× the world on the *server*
+  volume.** With `docker/compose.yaml`'s layout the extracted staging tree and the
+  replaced world tree both land beside `Pal/Saved` — that is the **server** volume
+  — while the restored world is copied *into* the `Saved` volume, so a
+  containerised restore holds a full extracted copy and a full replaced copy on the
+  server volume at the same time, plus one world's worth on the Saved volume.
+  Bare metal renames instead and needs none of it. `ENOSPC` is consequently the
+  most likely way a swap fails, and a swap that fails partway is the mixed-tree
+  state below, so each cross-mount move is preceded by a `statvfs` check of the
+  destination against everything that phase still has to move (plus
+  `PALWARDEN_IMPORT_FREE_HEADROOM`) and **refuses before anything moves** if it will
+  not fit. A move that renames is not checked at all, because a rename consumes no
+  space.
+
+  Every destination the copy path creates is created **through the destination
+  directory's descriptor** with a call that fails on an existing name
+  (`O_CREAT|O_EXCL|O_NOFOLLOW`, `mkdir`, `symlink`), so a name already occupied in
+  `Pal/Saved` — which the service account can create at any time — is a refusal and
+  never a write through someone else's symlink. A copy that fails partway has its
+  half-written **destination** entry removed before the failure is reported, so both
+  directories hold only whole entries and the recovery instructions below are safe
+  to follow literally. The ownership pass then walks the restored tree through
+  descriptors (`os.fwalk` + `chown(..., dir_fd=…, follow_symlinks=False)`) and
+  **refuses any non-directory entry with more than one hard link**: `Pal/Saved` is
+  writable by the service account throughout the swap, and a hardlink planted in it
+  resolves to its target inode through a descriptor exactly as it does through a
+  path.
+
+  The cost of moving entries is that a failure **partway** can leave
+  `Pal/Saved` holding part of one world and part of another, where a directory
+  rename could only fail before or after. Every such failure prints exactly which
+  state the tree is in, which top-level entries are in which directory (by name),
+  the replaced tree's path,
+  the staging tree's path when it still holds entries, and the safety archive's
+  name — a mixed tree must not be started on, and the output is what says so.
 
 `--restore` is **refused in `PALWARDEN_MODE=external`**: the game runs on another
 host, so `systemctl is-active` (via the shim's `pgrep` fallback) cannot see it,
@@ -662,3 +711,167 @@ Installed to `/etc/systemd/system`. Enable only what you need.
 
 Each `*.timer` has a matching one-shot `*.service`. After changing any unit:
 `sudo systemctl daemon-reload`.
+
+---
+
+## Test tiers
+
+Three tiers, one runner. Lint is separate.
+
+```bash
+./tests/lint.sh                     # shellcheck + python py_compile
+./tests/run.sh                      # tier 1: unit only (default)
+./tests/run.sh --integration        # + tier 2: docker container scenarios
+./tests/run.sh --live               # + tier 3: a REAL Palworld server
+```
+
+`RUN_INTEGRATION=1` and `RUN_LIVE=1` are equivalent to the two flags, for CI and
+`make`-style callers. Both tiers are additive — `--live` runs unit *and* live, so
+`--integration --live` runs all three.
+
+| Tier | Gate | In CI | Server under test | Suites |
+|------|------|-------|-------------------|--------|
+| Unit | default | yes | stubs | `tests/unit/test_*.sh` |
+| Integration | `--integration` / `RUN_INTEGRATION=1` | yes | `tests/fixtures/fake-server` (a shell script pretending to be the game) in a real container | `tests/integration/test_*.sh` |
+| **Live** | `--live` / `RUN_LIVE=1` **and** a marker file | **no** | the real game, on a throwaway bind mount | `tests/live/test_*.sh` |
+
+Integration and live both need `docker`; when it is missing the runner says so and
+skips rather than failing. When the live tier is skipped it prints how to enable it,
+because a tier nobody knows exists is a tier nobody runs.
+
+### The live tier does not run in CI
+
+Deliberately, and it is not a gap to be closed. There is no ~8–10 GB game install
+on a runner, and the whole point is that **CI stays hermetic**: this project has
+already had an integration suite write into a persistent bind-mounted fixture, so
+each run pre-seeded the next — a fresh clone would have failed and one assertion was
+passing over a *failed* backup. Persistence hid a real defect for two tasks. The
+hermetic suites stay the merge gate; the live tier is a **local fidelity check** you
+run before trusting something on a real host. See
+[`docs/superpowers/specs/2026-07-28-live-test-tier-design.md`](superpowers/specs/2026-07-28-live-test-tier-design.md).
+
+What it covers — the paths a stub server cannot exercise:
+
+| Suite | What only a real game can answer |
+|-------|----------------------------------|
+| `tests/live/test_restore_roundtrip.sh` | `backup_restore` end to end: stop, extract, swap by rename, chown, start, REST readiness — and the world actually reopens. |
+| `tests/live/test_stop_consistency.sh` | A graceful stop's `SIGINT` produces a world the game loads again; and `palworld-backups --if-due` against a real `Pal/Saved` produces an archive that really unpacks. |
+| `tests/live/test_config_drift.sh` | The **semantic** drift comparison (`True` == `1`, `60.000000` == `60`) surviving the game's own rewrite of `Engine.ini`, applied `PalWorldSettings.ini` values surviving it too (with secrets still redacted), and `update_check` against real Steam. |
+
+### One-time setup
+
+The testbed is a disposable directory **outside the repository tree**, holding the
+game install and the world. It persists between runs, so the multi-GB download
+happens once.
+
+```bash
+# 1. Create it and declare it disposable. The marker is not optional: the live tier
+#    stops the server, deletes worlds and restarts it, so it refuses to touch any
+#    directory that is not marked. A mistyped path is the one accident that would
+#    actually hurt, and a real deployment will not have this file.
+export PALWARDEN_LIVE_TESTBED="$HOME/palworld-testbed"   # also the built-in default
+mkdir -p "$PALWARDEN_LIVE_TESTBED/server/Pal/Saved"
+touch "$PALWARDEN_LIVE_TESTBED/.palwarden-live-testbed"
+
+# 2. Give the stack an admin password (docker/.env or the environment). The live
+#    tier drives the server through its REST API, which the game only enables when
+#    ADMIN_PASSWORD is set — without one, readiness could never be reached.
+grep -q '^ADMIN_PASSWORD=.' docker/.env 2>/dev/null \
+  || echo "ADMIN_PASSWORD=pick-something" >> docker/.env
+
+# 3. Install the game — ONCE. The overlay pins UPDATE_ON_START=false so ordinary
+#    runs start in seconds; this is the only invocation that sets it true. ~8-10 GB
+#    via SteamCMD; no suite ever does this for you.
+UPDATE_ON_START=true COMPOSE_PROFILES=embedded \
+  PALWARDEN_LIVE_TESTBED="$PALWARDEN_LIVE_TESTBED" \
+  docker compose -p palwarden-live --project-directory docker \
+    -f docker/compose.yaml -f docker/compose.live.yaml up -d --build
+
+# ...watch it install and boot, which takes a while:
+docker compose -p palwarden-live --project-directory docker \
+  -f docker/compose.yaml -f docker/compose.live.yaml logs -f palwarden
+
+# 4. Then run the tier. The suites bring the stack up and down themselves.
+./tests/run.sh --live
+```
+
+The `-f docker/compose.yaml -f docker/compose.live.yaml` overlay is what swaps the
+`palworld-server` and `palworld-saved` **named volumes** for bind mounts into the
+testbed; `docker/compose.yaml` is left untouched, so nothing about a real deployment
+changes. The `-p palwarden-live --project-directory docker` pair is exactly what
+`tests/live/lib/testbed.sh` passes, and it is worth copying rather than relying on
+the overlay's `name:` — `COMPOSE_PROJECT_NAME`, from the environment *or* from
+`docker/.env`, overrides `name:`, and `-p` is the only reliable pin. Ports come from
+`compose.yaml`, so a real deployment already listening on 8088/8211 makes the live
+`up` fail loudly instead of quietly sharing state.
+
+Web UI credentials need no setup: the suites read the generated ones out of
+`/etc/palworld/webui.env` in the running container, and honour pinned
+`WEBUI_USER`/`WEBUI_PASSWORD`/`WEBUI_TOKEN` if you have set them.
+
+### Refusals
+
+Every mutating helper in `tests/live/lib/testbed.sh` checks the testbed first, and
+each refusal carries a stable code plus the command that fixes it:
+
+| Code | Meaning |
+|------|---------|
+| `LIVE_E_NO_TESTBED` | `$PALWARDEN_LIVE_TESTBED` does not exist. |
+| `LIVE_E_UNMARKED` | It exists but has no `.palwarden-live-testbed` marker. |
+| `LIVE_E_OWNER_UID` | The testbed, `server/`, or `server/Pal/Saved` is owned by the wrong uid — the container's `steam` account is uid **1000**, and a testbed it cannot write to surfaces later as a corrupt-looking save. `sudo chown -R 1000 "$PALWARDEN_LIVE_TESTBED"`, or set `PALWARDEN_LIVE_EXPECT_UID`. |
+| `LIVE_E_NOT_INSTALLED` | No `server/PalServer.sh` — step 3 above has not been done. |
+| `LIVE_E_NOT_EXECUTABLE` | `PalServer.sh` lost its exec bit (a restore from a tar that dropped modes). `chmod +x` it. |
+| `LIVE_E_NO_ADMIN_PASSWORD` | Step 2 above. Set-but-empty in the environment counts, and beats `docker/.env`. |
+| `LIVE_E_COMPOSE_UP` | `docker compose up` itself failed; its output is above the refusal. |
+
+The guard is exercised by `tests/unit/test_live_guard.sh`, which runs in ordinary CI
+with neither a game nor Docker: a destructive suite's safety check cannot be verified
+only by a tier nobody runs automatically.
+
+### Knobs
+
+All optional; the defaults are what the suites use.
+
+| Variable | Default | What |
+|----------|---------|------|
+| `PALWARDEN_LIVE_TESTBED` | `$HOME/palworld-testbed` | The testbed directory. |
+| `PALWARDEN_LIVE_EXPECT_UID` | `1000` | The uid the testbed must be owned by. |
+| `PALWARDEN_LIVE_PROJECT` | `palwarden-live` | Compose project name. |
+| `PALWARDEN_LIVE_REPO` | derived from the suite's path | Repo root, so the helpers can be sourced from anywhere. |
+| `PALWARDEN_LIVE_WEBUI_PORT` | asked of compose after `up` | Published host port for the web UI. |
+| `PALWARDEN_LIVE_WEBUI_USER` | `$WEBUI_USER`, else `admin` | Web UI username. |
+| `PALWARDEN_LIVE_WEBUI_PASSWORD` / `_TOKEN` | `$WEBUI_PASSWORD` / `$WEBUI_TOKEN`, else read from `/etc/palworld/webui.env` in the container | Web UI password and CSRF token. |
+| `PALWARDEN_LIVE_UP_TIMEOUT` | `420` | Seconds to wait for REST readiness. |
+| `PALWARDEN_LIVE_JOB_TIMEOUT` | `300` | Seconds for an ordinary job to settle. |
+| `PALWARDEN_LIVE_RESTORE_TIMEOUT` | `900` | The restore job (stop + extract + cold start + readiness poll). |
+| `PALWARDEN_LIVE_STOP_TIMEOUT` | `420` | The graceful stop in `test_stop_consistency.sh`. |
+| `PALWARDEN_LIVE_RESTART_TIMEOUT` | `420` | The graceful restart in `test_config_drift.sh`. |
+| `PALWARDEN_LIVE_UPDATE_TIMEOUT` | `600` | `update_check` against real Steam. |
+
+Every wait in the tier is bounded: a live suite that hangs is worse than one that
+fails, because nobody watches it long enough to notice.
+
+### World drift, and the escape hatch
+
+There is **no** pristine-world snapshot and no reset between runs. The world
+accumulates play state, and a suite that failed halfway leaves it drifted — both are
+expected and harmless, because every live assertion is written against an artefact
+the same run created (a marker carrying a fresh nonce, a private backups directory,
+a config value the run chose to differ from what was on disk), never against an
+assumed world state or file list.
+
+When a half-finished run leaves the testbed in a state not worth reasoning about,
+throw the world away and keep the expensive install:
+
+```bash
+cd /path/to/palwarden
+source tests/live/lib/testbed.sh
+live_down          # stop the stack first — the game holds the save open and would
+                   # write it back out on shutdown
+live_reset_world   # deletes $PALWARDEN_LIVE_TESTBED/server/Pal/Saved, recreates it
+                   # empty; the server generates a fresh world on the next start
+```
+
+Both are guarded, so neither can run against an unmarked directory. See the runbook,
+[§16](palworld-service-runbook.md#16-the-live-test-testbed), for the operator-facing
+version of this.

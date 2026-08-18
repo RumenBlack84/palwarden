@@ -1055,5 +1055,34 @@ CONFIG_FILE_OVERRIDE="$WORK/no-such-config.ini" jobd --once >/dev/null 2>&1
 assert_eq "$(state_of "$id")" "failed" "missing live config refuses the save"
 assert_contains "$(output_of "$id")" "cannot read" "explains why"
 assert_eq "$(wc -c < "$WORK/argv.log" | tr -d ' ')" "0" "no apply or restart after a refused save"
+# --- a step that times out still records everything it printed -------------
+# The whole mitigation for a mid-swap restore failure is that the tool names the
+# exact state it left the world in, and this is the path that used to throw all of
+# it away: `subprocess.run(capture_output=True, timeout=...)` buffers the child's
+# output and hands it over at the end, so a killed step recorded only
+# `TimeoutExpired`'s `str()`. That was survivable while a timed-out step could only
+# be a long tar. It stopped being survivable when `--restore` began swapping
+# `Pal/Saved`'s contents entry by entry: a SIGKILL can now land *mid-swap*, and the
+# containerised restore copies the world rather than relinking it, so it is also
+# roughly twice as slow.
+cat > "$WORK/bin/palworld-backup" <<EOF
+#!/usr/bin/env bash
+echo "moved SaveGames aside, this is the state report"
+echo "and this line went to stderr" >&2
+# Longer than the timeout below, so the step is killed rather than finishing.
+sleep 30
+EOF
+chmod +x "$WORK/bin/palworld-backup"
+id="$(enqueue backup '{}')"
+PALWARDEN_JOBD_STEP_TIMEOUT=1 jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "failed" "a step that exceeds the timeout fails the job"
+assert_contains "$(output_of "$id")" "moved SaveGames aside, this is the state report" \
+  "the output the step printed before it was killed is recorded"
+assert_contains "$(output_of "$id")" "and this line went to stderr" \
+  "...its stderr too, merged in the order it was written"
+assert_contains "$(output_of "$id")" "timed out after 1s and was killed" \
+  "...and the job says the step was killed rather than leaving the operator guessing"
+stub_tools
+
 
 assert_report

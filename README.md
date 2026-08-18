@@ -41,7 +41,7 @@ join-info publishing.
 | `webui/` | The control-plane dashboard plus HTML editors for server settings and Engine.ini, both wired live to the server through the control plane. |
 | `docs/` | Architecture, per-tool reference, config guide, backlog, Docker roadmap, and the original export artifacts. |
 | `docker/` | All-in-one container image, compose stack, and s6 service definitions. |
-| `tests/` | Unit + docker integration test suites (`./tests/run.sh`). |
+| `tests/` | Three test tiers, one runner: unit (`./tests/run.sh`), docker integration (`--integration`), and a **live** tier that drives a real throwaway Palworld server (`--live`, off by default and never in CI) — see [Test tiers](docs/tools.md#test-tiers). |
 | `install.sh` | Deploys everything to the real filesystem paths and reloads systemd. |
 
 Start with **[`docs/architecture.md`](docs/architecture.md)** for how the pieces
