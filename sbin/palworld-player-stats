@@ -1,0 +1,366 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Brian Grant
+"""Save-derived per-player stats: parse Players/<uid>.sav into a JSON snapshot.
+
+Spec: docs/superpowers/specs/2026-08-18-player-stats-board-design.md.
+
+`refresh` (run by a periodic job) re-parses only players whose file mtime
+changed and rewrites the snapshot atomically; `show` reads the snapshot back
+(never touching the codec, so it works without pyooz); `dump` introspects a
+single .sav — the tool that pins RecordData property names against real
+saves. Degradation is state, not failure: `refresh` always exits 0 and
+always writes a snapshot whose `status`/`degraded_reason`/per-player
+`parse_status` say what actually happened.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime
+import json
+import os
+import re
+import sys
+import tempfile
+from pathlib import Path
+
+# Mirror palwarden-webui: prepend the bare-metal lib dir and the repo's lib/
+# so palwarden_gvas resolves in both installed and dev-checkout layouts.
+sys.path.insert(0, "/usr/local/lib")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import palwarden_gvas as gvas  # noqa: E402
+
+# The live world tree, resolved exactly as palworld-backup/palworld-restore
+# resolve it — same variables, same precedence, and the same
+# `${PALWORLD_SAVED_DIR-...}` semantics where a *set but empty* override is
+# honoured while an unset one falls through PALWORLD_INSTALL_DIR.
+_saved = os.environ.get("PALWORLD_SAVED_DIR")
+if _saved is None:
+    _saved = (os.environ.get("PALWORLD_INSTALL_DIR") or "/opt/palworld/server") + "/Pal/Saved"
+SAVED_DIR = Path(_saved)
+
+SNAPSHOT_FILE = Path(os.environ.get(
+    "PALWARDEN_PLAYER_STATS_FILE", "/var/lib/palworld/player-stats.json"))
+
+SCHEMA_VERSION = 1
+# Players/<uid>.sav names are the save's own uppercase-hex UIDs (== the REST
+# playerId); anything else in that directory is not ours to parse.
+UID_RE = re.compile(r"^[0-9A-F]{32}$")
+# Player saves are ~1 MiB; the cap is a tripwire, not a budget.
+COPY_CAP = 64 * 1024 * 1024
+COPY_CHUNK = 1024 * 1024
+
+# v1 aggregates: RecordData ledgers folded to counts that need no ID->name
+# tables (friendly names are backlog item 10's content work). Property names
+# verified against production saves (game v1.0.x, 2026-08-18) via `dump`.
+# An absent or unparsed ledger simply leaves its aggregate out — per-field
+# degradation. Modes:
+#   count_true: flag map -> number of true values
+#   sum:        int map  -> sum of values
+#   count:      any map  -> number of keys
+#   int:        plain int scalar (repeated stat names accumulate)
+AGGREGATES = (
+    ("towers_cleared", "TowerBossDefeatFlag", "count_true"),
+    ("bosses_defeated", "NormalBossDefeatFlag", "count_true"),
+    ("captures_total", "PalCaptureCount", "sum"),
+    ("species_captured_distinct", "PalCaptureCount", "count"),
+    ("paldeck_unlocked", "PaldeckUnlockFlag", "count_true"),
+    ("items_crafted_total", "CraftItemCount", "sum"),
+    ("items_crafted_distinct", "CraftItemCount", "count"),
+    ("fish_caught_total", "FishingCountMap", "sum"),
+    ("fish_species_distinct", "FishingCountMap", "count"),
+    ("npc_talks_total", "NPCTalkCountMap", "sum"),
+    ("dungeons_cleared", "NormalDungeonClearCount", "int"),
+    ("dungeons_cleared", "FixedDungeonClearCount", "int"),
+    ("camps_conquered", "CampConqueredCount", "int"),
+    ("relics_obtained", "RelicObtainForInstanceFlag", "count_true"),
+    ("notes_obtained", "NoteObtainForInstanceFlag", "count_true"),
+    ("fast_travels_unlocked", "FastTravelPointUnlockFlag", "count_true"),
+)
+
+
+def iso_utc(ts: float | None = None) -> str:
+    dt = (datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
+          if ts is not None else datetime.datetime.now(tz=datetime.timezone.utc))
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def log(msg: str) -> None:
+    print(f"palworld-player-stats: {msg}", file=sys.stderr)
+
+
+def read_snapshot(path: Path) -> dict:
+    try:
+        snap = json.loads(path.read_text())
+        if isinstance(snap, dict) and isinstance(snap.get("players"), dict):
+            return snap
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {"players": {}}
+
+
+def write_snapshot(path: Path, snap: dict) -> None:
+    # Atomic like palworld-service-events: a reader (the webui's `show`)
+    # must never see a half-written snapshot.
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(snap, indent=2, sort_keys=True) + "\n")
+    os.chmod(tmp, 0o644)
+    tmp.replace(path)
+
+
+def copy_bounded(src: Path, dst: Path) -> None:
+    """Copy the live file to scratch; the parse only ever sees the copy.
+
+    The game rewrites saves on autosave and at exit, so the copy is the
+    consistency boundary: a torn copy fails the header/extent checks in the
+    parser, we retry once, and a still-torn file degrades to `unreadable`.
+    """
+    with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
+        copied = 0
+        while True:
+            chunk = fsrc.read(COPY_CHUNK)
+            if not chunk:
+                return
+            copied += len(chunk)
+            if copied > COPY_CAP:
+                raise gvas.SavCorrupt(
+                    f"file exceeded the {COPY_CAP}-byte cap while copying")
+            fdst.write(chunk)
+
+
+def parse_player_file(path: Path, scratch: Path) -> tuple[dict, list[str]]:
+    """Copy + parse, one retry on a torn read. Raises SavCorrupt if it stays torn."""
+    last: Exception | None = None
+    for attempt in ("first", "retry"):
+        copy = scratch / f"{path.name}.{attempt}"
+        try:
+            copy_bounded(path, copy)
+            return gvas.parse_sav(copy.read_bytes())
+        except gvas.SavCorrupt as exc:
+            last = exc
+        finally:
+            try:
+                copy.unlink()
+            except OSError:
+                pass
+    raise last  # type: ignore[misc]
+
+
+def aggregate(record: dict) -> dict:
+    stats: dict = {}
+    for stat_name, prop_name, mode in AGGREGATES:
+        value = record.get(prop_name)
+        try:
+            if mode == "int":
+                if isinstance(value, bool) or not isinstance(value, int):
+                    continue
+                stats[stat_name] = stats.get(stat_name, 0) + value
+                continue
+            if not isinstance(value, dict):
+                continue
+            if mode == "count_true":
+                stats[stat_name] = sum(1 for v in value.values() if v is True)
+            elif mode == "sum":
+                stats[stat_name] = sum(int(v) for v in value.values())
+            elif mode == "count":
+                stats[stat_name] = len(value)
+        except (TypeError, ValueError):
+            continue  # a misshapen ledger loses its aggregate, nothing else
+    return stats
+
+
+def build_entry(props: dict, errors: list[str], mtime_ns: int) -> dict:
+    save_data = props.get("SaveData")
+    record = save_data.get("RecordData") if isinstance(save_data, dict) else None
+    if not isinstance(record, dict):
+        return {
+            "parse_status": "error",
+            "parse_errors": errors + ["no RecordData in save"],
+            "source_mtime": mtime_ns,
+            "parsed_at": iso_utc(),
+            "stats": {},
+            "records": {},
+        }
+    return {
+        "parse_status": "partial" if errors else "ok",
+        "parse_errors": errors,
+        "source_mtime": mtime_ns,
+        "parsed_at": iso_utc(),
+        "stats": aggregate(record),
+        # The per-key ledgers stay in the snapshot so backlog item 10 can
+        # diff successive snapshots ("new tower boss", "first legendary
+        # craft"); the Players page renders only `stats`.
+        "records": {k: v for k, v in record.items() if isinstance(v, dict)},
+    }
+
+
+def find_world_dir() -> tuple[Path | None, str | None, str | None]:
+    """-> (world_dir, status, degraded_reason); status is None when healthy."""
+    root = SAVED_DIR / "SaveGames" / "0"
+    try:
+        worlds = sorted(p for p in root.iterdir() if p.is_dir())
+    except OSError:
+        worlds = []
+    if not worlds:
+        return None, "no-world-dir", f"no world directory under {root}"
+    if len(worlds) > 1:
+        names = ", ".join(p.name for p in worlds)
+        return None, "multiple-world-dirs", (
+            f"expected exactly one world under {root}, found: {names}")
+    return worlds[0], None, None
+
+
+def cmd_refresh(args: argparse.Namespace) -> int:
+    snapshot_file = Path(args.snapshot) if args.snapshot else SNAPSHOT_FILE
+    previous = read_snapshot(snapshot_file)
+    old_players: dict = previous.get("players", {})
+
+    snap = {
+        "schema_version": SCHEMA_VERSION,
+        "generated_at": iso_utc(),
+        "world_dir": None,
+        "status": "ok",
+        "degraded_reason": None,
+        "players": old_players,
+    }
+
+    world_dir, status, reason = find_world_dir()
+    if world_dir is None:
+        # Degradation is state, not failure: the snapshot says why, the
+        # previous players are retained, and the exit code stays 0.
+        snap["status"] = status
+        snap["degraded_reason"] = reason
+        write_snapshot(snapshot_file, snap)
+        log(reason)
+        return 0
+    snap["world_dir"] = str(world_dir)
+
+    players: dict = {}
+    parser_unavailable: str | None = None
+    with tempfile.TemporaryDirectory(prefix="palworld-player-stats.") as scratch_dir:
+        scratch = Path(scratch_dir)
+        for sav in sorted((world_dir / "Players").glob("*.sav")):
+            uid = sav.stem
+            if uid.endswith("_dps"):
+                continue  # <uid>_dps.sav: the game's pal-storage sidecar, expected
+            if not UID_RE.match(uid):
+                log(f"skipping non-uid save file name: {sav.name}")
+                continue
+            try:
+                mtime_ns = sav.stat().st_mtime_ns
+            except OSError as exc:
+                log(f"cannot stat {sav.name}: {exc}")
+                continue
+            old = old_players.get(uid)
+            # ns precision on purpose: the game has been observed rewriting a
+            # file within the same second as an operator-side change.
+            if old and old.get("source_mtime") == mtime_ns:
+                players[uid] = old
+                continue
+            try:
+                props, errors = parse_player_file(sav, scratch)
+                players[uid] = build_entry(props, errors, mtime_ns)
+            except gvas.ParserUnavailable as exc:
+                parser_unavailable = str(exc)
+                if old:
+                    players[uid] = old
+            except gvas.SavCorrupt as exc:
+                # Stays torn after the retry: keep the previous good stats,
+                # say so, and leave source_mtime stale so the next pass retries.
+                entry = dict(old) if old else {"stats": {}, "records": {}}
+                entry["parse_status"] = "unreadable"
+                entry["parse_errors"] = [str(exc)[:160]]
+                players[uid] = entry
+
+    snap["players"] = players
+    if parser_unavailable:
+        snap["status"] = "parser-unavailable"
+        snap["degraded_reason"] = parser_unavailable
+        log(parser_unavailable)
+    write_snapshot(snapshot_file, snap)
+    return 0
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    snapshot_file = Path(args.snapshot) if args.snapshot else SNAPSHOT_FILE
+    try:
+        snap = json.loads(snapshot_file.read_text())
+    except (OSError, json.JSONDecodeError):
+        snap = {
+            "schema_version": SCHEMA_VERSION,
+            "generated_at": None,
+            "world_dir": None,
+            "status": "no-snapshot",
+            "degraded_reason": (
+                f"no snapshot at {snapshot_file} yet — is the "
+                "palworld-player-stats refresh job running?"),
+            "players": {},
+        }
+    if args.json:
+        print(json.dumps(snap, indent=2, sort_keys=True))
+        return 0
+    status = snap.get("status", "?")
+    print(f"status: {status}"
+          + (f" ({snap.get('degraded_reason')})" if snap.get("degraded_reason") else ""))
+    players = snap.get("players") or {}
+    if not players:
+        print("no players in the snapshot yet")
+        return 0
+    for uid, entry in sorted(players.items()):
+        stats = entry.get("stats") or {}
+        summary = ", ".join(f"{k}={v}" for k, v in sorted(stats.items()))
+        print(f"{uid}  [{entry.get('parse_status', '?')}]  {summary}")
+    return 0
+
+
+def cmd_dump(args: argparse.Namespace) -> int:
+    """Introspect one .sav: RecordData keys and shapes (pins property names)."""
+    data = Path(args.sav).read_bytes()
+    props, errors = gvas.parse_sav(data)
+    save_data = props.get("SaveData") if isinstance(props.get("SaveData"), dict) else {}
+    record = save_data.get("RecordData") if isinstance(save_data.get("RecordData"), dict) else {}
+
+    def shape(v):
+        if isinstance(v, dict):
+            sample = next(iter(v.items()), None)
+            return {"kind": "map", "len": len(v),
+                    "sample": [str(sample[0])[:60], sample[1]] if sample else None}
+        if isinstance(v, list):
+            return {"kind": "list", "len": len(v)}
+        return {"kind": type(v).__name__, "value": v if not isinstance(v, str) else v[:60]}
+
+    out = {
+        "top_keys": sorted(props),
+        "savedata_keys": sorted(save_data),
+        "record_keys": {k: shape(v) for k, v in sorted(record.items())},
+        "errors": errors,
+    }
+    print(json.dumps(out, indent=2, sort_keys=True))
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Save-derived per-player stats snapshot")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("refresh", help="re-parse changed player saves, rewrite the snapshot")
+    p.add_argument("--snapshot", help=f"snapshot path (default {SNAPSHOT_FILE})")
+    p.set_defaults(func=cmd_refresh)
+
+    p = sub.add_parser("show", help="print the snapshot (never touches the save codec)")
+    p.add_argument("--snapshot", help=f"snapshot path (default {SNAPSHOT_FILE})")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_show)
+
+    p = sub.add_parser("dump", help="introspect one .sav: RecordData keys and shapes")
+    p.add_argument("sav")
+    p.set_defaults(func=cmd_dump)
+
+    args = parser.parse_args()
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

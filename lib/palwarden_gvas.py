@@ -103,15 +103,17 @@ def decompress_sav(data: bytes) -> bytes:
 
 def _oodle_decompress(payload: bytes, ulen: int) -> bytes:
     try:
-        import pyooz  # the one optional dependency; PlZ never gets here
+        # The PyPI package is `pyooz`, but the module it installs is `ooz`
+        # (ooz.abi3.so). The one optional dependency; PlZ never gets here.
+        import ooz
     except ImportError as exc:
         raise ParserUnavailable(
             "Oodle-compressed (PlM) save but pyooz is not installed — "
             "see docs/tools.md (palworld-player-stats) for the install step"
         ) from exc
     try:
-        return pyooz.decompress(payload, ulen)
-    except Exception as exc:  # pyooz raises plain Exceptions
+        return ooz.decompress(payload, ulen)
+    except Exception as exc:  # ooz raises RuntimeError on bad data
         raise SavCorrupt(f"oodle: {exc}") from exc
 
 

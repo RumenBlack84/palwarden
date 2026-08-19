@@ -102,15 +102,16 @@ work. v1 ships only aggregates that need none:
 | `relics_obtained` | `RelicObtainForInstanceFlag` — count of true |
 | `notes_obtained` | `NoteObtainForInstanceFlag` — count of true |
 | `fast_travels_unlocked` | `FastTravelPointUnlockFlag` — count of true |
-| `items_crafted_total` | craft ledger — **name TBD** |
-| `fish_caught_total` / `fish_species_distinct` | fish ledger — **name TBD** |
-| `npc_talks_total` | NPC talk ledger — **name TBD** |
-| `dungeons_cleared` | dungeon ledger — **name TBD** |
+| `items_crafted_total` / `items_crafted_distinct` | `CraftItemCount` — sum / key count |
+| `fish_caught_total` / `fish_species_distinct` | `FishingCountMap` — sum / key count |
+| `npc_talks_total` | `NPCTalkCountMap` — sum |
+| `dungeons_cleared` | `NormalDungeonClearCount` + `FixedDungeonClearCount` (plain ints) |
+| `camps_conquered` | `CampConqueredCount` (plain int) |
 
-TBD names are pinned by running `palworld-player-stats dump` against a real
-production player save (read-only copy) before the mapping is finalized; an
-aggregate whose property is absent or unparsed is simply absent from `stats`
-— per-field degradation makes shipping the known subset safe.
+All property names verified against production saves (game v1.0.x,
+2026-08-18) via `palworld-player-stats dump`; a real player save parsed with
+zero errors. An aggregate whose property is absent or unparsed is simply
+absent from `stats` — per-field degradation makes format drift safe.
 
 ## Refresh model
 
