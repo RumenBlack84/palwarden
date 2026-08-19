@@ -179,7 +179,12 @@ Purpose:
 
 ## 9. Per-player stats board (save-derived)
 
-Recorded: 2026-08-16. Grow the Players tab (shipped with presence tracking —
+Recorded: 2026-08-16. **Shipped 2026-08-18** — spec:
+`docs/superpowers/specs/2026-08-18-player-stats-board-design.md`;
+`palworld-player-stats` (refresh/show/dump), `lib/palwarden_gvas.py`,
+`/api/player-stats`, stats on the Players page, 60s timer + s6 service.
+The snapshot's `records` section keeps the per-key ledgers item 10 will
+diff. Everything below stands as the original design record. Grow the Players tab (shipped with presence tracking —
 see `docs/superpowers/specs/2026-08-16-player-presence-design.md`) into a full
 stats board using the save files themselves.
 
@@ -257,9 +262,9 @@ two tiers:
 
 1. ~~Add crash/restart watchdog summary.~~ — done, see item 8.
 2. Consider wiring health report failures into alert-only notifications.
-3. Stats board (item 9) — first, it forces the save reader into existence
-   with zero risk (pure reads).
-4. Milestone announcements (item 10) — same reader plus a diff store and the
-   curated name tables.
+3. ~~Stats board (item 9).~~ — done 2026-08-18; the save reader exists and
+   has parsed production saves with zero errors.
+4. Milestone announcements (item 10) — diff the stats snapshot's `records`
+   (already retained per refresh) plus the curated name tables.
 5. Export tier 1 (item 11) — cheap, any time; tier 2 waits for reader
    maturity across game patches.
