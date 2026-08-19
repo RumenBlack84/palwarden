@@ -282,6 +282,11 @@ if [[ "$MODE" == "embedded" ]]; then
   # decided per tick inside palworld-backups, so switching backups off from the
   # panel needs no service change and switching them back on needs no recreate.
   enable_service backup-auto
+  # Save-derived player stats for the web UI's Players page, embedded only
+  # (external mode has no local save tree). Like backup-auto, enabled
+  # unconditionally: a missing pyooz codec is the tool's own degraded state,
+  # reported through the snapshot, not a reason to gate the service.
+  enable_service player-stats
 
   # Upgrade guard for the release that moved /opt/palworld/backups onto its own
   # volume. Before it, archives lived in the container's writable layer, which

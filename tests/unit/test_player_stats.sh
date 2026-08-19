@@ -19,7 +19,7 @@ trap 'rm -rf "$WORK"' EXIT
 export PYTHONPATH="$REPO/lib:$REPO/tests/lib${PYTHONPATH:+:$PYTHONPATH}"
 
 # py() runs an inline python check that prints assert_eq-able output.
-py() { python3 - "$@" 2>&1; }
+py() { python3 - 2>&1; }
 
 echo "-- reader: fixture round-trip --"
 out="$(py <<'PY'
@@ -223,7 +223,7 @@ PY
 
 refresh() {
   env PALWORLD_SAVED_DIR="$SAVED" PALWARDEN_PLAYER_STATS_FILE="$SNAP" \
-      python3 "$TOOL" refresh "$@"
+      python3 "$TOOL" refresh
 }
 # snap_q <python-expr over `s` (the loaded snapshot)>
 snap_q() { python3 - "$SNAP" "$1" <<'PY'
@@ -362,5 +362,19 @@ assert_file_contains "$SVC" "palworld-player-stats refresh" "service runs the re
 assert_file_contains "$TMR" "OnUnitActiveSec=60" "timer undercuts any plausible autosave interval"
 assert_file_contains "$REPO/packaging/scripts/preremove.sh" "palworld-player-stats.timer" \
   "package removal disables the timer"
+
+echo "-- deployment: container service --"
+RUN_SCRIPT="$REPO/docker/s6-rc.d/player-stats/run"
+assert_file_exists "$RUN_SCRIPT" "s6 service run script exists"
+assert_file_exists "$REPO/docker/s6-rc.d/player-stats/type" "s6 service type file exists"
+assert_file_contains "$RUN_SCRIPT" "s6-setuidgid steam" "refresh runs unprivileged in-container"
+assert_file_contains "$RUN_SCRIPT" 'PLAYER_STATS_INTERVAL:-60' "interval is overridable, default 60s"
+assert_file_contains "$RUN_SCRIPT" "palworld-player-stats refresh" "the service runs the refresh"
+assert_file_contains "$REPO/docker/entrypoint.sh" "enable_service player-stats" \
+  "the entrypoint enables the service (embedded mode)"
+assert_file_contains "$REPO/docker/Dockerfile" "WITH_PLAYER_STATS" \
+  "the codec install is a build arg"
+assert_file_contains "$REPO/docker/Dockerfile" "pyooz==" \
+  "pyooz is version-pinned"
 
 assert_report
