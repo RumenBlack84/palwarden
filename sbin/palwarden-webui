@@ -644,6 +644,14 @@ def ep_playtime(_query: dict) -> dict:
     return run_tool_json([str(SBIN / "palworld-fps"), "playtime", "--json"])
 
 
+def ep_player_stats(_query: dict) -> dict:
+    """The save-derived stats snapshot. `show` only reads the JSON the
+    periodic refresh job wrote — it never touches the save codec, so this
+    endpoint works (reporting the degraded state) even where pyooz isn't
+    installed."""
+    return run_tool_json([str(SBIN / "palworld-player-stats"), "show", "--json"])
+
+
 def ep_engine(_query: dict) -> dict:
     result = run_tool([str(SBIN / "palworld-engine-config"), "status", "--check"])
     if not result["ok"]:
@@ -764,6 +772,7 @@ READ_ENDPOINTS = {
     "/api/events": ep_events,
     "/api/service-events": ep_service_events,
     "/api/playtime": ep_playtime,
+    "/api/player-stats": ep_player_stats,
     "/api/engine": ep_engine,
     "/api/config": ep_config,
     "/api/backups": ep_backups,
