@@ -724,6 +724,8 @@ assert_file_contains "$PLAYERS" "degraded_reason" \
   "the page surfaces the snapshot's degraded state"
 assert_file_contains "$PLAYERS" "toUpperCase" \
   "the presence-to-stats join normalizes the uid"
+assert_file_contains "$PLAYERS" "statsOnly" \
+  "players the saves know but presence has never seen still get a card"
 assert_file_contains "$PAGE" 'href="backups.html" aria-current="page"' \
   "the Backups page marks its own tab as current"
 

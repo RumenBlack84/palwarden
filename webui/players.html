@@ -110,7 +110,9 @@ function playerCard(p, s) {
   content.className = "pw-section__content";
   const dl = document.createElement("dl");
   dl.className = "pw-stats";
-  const rows = [
+  // A stats-only card (name === null: the saves know this uid but presence
+  // has never seen it) skips the presence rows instead of rendering zeros.
+  const rows = p.name === null ? [["presence", "not seen since tracking began"]] : [
     ["level", p.level == null ? "n/a" : String(p.level)],
     ["playtime (tracked)", fmtDuration(p.total_play_seconds || 0)],
     ["last 7 days", fmtDuration(p.play_7d_seconds || 0)],
@@ -165,9 +167,17 @@ async function refresh() {
     if (res.ok === false) throw new Error(res.error || "request failed");
     const players = (res.data && res.data.players) || [];
     const entries = (snap && snap.players) || {};
+    const seen = new Set(players.map((p) => String(p.player_uid || "").toUpperCase()));
+    // Players the saves know but presence has never seen (inactive since
+    // presence tracking shipped): still on the board, keyed by uid until
+    // their next login supplies a name.
+    const statsOnly = Object.keys(entries).filter((uid) => !seen.has(uid)).sort()
+      .map((uid) => playerCard({ player_uid: uid, name: null, online: false },
+                               entries[uid]));
     grid.replaceChildren(...players.map(
-      (p) => playerCard(p, entries[String(p.player_uid || "").toUpperCase()])));
-    if (players.length) {
+      (p) => playerCard(p, entries[String(p.player_uid || "").toUpperCase()])),
+      ...statsOnly);
+    if (players.length || statsOnly.length) {
       status.hidden = true;
     } else {
       status.hidden = false;
