@@ -348,4 +348,19 @@ out="$(python3 "$TOOL" dump "$PLAYERS/$UID_A.sav")"
 assert_contains "$out" "PalCaptureCount" "dump names the ledgers"
 assert_contains "$out" "TowerBossDefeatFlag" "dump names the flag maps"
 
+echo "-- deployment: bare-metal units --"
+SVC="$REPO/systemd/palworld-player-stats.service"
+TMR="$REPO/systemd/palworld-player-stats.timer"
+assert_file_exists "$SVC" "refresh service unit exists"
+assert_file_exists "$TMR" "refresh timer unit exists"
+assert_file_contains "$SVC" "Type=oneshot" "service is a oneshot"
+assert_file_contains "$SVC" "flock -n /run/palworld-player-stats/lock" "service is flocked"
+assert_file_contains "$SVC" "RuntimeDirectory=palworld-player-stats" \
+  "the unprivileged user gets a writable lock dir"
+assert_file_contains "$SVC" "User=palworld" "refresh runs unprivileged"
+assert_file_contains "$SVC" "palworld-player-stats refresh" "service runs the refresh"
+assert_file_contains "$TMR" "OnUnitActiveSec=60" "timer undercuts any plausible autosave interval"
+assert_file_contains "$REPO/packaging/scripts/preremove.sh" "palworld-player-stats.timer" \
+  "package removal disables the timer"
+
 assert_report
