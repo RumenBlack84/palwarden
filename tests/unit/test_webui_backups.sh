@@ -711,6 +711,21 @@ assert_file_not_contains "$PLAYERS" "innerHTML" \
   "no HTML sink anywhere near player-controlled names"
 assert_file_contains "$PLAYERS" "No players seen yet" \
   "an empty history gets a friendly message"
+# --- save-derived stats on the Players page (spec: player stats board design) --
+assert_file_contains "$PLAYERS" '"/api/player-stats"' \
+  "the Players page reads the stats snapshot endpoint"
+assert_file_contains "$PLAYERS" "stats as of" \
+  "each card says how fresh its save-derived stats are"
+assert_file_contains "$PLAYERS" "towers cleared" \
+  "the cards render the tower aggregate"
+assert_file_contains "$PLAYERS" "items crafted" \
+  "the cards render the craft aggregate"
+assert_file_contains "$PLAYERS" "degraded_reason" \
+  "the page surfaces the snapshot's degraded state"
+assert_file_contains "$PLAYERS" "toUpperCase" \
+  "the presence-to-stats join normalizes the uid"
+assert_file_contains "$PLAYERS" "statsOnly" \
+  "players the saves know but presence has never seen still get a card"
 assert_file_contains "$PAGE" 'href="backups.html" aria-current="page"' \
   "the Backups page marks its own tab as current"
 

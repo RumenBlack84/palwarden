@@ -47,6 +47,11 @@ if [ "\${1:-}" = "graph" ]; then
 fi
 echo '{"windows":{"24h":{"avg":59.5}}}'
 EOF
+cat > "$WORK/sbin/palworld-player-stats" <<EOF
+#!/usr/bin/env bash
+echo "\$@" >> "$WORK/player-stats-argv.log"
+echo '{"schema_version": 1, "status": "ok", "players": {"022E0173000000000000000000000000": {"parse_status": "ok", "stats": {"towers_cleared": 3}}}}'
+EOF
 cat > "$WORK/sbin/palworld-service-events" <<'EOF'
 #!/usr/bin/env bash
 echo '{"restarts":2,"unexpected":1,"outages":0}'
@@ -166,6 +171,18 @@ assert_contains "$pt" '"ok": true' "playtime answers in the house shape"
 assert_contains "$pt" '"Snax"' "playtime returns the tool's JSON under data"
 assert_contains "$(tail -n 1 "$WORK/fps-argv.log")" "playtime --json" \
   "the endpoint runs the playtime subcommand in JSON mode"
+# --- the player-stats endpoint ---------------------------------------------
+assert_eq "$(code "$U/api/player-stats")" "401" "player-stats requires auth"
+ps="$(body -u "$CREDS" "$U/api/player-stats")"
+assert_contains "$ps" '"ok": true' "player-stats answers in the house shape"
+assert_contains "$ps" '"towers_cleared": 3' "player-stats returns the snapshot under data"
+assert_contains "$(tail -n 1 "$WORK/player-stats-argv.log")" "show --json" \
+  "the endpoint runs the codec-free show subcommand in JSON mode"
+cp "$WORK/sbin/palworld-player-stats" "$WORK/player-stats-stub.bak"
+cp "$WORK/sbin/palworld-broken-tool" "$WORK/sbin/palworld-player-stats"
+assert_contains "$(body -u "$CREDS" "$U/api/player-stats")" '"ok": false' \
+  "a failing player-stats tool reports ok:false, not a blank panel"
+cp "$WORK/player-stats-stub.bak" "$WORK/sbin/palworld-player-stats"
 
 # A failing render (fresh install: no samples yet) answers in the house JSON
 # shape with the tool's own words, not a broken image or a traceback.

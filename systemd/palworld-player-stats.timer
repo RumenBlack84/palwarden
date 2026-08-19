@@ -1,0 +1,12 @@
+[Unit]
+Description=Refresh player stats every minute (mtime-cached; idle passes are stat() calls)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=60s
+AccuracySec=5s
+Persistent=false
+Unit=palworld-player-stats.service
+
+[Install]
+WantedBy=timers.target

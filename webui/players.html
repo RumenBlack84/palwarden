@@ -52,6 +52,7 @@
   <p>Who has been on the server, as observed by the sampler. Playtime is
      tracked since each player's first login after presence tracking shipped —
      it is not their all-time total.</p>
+  <p class="pw-empty" id="players-stats-note" hidden></p>
   <p class="pw-empty" id="players-status">Loading…</p>
   <div class="pw-grid" id="players-grid"></div>
 </div>
@@ -71,10 +72,30 @@ function fmtDuration(seconds) {
   return h + "h " + String(m).padStart(2, "0") + "m";
 }
 
+// Save-derived aggregates, rendered when the stats snapshot has this player.
+// Labels only for keys the snapshot actually carries — an aggregate whose
+// ledger degraded on a game update simply doesn't render (spec: per-field
+// degradation). Friendly per-ID names are backlog item 10, not this page.
+const STAT_ROWS = [
+  ["captures", "captures_total"],
+  ["species caught", "species_captured_distinct"],
+  ["paldeck unlocked", "paldeck_unlocked"],
+  ["towers cleared", "towers_cleared"],
+  ["bosses defeated", "bosses_defeated"],
+  ["dungeons cleared", "dungeons_cleared"],
+  ["camps conquered", "camps_conquered"],
+  ["items crafted", "items_crafted_total"],
+  ["fish caught", "fish_caught_total"],
+  ["fast travels", "fast_travels_unlocked"],
+  ["relics", "relics_obtained"],
+  ["notes", "notes_obtained"],
+  ["NPC chats", "npc_talks_total"],
+];
+
 // A .pw-section card per player, built node-by-node. The header is static
 // (an always-open tile, like the dashboard nameplate): name left, state pill
 // right. The body is the dashboard's label/value stats idiom.
-function playerCard(p) {
+function playerCard(p, s) {
   const card = document.createElement("section");
   card.className = "pw-section pw-section--teal";
   const header = document.createElement("div");
@@ -89,7 +110,9 @@ function playerCard(p) {
   content.className = "pw-section__content";
   const dl = document.createElement("dl");
   dl.className = "pw-stats";
-  const rows = [
+  // A stats-only card (name === null: the saves know this uid but presence
+  // has never seen it) skips the presence rows instead of rendering zeros.
+  const rows = p.name === null ? [["presence", "not seen since tracking began"]] : [
     ["level", p.level == null ? "n/a" : String(p.level)],
     ["playtime (tracked)", fmtDuration(p.total_play_seconds || 0)],
     ["last 7 days", fmtDuration(p.play_7d_seconds || 0)],
@@ -97,6 +120,18 @@ function playerCard(p) {
     ["last seen", p.online ? "now" : (p.last_seen || "n/a")],
     ["first seen", p.first_seen || "n/a"],
   ];
+  if (s) {
+    const stats = s.stats || {};
+    for (const [label, key] of STAT_ROWS) {
+      if (stats[key] != null) rows.push([label, String(stats[key])]);
+    }
+    if (s.parse_status && s.parse_status !== "ok") {
+      rows.push(["stats status", String(s.parse_status)]);
+    }
+    if (s.parsed_at) {
+      rows.push(["stats as of", String(s.parsed_at).replace("T", " ").replace("Z", " UTC")]);
+    }
+  }
   for (const [label, value] of rows) {
     const dt = document.createElement("dt"); dt.textContent = label;
     const dd = document.createElement("dd"); dd.textContent = value;
@@ -109,13 +144,40 @@ function playerCard(p) {
 
 async function refresh() {
   const status = document.getElementById("players-status");
+  const note = document.getElementById("players-stats-note");
   const grid = document.getElementById("players-grid");
+
+  // The save-derived snapshot is optional garnish: any failure here degrades
+  // the page to presence-only, it never breaks it.
+  let snap = null;
+  try {
+    const sres = await get("/api/player-stats");
+    if (sres.ok !== false && sres.data) snap = sres.data;
+  } catch (e) { /* presence-only */ }
+  if (snap && snap.status && snap.status !== "ok") {
+    note.hidden = false;
+    note.textContent = "Save-derived stats unavailable: "
+      + String(snap.degraded_reason || snap.status);
+  } else {
+    note.hidden = true;
+  }
+
   try {
     const res = await get("/api/playtime");
     if (res.ok === false) throw new Error(res.error || "request failed");
     const players = (res.data && res.data.players) || [];
-    grid.replaceChildren(...players.map(playerCard));
-    if (players.length) {
+    const entries = (snap && snap.players) || {};
+    const seen = new Set(players.map((p) => String(p.player_uid || "").toUpperCase()));
+    // Players the saves know but presence has never seen (inactive since
+    // presence tracking shipped): still on the board, keyed by uid until
+    // their next login supplies a name.
+    const statsOnly = Object.keys(entries).filter((uid) => !seen.has(uid)).sort()
+      .map((uid) => playerCard({ player_uid: uid, name: null, online: false },
+                               entries[uid]));
+    grid.replaceChildren(...players.map(
+      (p) => playerCard(p, entries[String(p.player_uid || "").toUpperCase()])),
+      ...statsOnly);
+    if (players.length || statsOnly.length) {
       status.hidden = true;
     } else {
       status.hidden = false;
