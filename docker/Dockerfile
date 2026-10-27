@@ -19,6 +19,10 @@ ARG S6_OVERLAY_VERSION=3.2.0.2
 # Include matplotlib so FPS/health report graphs work in-container. Set to
 # "false" at build time for a leaner image (reports then run text-only).
 ARG WITH_GRAPHS=true
+# Include the pyooz Oodle codec (GPL-3.0-or-later, see CREDITS.md) so
+# save-derived player stats parse the game's PlM saves. Set to "false" for a
+# leaner image — the Players page then shows the tool's degraded state.
+ARG WITH_PLAYER_STATS=true
 
 # Runtime dependencies for the tooling + supervisor.
 #   python3         - REST client, telemetry, config helpers, web UI server
@@ -38,6 +42,10 @@ RUN apt-get update \
         util-linux \
     && if [ "$WITH_GRAPHS" = "true" ]; then \
          apt-get install -y --no-install-recommends python3-matplotlib; \
+       fi \
+    && if [ "$WITH_PLAYER_STATS" = "true" ]; then \
+         apt-get install -y --no-install-recommends python3-pip \
+         && pip3 install --break-system-packages --no-cache-dir pyooz==0.0.8; \
        fi \
     && rm -rf /var/lib/apt/lists/*
 

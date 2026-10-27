@@ -366,7 +366,9 @@ it for you). With no arguments it prints help and exits — the service uses
 
 Read endpoints (Basic auth is enough): `/api/health`, `/api/fps`, `/api/events`,
 `/api/service-events`, `/api/playtime` (the sampler's per-player presence
-rollup, feeding the Players tab), `/api/engine`, `/api/config` (passwords redacted),
+rollup, feeding the Players tab), `/api/player-stats` (the save-derived stats
+snapshot, also feeding the Players tab; read codec-free via
+`palworld-player-stats show`), `/api/engine`, `/api/config` (passwords redacted),
 `/api/backups`, `/api/snapshots`, `/api/backup-schedule`, `/api/jobs`,
 `/api/jobs/<id>`, `/api/token`. A failing tool answers `200` with
 `{"ok": false, "error": ...}` rather than a `500`, so one broken tool cannot blank
@@ -554,6 +556,37 @@ avg/max, Engine.ini profile + drift, latest backup/snapshot, Steam buildid, disk
 usage, and recent markers. `discord` attaches the FPS/player graph. Drives the
 09:00 ET `palworld-fps-daily-report.timer`. **Never mutates state.**
 
+### `palworld-player-stats`
+`/usr/local/sbin/palworld-player-stats <subcommand>` — Python 3, owns
+`/var/lib/palworld/player-stats.json` (override:
+`PALWARDEN_PLAYER_STATS_FILE`). Parses `Players/<uid>.sav` from the world
+save (resolved via `PALWORLD_SAVED_DIR` / `PALWORLD_INSTALL_DIR`, same
+precedence as the backup family) into per-player **save-derived stats**:
+captures, paldeck, crafts, fish, towers/bosses/dungeons, camps, fast travels,
+relics, notes. Spec:
+`docs/superpowers/specs/2026-08-18-player-stats-board-design.md`.
+
+| Subcommand | Purpose |
+|------------|---------|
+| `refresh [--snapshot FILE]` | Re-parse players whose `.sav` mtime changed (ns precision) and rewrite the snapshot atomically; unchanged players cost a `stat()`. Reads **copies**, never live files, retrying once on a torn read — a still-torn file degrades to `unreadable` and keeps its previous good stats. Always exits 0: no/multiple world dirs and a missing codec are snapshot `status`/`degraded_reason`, not failures. Driven every 60s by `palworld-player-stats.timer` / the `player-stats` s6 service. |
+| `show [--json]` | Print the snapshot. Never touches the save codec, so it works (reporting the degraded state) even without pyooz. `GET /api/player-stats` shells out to this. |
+| `dump FILE.sav` | Introspect one save: RecordData keys and shapes, plus parse errors. The tool that pins property names when a game update shifts the format. |
+
+The snapshot keeps both `stats` (the aggregates the Players page renders) and
+`records` (the raw per-key ledgers — boss flags, per-item craft counts —
+retained for the future Discord milestone diffing, backlog item 10).
+
+**Optional dependency:** the game compresses saves with Oodle (`PlM` magic)
+since ~0.6; decompression needs **pyooz** (GPL-3.0-or-later, see
+`CREDITS.md`). The Docker image installs it when built with
+`WITH_PLAYER_STATS=true` (the default). On bare metal:
+`pip install pyooz` (Debian/Ubuntu: `pip install --break-system-packages pyooz`,
+or use a venv and point the timer's ExecStart at its python). Without it the
+tool still runs and the Players page shows
+`Save-derived stats unavailable: … pyooz is not installed …`. The parser
+degrades per-field on unknown properties instead of crashing, so a game
+update dulls the board rather than breaking it.
+
 ---
 
 ## Watchers
@@ -645,6 +678,13 @@ Installed to `/usr/local/lib`, not run directly.
   [Backup-family environment overrides](#backup-family-environment-overrides).
   `env_int` is its public reader for all of them: a malformed or non-positive
   override falls back to the default, so a typo can never lower a ceiling to zero.
+- **`palwarden_gvas`** — Python module (`palwarden_gvas.py`): reads Palworld's
+  `.sav` container (`PlZ` = zlib via stdlib; `PlM` = Oodle via the optional
+  pyooz codec, lazily imported) and the GVAS property tree inside, with
+  **per-field degradation** — unknown or corrupt properties are recorded and
+  skipped by their known extents, siblings survive. Imported by
+  `palworld-player-stats`; written against the wire format with
+  palworld-save-tools (MIT) as reference (see `CREDITS.md`).
 - **`palworld-config-diff`** — Python; prints a non-secret diff between two
   `PalWorldSettings.ini` files (`--discord` formats for chat). Redacts secret keys.
 - **`palworld-config-summary`** — Python; prints a summary of the
@@ -707,6 +747,7 @@ Installed to `/etc/systemd/system`. Enable only what you need.
 | `palworld-public-info-watch.timer` | timer | every 10m | `palworld-public-info-watch`. |
 | `palworld-service-events.timer` | timer | every 1m | `palworld-service-events sample` — detects restarts/outages. |
 | `palworld-backup-auto.timer` | timer | every 15m | `palworld-backups --if-due --prune` under a lock, as **root**. The tick is fixed; the *schedule* is `/etc/palworld/backup.env` (editable from the Backups page), so changing how often you back up needs no `daemon-reload`. Hardened like `palwarden-jobd.service` — `ProtectSystem=true` only, because it must write `/opt/palworld/backups`. |
+| `palworld-player-stats.timer` | timer | every 1m (after boot+2m) | `palworld-player-stats refresh` under a lock, as **palworld** (reads saves, writes only `/var/lib/palworld`). Idle passes are `stat()` calls; the snapshot tracks every autosave within a minute. |
 | `palworld-1dot0-watch.timer` | timer | every 1m *(dated)* | `palworld-launch-watch`. Inert; do not enable. |
 
 Each `*.timer` has a matching one-shot `*.service`. After changing any unit:

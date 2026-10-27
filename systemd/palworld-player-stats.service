@@ -1,0 +1,14 @@
+[Unit]
+Description=Refresh the save-derived player stats snapshot
+After=palworld.service
+
+[Service]
+Type=oneshot
+# Unlike the fps sampler this runs as the service account, deliberately: it
+# only reads the save tree (owned by palworld) and writes /var/lib/palworld —
+# root would grant nothing but a bigger blast radius.
+User=palworld
+# An unprivileged user cannot create lock files in /run itself; systemd
+# provisions this subdirectory owned by User= before ExecStart runs.
+RuntimeDirectory=palworld-player-stats
+ExecStart=/usr/bin/flock -n /run/palworld-player-stats/lock /usr/local/sbin/palworld-player-stats refresh

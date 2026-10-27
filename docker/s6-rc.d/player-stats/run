@@ -1,0 +1,14 @@
+#!/command/with-contenv bash
+# shellcheck shell=bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Brian Grant
+#
+# Save-derived player stats refresher, supervised by s6 and run as the
+# unprivileged steam user (it reads the save tree and writes only
+# /var/lib/palworld). Replaces palworld-player-stats.timer. Embedded mode
+# only — external mode has no local save tree. The 60s default deliberately
+# undercuts any plausible autosave interval: unchanged saves cost a stat()
+# each, and the snapshot stays fresh within a minute of every autosave.
+exec s6-setuidgid steam palwarden-run-periodic \
+  "${PLAYER_STATS_INTERVAL:-60}" player-stats \
+  palworld-player-stats refresh

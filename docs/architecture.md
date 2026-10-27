@@ -153,6 +153,20 @@ sampler error), and playtime is **tracked-since**, not all-time — the page
 says so. The REST payload's `ip`/`ping`/`location` are deliberately never
 stored.
 
+What presence can't tell — what a player has *done* — comes from the saves:
+a periodic `palworld-player-stats refresh` (systemd timer / s6 service, 60s)
+parses `Players/<uid>.sav` copies (never the live files; the game rewrites
+them on autosave) into `/var/lib/palworld/player-stats.json`, re-parsing only
+changed mtimes. The Players tab joins that snapshot to the presence cards by
+UID via `GET /api/player-stats`. Everything degrades instead of failing: the
+GVAS reader (`lib/palwarden_gvas.py`) skips unknown properties per-field so a
+game update dulls the board rather than breaking it, a missing pyooz codec
+(the one optional dependency — the game Oodle-compresses saves) is a reported
+snapshot state, and the page falls back to presence-only when the stats fetch
+fails. The snapshot also retains the raw per-key ledgers for the planned
+Discord milestone diffing (backlog item 10). Spec:
+`docs/superpowers/specs/2026-08-18-player-stats-board-design.md`.
+
 ### The settings editor
 
 `webui/PalWorldSettingsEditor.html` is a fork of the MIT upstream settings
