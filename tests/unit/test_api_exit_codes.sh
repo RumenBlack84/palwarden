@@ -110,6 +110,42 @@ assert_contains "$out" '"players"' "players prints the API's JSON"
 assert_file_contains "$WORK/request.log" "GET /v1/api/players" \
   "players issues GET /v1/api/players on the wire"
 
+# --- stdout purity on success (Docker acceptance, 2026-10-26) ---------------
+# The presence sampler and idle watcher parse the helper's WHOLE stdout as one
+# JSON object (spec §5.1, F3). The success status line therefore belongs on
+# STDERR: with "HTTP 200 OK" on stdout, every real in-container sample died
+# with "API output is not one JSON object" and idle stop never armed. The
+# contract the F3 parser documents: raw REST body on stdout, errors on stderr.
+PORT_PURE=18132
+python3 - "$PORT_PURE" <<'PY' &
+import http.server, sys
+port = int(sys.argv[1])
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b'{"players": []}'
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a): pass
+with http.server.HTTPServer(("127.0.0.1", port), H) as s:
+    s.timeout = 10
+    s.handle_request()
+PY
+PURE_PID=$!
+sleep 0.3
+printf 'REST_API_ENABLED=True\nADMIN_PASSWORD=x\nREST_API_PORT=%s\nREST_API_HOST=127.0.0.1\n' "$PORT_PURE" > "$CFG"
+out="$(api players 2>/dev/null)"; rc=$?
+wait "$PURE_PID" 2>/dev/null
+assert_eq "$rc" "0" "players succeeds (output: $out)"
+assert_eq "$out" '{"players": []}' \
+  "success stdout is the raw JSON body ONLY (status line must go to stderr)"
+if printf '%s' "$out" | python3 -c 'import json,sys; json.load(sys.stdin)'; then
+  pass "stdout parses as one JSON object (the sampler's contract)"
+else
+  fail "stdout is NOT pure JSON — the strict §5.1 parser would reject it: $out"
+fi
+
 # --- and the callers that depend on these codes still say so -------------------
 # Both branches of the readiness wait, so the bare-metal one cannot quietly lose the
 # check again: it polled to the deadline on a REST API that was merely disabled.

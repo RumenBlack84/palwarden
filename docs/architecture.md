@@ -58,7 +58,18 @@ auth with `admin` + `ADMIN_PASSWORD` from `/etc/palworld/settings.env`.
 shutdown → wait for exit) and `palworld-graceful-restart` (stop → start → wait
 for systemd active → wait for REST API ready). Restart auto-shortens the player
 warning when the server is empty. `palworld-update` and the memory/needrestart
-hooks all funnel through these instead of raw `systemctl restart`.
+hooks all funnel through these instead of raw `systemctl restart`. Every
+supported state change — these, update, restore, the idle stop, and every wake
+path — runs under one cooperative lock, `/run/palworld-lifecycle.lock`
+(`lib/palwarden_lifecycle.py`, shared shell/Python flock protocol with inherited
+descriptors for nested calls), with a generation-marked state file at
+`/var/lib/palwarden-ops/lifecycle/state.json` fencing queued wakes against
+intervening maintenance. Raw `s6-svc`/signals/root commands bypass it by
+design; that boundary is documented, not papered over. The idle/knock pair
+(`palworld-idle-watch`, `palworld-knock`) automates the down and up edges of
+this layer: a stop on positive empty evidence, and an idempotent
+`start_if_down` wake that only ever starts a confirmed-stopped, wanted-down
+service.
 
 **4. Config management** — env-driven, backed up on every change:
 - `palworld-config-apply-env` renders `settings.env` → `PalWorldSettings.ini`
@@ -84,6 +95,12 @@ memory threshold — the container's cgroup limit when there is one, else host R
 `service-events` (notice restarts/outages and record them as markers, classified
 planned vs unexpected), `public-info-watch` (republish join info on change), and
 `launch-watch` (a dated one-off for the Palworld 1.0 launch — see below).
+Two are long-running rather than timer-driven, and supervised as such in the
+container: `idle-watch` (stop on sustained *observed* emptiness — sampler
+evidence no older than 60s plus a final empty-players check under the lifecycle
+lock) and `palworld-knock` (lease the game's UDP port only while the server is
+down-and-wanted-down, wake on a matching packet; the sampler's
+`presence_state` singleton in the telemetry DB is what idle eligibility reads).
 
 Restart detection is observational on purpose: systemd's `NRestarts` resets with
 the unit and s6 keeps no counter, so sampling state + main PID is the only measure
@@ -263,6 +280,12 @@ what keeps their names from being substituted), which is precisely why
 
 - Timer-driven jobs that can collide with each other or with the server take a
   `flock` (`fps-sample`, `update`, `memory-watch`, `backup-auto`).
+- Above those sits the lifecycle lock, `/run/palworld-lifecycle.lock`: every
+  supported controller of server state holds it across its whole transaction,
+  and the knock listener leases the UDP port *under* it (socket closed before
+  the lock is released), so a supported manual start cannot slip past the
+  listener. Outer job/update/backup locks are always acquired before it, never
+  inside it; read-only queries never take it.
 - `palwarden-jobd` takes its lock in **every** mode — the daemon loop, `--once`
   and `--reap` alike — so a hand-run one-shot can never race the service or
   mistake a live job for an orphan.

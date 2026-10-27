@@ -1,0 +1,486 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Brian Grant
+"""palworld-idle-watch — idle eligibility tick and live scheduler.
+
+One-shot by default (one tick, one decision line, exit 0 for skips and a
+confirmed stop, 1 for a failed stop, 64 for usage); ``--loop`` runs the s6
+supervised schedule.
+
+Decision contract (idle-shutdown/knock-wake spec §5.2): a tick stops the
+server ONLY on positive evidence — IDLE_TIMEOUT > 0, service running,
+parseable uptime >= the timeout, and a valid, fresh (<=60 s), coherent
+presence_state whose observed-empty interval already covers the full
+timeout. Missing/stale/invalid/locked evidence is UNKNOWN, never idle.
+
+Under nonblocking lifecycle ownership everything is re-read (config, state,
+uptime, evidence) and one final schema-valid ``palworld-api players`` call
+must come back EMPTY. That final observation is reserved/applied through the
+shared presence writer on a short-lived write connection: occupied, loading,
+error, superseded, or write-failure outcomes abort the stop AND clear the
+stored empty interval, forcing a new full period. Only then: idle event, one
+warning notification, ``palworld-graceful-stop --wait 0`` under the inherited
+lock descriptor, and a bounded confirmation that the service is actually
+down. Event/notification errors are best-effort and never block a safe stop.
+
+--loop uses monotonic scheduling and re-reads config at least once per
+second; an IDLE_CHECK_INTERVAL edit reschedules relative to the LAST tick
+and an overdue tick runs promptly (§7.2). A config change can never undo a
+stop whose side effect has already been issued.
+"""
+
+from __future__ import annotations
+
+import calendar
+import json
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+sys.path.insert(0, "/usr/local/lib")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import palwarden_lifecycle as lc  # noqa: E402
+import palwarden_ops as ops  # noqa: E402
+import palwarden_presence as presence  # noqa: E402
+
+SERVICE = "palworld.service"   # portable name: real systemd or the s6 shim
+DB_PATH = os.environ.get("PALWORLD_METRICS_DB", "/var/lib/palworld/metrics.sqlite3")
+API_HELPER = os.environ.get("PALWORLD_API_BIN", "/usr/local/sbin/palworld-api")
+STOP_BIN = os.environ.get("PALWARDEN_GRACEFUL_STOP_BIN",
+                          "/usr/local/sbin/palworld-graceful-stop")
+NOTIFY_HELPER = os.environ.get("PALWARDEN_NOTIFY_HELPER",
+                               "/usr/local/lib/palworld-notify")
+BUSY_TIMEOUT_MS = 2000         # bounded: a locked DB means UNKNOWN, not a wait
+CONFIRM_S = float(os.environ.get("PALWARDEN_IDLE_STOP_CONFIRM_S", "120"))
+POLL_S = float(os.environ.get("PALWARDEN_IDLE_STOP_POLL_S", "5"))
+STOP_TIMEOUT_S = float(os.environ.get("PALWARDEN_IDLE_STOP_TIMEOUT_S", "900"))
+FETCH_TIMEOUT_S = 5
+
+USAGE = "usage: palworld-idle-watch [--loop] [--help]\n"
+
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def extract_json(text: str):
+    # F3 (review follow-up): the old first-{-to-last-} slice accepted a
+    # top-level array as an object and json.loads silently kept the LAST
+    # duplicate key. Parse the WHOLE output strictly through the shared
+    # parser (the API client prints the raw REST body, nothing else).
+    return presence.parse_api_json(text)
+
+
+def fetch_players(timeout: int = FETCH_TIMEOUT_S):
+    """Final schema-valid players list; raises on ANY transport/schema issue.
+
+    Same strictness as the sampler (shared validator): a broken answer is an
+    error, never a silent [].
+    """
+    proc = subprocess.run([API_HELPER, "players"], text=True,
+                          capture_output=True, timeout=timeout, check=False)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "unknown API error").strip()
+        raise RuntimeError(detail[:500])
+    return presence.validate_players_payload(extract_json(proc.stdout))
+
+
+def service_uptime_seconds():
+    """Seconds since the service (re)started, or None = UNKNOWN.
+
+    ``systemctl show -p ExecMainStartTimestamp`` prints the same
+    'Wed 2026-10-21 20:53:33 UTC' shape on real systemd and through the s6
+    shim (which derives it from s6-svstat seconds); anything else — empty,
+    garbage, a missing supervisor — is UNKNOWN and suppresses the stop.
+    """
+    svc_bin = os.environ.get("PALWARDEN_SYSTEMCTL_BIN") or "systemctl"
+    if shutil.which(svc_bin) is None:
+        return None
+    try:
+        r = subprocess.run(
+            [svc_bin, "show", "-p", "ExecMainStartTimestamp", "--value", SERVICE],
+            capture_output=True, text=True, timeout=15, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    stamp = (r.stdout or "").strip()
+    if not stamp:
+        return None
+    try:
+        parsed = datetime.strptime(stamp, "%a %Y-%m-%d %H:%M:%S %Z")
+    except ValueError:
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.replace(tzinfo=None)
+    started = calendar.timegm(parsed.utctimetuple())
+    uptime = int(time.time()) - started
+    return uptime if uptime >= 0 else None
+
+
+def read_eligibility(db_path, timeout_minutes, at_ms):
+    """(eligible, reason) from a read-only connection with a bounded wait."""
+    timeout_ms = int(timeout_minutes) * 60_000
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True,
+                              timeout=BUSY_TIMEOUT_MS / 1000.0)
+    except sqlite3.Error:
+        return False, "db"
+    try:
+        con.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        row = con.execute(
+            "SELECT last_success_ms, valid, empty_since_ms FROM presence_state WHERE id=1"
+        ).fetchone()
+    except sqlite3.Error:
+        con.close()
+        return False, "db"
+    con.close()
+    if row is None:
+        return False, "no-state"
+    last_success_ms, valid, empty_since_ms = row[0], int(row[1]), row[2]
+    if valid != 1:
+        return False, "invalid"
+    if last_success_ms is None:
+        return False, "no-success"
+    if int(last_success_ms) > at_ms:
+        return False, "future"          # discontinuity: never trust the clock
+    if at_ms - int(last_success_ms) > presence.MAX_GAP_MS:
+        return False, "stale"
+    if empty_since_ms is None:
+        return False, "occupied"
+    if int(empty_since_ms) > at_ms or int(empty_since_ms) > int(last_success_ms):
+        return False, "discontinuity"
+    if at_ms - int(empty_since_ms) < timeout_ms:
+        return False, "short"
+    return True, "eligible"
+
+
+def wake_reason(timeout_minutes, config):
+    """Stop message that matches the ACTUAL wake policy — no false promises."""
+    base = ("Server stopped after %s minutes with no players." % timeout_minutes)
+    if not config.get("KNOCK_ENABLED", False):
+        return base + " An administrator can start it again."
+    if str(config.get("KNOCK_TOKEN", "")):
+        return base + " Send your knock token to the server port to wake it."
+    return base + " Knock (any packet) on the server port to wake it."
+
+
+def _default_config():
+    return ops.resolve()
+
+
+def _record_idle_event(db_path, timeout_minutes):
+    """Best-effort fps_events row; a broken event log never blocks the stop."""
+    try:
+        con = sqlite3.connect(db_path, timeout=BUSY_TIMEOUT_MS / 1000.0)
+        try:
+            con.execute("PRAGMA busy_timeout=%d" % BUSY_TIMEOUT_MS)
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS fps_events (
+                    event_at_ms INTEGER NOT NULL PRIMARY KEY,
+                    event_at_utc TEXT NOT NULL,
+                    label TEXT NOT NULL,
+                    category TEXT NOT NULL DEFAULT 'manual',
+                    details TEXT
+                )
+                """
+            )
+            ms = now_ms()
+            while con.execute("SELECT 1 FROM fps_events WHERE event_at_ms=?",
+                              (ms,)).fetchone():
+                ms += 1
+            con.execute(
+                "INSERT INTO fps_events (event_at_ms, event_at_utc, label, "
+                "category, details) VALUES (?, ?, ?, 'idle', ?)",
+                (ms, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ms / 1000)),
+                 "idle stop", "timeout=%sm" % timeout_minutes),
+            )
+            con.commit()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        pass
+
+
+# Fixed shell code (never interpolated): source the helper, then CALL its
+# function. The shipped lib/palworld-notify is function-only — executing it
+# merely defines palworld_notify() and exits (F9, review follow-up).
+_NOTIFY_SH = ('source "$1" 2>/dev/null || exit 0; '
+              "declare -F palworld_notify >/dev/null || exit 0; "
+              'palworld_notify "$2" "$3"')
+
+
+def _notify(kind, text):
+    # Best-effort and bounded; a missing/failing helper never blocks a stop
+    # (spec §6.3). Kind and message travel as ARGUMENTS ($2/$3), never
+    # interpolated into shell text.
+    try:
+        subprocess.run(["bash", "-c", _NOTIFY_SH, "palwarden-notify",
+                        NOTIFY_HELPER, kind, text],
+                       capture_output=True, timeout=15, check=False)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _stop_server(reason, fd):
+    """graceful-stop under the INHERITED lock fd, then confirm service down."""
+    env = dict(os.environ)
+    pass_fds = ()
+    if fd is not None:
+        env.update(lc.ownership_env(fd))   # clears CLOEXEC, exports FD_ENV
+        pass_fds = (fd,)
+    try:
+        proc = subprocess.run(
+            [STOP_BIN, "--wait", "0", "--message", reason],
+            env=env, pass_fds=pass_fds, capture_output=True, text=True,
+            timeout=STOP_TIMEOUT_S, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if proc.returncode != 0:
+        return False
+    deadline = time.monotonic() + CONFIRM_S
+    while True:
+        if lc.service_state() == "stopped":
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(POLL_S)
+
+
+def _default_deps():
+    return {
+        "config": _default_config,
+        "state": lc.service_state,
+        "uptime_s": service_uptime_seconds,
+        "db_path": DB_PATH,
+        "fetch_players": fetch_players,
+        "acquire": lambda: lc.acquire(
+            timeout=0, owner_pid=os.getpid(), owner_comm="palworld-idle-watch"),
+        "release": lambda fd: fd is not None and lc.release(
+            fd, owner_pid=os.getpid(), owner_comm="palworld-idle-watch"),
+        "apply_observation": presence.apply_observation,
+        "notify": _notify,
+        "stop": _stop_server,
+    }
+
+
+def _cfg(deps):
+    c = deps["config"]
+    return c() if callable(c) else dict(c)
+
+
+def _safe_config(d):
+    """Config read is fail-closed: an invalid file is a skip, never a crash
+    loop (the last VALID file remains on disk for the next tick)."""
+    try:
+        return _cfg(d)
+    except Exception:
+        return None
+
+
+def tick(deps=None):
+    """One eligibility tick; returns a decision string (see module docstring)."""
+    d = _default_deps()
+    if deps:
+        d.update(deps)
+    # Defaults that must follow the EFFECTIVE db_path (injected or env), not
+    # the module-level constant.
+    if "eligibility" not in (deps or {}):
+        d["eligibility"] = lambda tmin, at: read_eligibility(d["db_path"], tmin, at)
+    if "event" not in (deps or {}):
+        d["event"] = lambda tmin: _record_idle_event(d["db_path"], tmin)
+
+    config = _safe_config(d)
+    if config is None:
+        return "skip config-invalid"
+    timeout = int(config.get("IDLE_TIMEOUT", 0))
+    if timeout <= 0:
+        return "skip disabled"
+    state = d["state"]()
+    if state != "running":
+        return "skip state=%s" % state
+    uptime = d["uptime_s"]()
+    if uptime is None:
+        return "skip uptime-unknown"
+    if uptime < timeout * 60:
+        return "skip uptime-short"
+    ok, why = d["eligibility"](timeout, now_ms())
+    if not ok:
+        return "skip presence (%s)" % why
+
+    try:
+        fd = d["acquire"]()
+    except lc.LifecycleError:
+        return "skip busy"
+    try:
+        # Everything re-read under ownership: a config edit, restart, or new
+        # observation since the read-only pass must be seen before any side
+        # effect is issued.
+        config = _safe_config(d)
+        if config is None or int(config.get("IDLE_TIMEOUT", 0)) <= 0:
+            return "abort config"
+        timeout = int(config.get("IDLE_TIMEOUT", 0))
+        if d["state"]() != "running":
+            return "abort state"
+        uptime = d["uptime_s"]()
+        if uptime is None or uptime < timeout * 60:
+            return "abort uptime"
+        ok, why = d["eligibility"](timeout, now_ms())
+        if not ok:
+            return "abort evidence (%s)" % why
+
+        # Final check: reserve BEFORE the request, apply under the sequence
+        # fence on a short-lived write connection (never held over HTTP).
+        db_path = d["db_path"]
+        try:
+            con = sqlite3.connect(db_path, timeout=BUSY_TIMEOUT_MS / 1000.0)
+            con.row_factory = sqlite3.Row
+            con.execute("PRAGMA busy_timeout=%d" % BUSY_TIMEOUT_MS)
+            seq = presence.reserve_observation(con)
+        except sqlite3.Error:
+            return "abort final=db"
+        try:
+            players = d["fetch_players"]()
+        except Exception:
+            # F5 (review follow-up): apply the failure THROUGH ITS RESERVED
+            # SEQUENCE, so an older in-flight observation can never overwrite
+            # this invalidation (and an older failure cannot erase newer
+            # evidence). Only when the fenced apply itself cannot write (the
+            # DB is the casualty) do we fall back to the best-effort
+            # unsequenced invalidate.
+            try:
+                d["apply_observation"](con, seq, False, None, now_ms())
+            except sqlite3.Error:
+                presence.invalidate(con)
+            con.close()
+            return "abort final=error"
+        try:
+            result = d["apply_observation"](con, seq, True, players, now_ms())
+        except sqlite3.Error:
+            presence.invalidate(con)
+            con.close()
+            return "abort final=db"
+        con.close()
+        if not result.get("applied"):
+            return "abort final=superseded"
+        if players:
+            # apply already cleared the stored empty interval: a NEW full
+            # observed-empty period is now required, even if the periodic
+            # sampler missed this player entirely.
+            return "abort final=occupied"
+        ok, why = d["eligibility"](timeout, now_ms())
+        if not ok:
+            return "abort final=stale (%s)" % why
+
+        # F4 (review follow-up) + R6 (Sol review): the policy gate runs
+        # TWICE — once before the best-effort event/notify work and once
+        # IMMEDIATELY at dispatch, after that blocking work. A config save
+        # that lands WHILE the event/notification subprocesses run must
+        # still abort: disabling idle shutdown, raising the timeout past
+        # the observed-empty window, or a restart that reset uptime all
+        # abort here. (A stop whose side effect was already issued can
+        # never be undone — spec §7.2.)
+        def _policy_gate():
+            config = _safe_config(d)
+            if config is None or int(config.get("IDLE_TIMEOUT", 0)) <= 0:
+                return None, "abort final=config"
+            if d["state"]() != "running":
+                return None, "abort final=state"
+            timeout = int(config.get("IDLE_TIMEOUT", 0))
+            uptime = d["uptime_s"]()
+            if uptime is None or uptime < timeout * 60:
+                return None, "abort final=uptime"
+            ok, why = d["eligibility"](timeout, now_ms())
+            if not ok:
+                return None, "abort final=stale (%s)" % why
+            return config, None
+
+        config, why = _policy_gate()
+        if why:
+            return why
+
+        reason = wake_reason(timeout, config)
+        d["event"](timeout)                      # best-effort
+        d["notify"]("warning", reason)           # best-effort, exactly one
+        # Publication itself performs blocking persistent I/O. It is mandatory,
+        # and the LAST policy gate must follow it, not precede it.
+        try:
+            lc.begin_transaction("maintenance")
+        except lc.LifecycleError as e:
+            sys.stderr.write("idle-watch: stop refused: cannot publish "
+                             "transaction state (%s)\n" % e)
+            return "abort lifecycle-publication"
+        safe = False
+        try:
+            config, why = _policy_gate()
+            if why:
+                safe = True  # no stop dispatched; close only our transaction
+                return why
+            safe = d["stop"](reason, fd)
+            return "stop issued" if safe else "stop failed"
+        finally:
+            try:
+                lc.write_state("idle" if safe else "unsafe")
+            except lc.LifecycleError as e:
+                sys.stderr.write("idle-watch: warning: completion not recorded "
+                                 "(%s); wake stays fenced until ack\n" % e)
+    finally:
+        d["release"](fd)
+
+
+def run_loop(tick_fn=None, config_fn=None, clock=None, sleep=None):
+    """Monotonic scheduler: config re-read every second, interval edits
+    recompute relative to the LAST tick, overdue ticks run promptly."""
+    tick_fn = tick_fn or tick
+    config_fn = config_fn or _default_config
+    clock = clock or time.monotonic
+    sleep = sleep or time.sleep
+    last_tick = None
+    while True:
+        try:
+            interval = int(config_fn().get("IDLE_CHECK_INTERVAL", 60))
+        except Exception:
+            interval = 60
+        interval = max(1, interval)
+        now = clock()
+        if last_tick is None:
+            decision = tick_fn()
+            print("idle-watch: %s" % decision, flush=True)
+            last_tick = clock()
+            continue
+        due = last_tick + interval
+        if now >= due:
+            decision = tick_fn()
+            print("idle-watch: %s" % decision, flush=True)
+            last_tick = clock()
+        else:
+            sleep(min(1.0, due - now))
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    loop = False
+    for a in argv:
+        if a == "--loop":
+            loop = True
+        elif a in ("-h", "--help"):
+            sys.stdout.write(USAGE)
+            return 0
+        else:
+            sys.stderr.write(USAGE)
+            sys.stderr.write("palworld-idle-watch: unknown argument %r\n" % a)
+            return 64
+    if loop:
+        run_loop()
+        return 0
+    decision = tick()
+    print("idle-watch: %s" % decision)
+    return 1 if decision == "stop failed" else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -7,6 +7,30 @@ source /usr/local/lib/palworld-notify 2>/dev/null || true
 # aborting on "command not found".
 declare -F palworld_notify >/dev/null || palworld_notify() { :; }
 
+# Task 3 (idle-shutdown/knock-wake): shared lifecycle lock. Acquire-or-reuse the
+# lock before any mutation so concurrent stop/restart/update/restore operations
+# serialize. Sourced optionally (no-op when not installed, e.g. a bare dev
+# checkout); enrollment follows parsing so check-only work stays read-only.
+# See lib/palwarden-lifecycle-bash and spec section 4.1.
+# Find the helper: explicit PALWARDEN_LIB_DIR, else the sibling lib/ of a dev
+# checkout (sbin/../lib), else the installed /usr/local/lib. When the helper
+# genuinely isn't installed anywhere (a bare checkout without it), fall back to
+# a no-op; when it IS found but the lock cannot be taken, maybe_acquire fails
+# loudly — enrollment never degrades silently to unlocked.
+_pw_lc_helper="${PALWARDEN_LIB_DIR:-}"
+if [[ -z "$_pw_lc_helper" ]]; then
+  _pw_lc_cand="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" 2>/dev/null && pwd)" || _pw_lc_cand=""
+  if [[ -n "$_pw_lc_cand" && -f "$_pw_lc_cand/palwarden-lifecycle-bash" ]]; then
+    _pw_lc_helper="$_pw_lc_cand"
+  else
+    _pw_lc_helper=/usr/local/lib
+  fi
+fi
+source "$_pw_lc_helper/palwarden-lifecycle-bash" 2>/dev/null || true
+declare -F palworld_lifecycle_maybe_acquire >/dev/null \
+  || palworld_lifecycle_maybe_acquire() { :; }
+_pw_original_args=("$@")
+
 APP_ID=2394010
 INSTALL_DIR="${PALWORLD_INSTALL_DIR:-/opt/palworld/server}"
 MANIFEST="$INSTALL_DIR/steamapps/appmanifest_${APP_ID}.acf"
@@ -41,6 +65,12 @@ while [[ $# -gt 0 ]]; do
     *) usage; exit 64 ;;
   esac
 done
+
+# A check fetches metadata only: informational exit 10 (or a failed fetch)
+# must not record unsafe maintenance. Keep original argv for the re-exec bridge.
+if [[ "$CHECK_ONLY" -eq 0 ]]; then
+  palworld_lifecycle_maybe_acquire "${_pw_original_args[@]}"
+fi
 
 local_buildid() {
   if [[ -r "$MANIFEST" ]]; then

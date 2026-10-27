@@ -38,6 +38,7 @@ RESTORE="$SBIN_REAL/palworld-restore"
 DOCS="$DIR/../../docs"
 
 WORK="$(mktemp -d)"
+export PALWARDEN_LIFECYCLE_STATE_DIR="$WORK/lifecycle-state"
 trap 'chmod -R u+rwX "$WORK" 2>/dev/null; rm -rf "$WORK"' EXIT
 
 BK="$WORK/backups"          # PALWARDEN_SAVE_BACKUP_DIR (root-owned in reality)
@@ -433,6 +434,7 @@ env_args() {
     "PALWORLD_USER=${OWNER_USER}" \
     "PALWORLD_GROUP=${OWNER_GROUP}" \
     "PALWARDEN_RESTORE_POLL_SECONDS=1" \
+    "PALWARDEN_LIFECYCLE_LOCK=$WORK/lifecycle.lock" \
     "STUB_LOG_DIR=$LOGD" \
     "STUB_BK=$BK"
 }
@@ -1438,5 +1440,53 @@ assert_file_contains "$DOCS/tools.md" "--import" \
 # roughly twice the world free there.
 assert_file_contains "$DOCS/tools.md" "2× the world" \
   "docs/tools.md states the free-space requirement of the copy fallback"
+
+# ==============================================================================
+# F6 (review follow-up): a nested restore must BORROW inherited ownership.
+# With the lifecycle lock already held by an outer transaction (descriptor
+# inherited via the internal env var), palworld-restore must reuse it instead
+# of acquiring a NEW flock on the same file — a self-conflict that previously
+# waited out the full lifecycle timeout — and its cleanup must never unlock
+# the outer owner.
+# ==============================================================================
+reset_all
+populate_world
+stage
+cat > "$WORK/nested_holder.py" <<'PY'
+import os, subprocess, sys
+sys.path.insert(0, os.environ["PYTHONPATH"])
+import palwarden_lifecycle as lc
+lc.ensure_state()
+fd = lc.acquire(timeout=5)
+lc.write_state("active", operation="maintenance", rotate=True)
+env = dict(os.environ)
+env.update(lc.ownership_env(fd))
+# A short timeout turns the old self-conflict into a fast, loud failure.
+env["PALWARDEN_LIFECYCLE_TIMEOUT"] = "2"
+r = subprocess.run([sys.executable, os.environ["RESTORE_BIN"],
+                    "--restore", os.environ["NEST_NAME"]],
+                   env=env, pass_fds=(fd,), capture_output=True,
+                   text=True, timeout=180)
+sys.stdout.write("rc=%d\n" % r.returncode)
+tail = (r.stderr or r.stdout or "").strip().splitlines()
+if tail:
+    sys.stdout.write("last: %s\n" % tail[-1][:200])
+# The outer transaction must STILL own the lock after the nested return.
+# Probe from a SEPARATE process/descriptor: flock on the holder's own fd
+# always succeeds (same open file description), so it proves nothing.
+probe = subprocess.run([sys.executable, "-m", "palwarden_lifecycle",
+                        "acquire", "--timeout", "0"],
+                       capture_output=True, text=True)
+print("held" if probe.returncode == 75 else "RELEASED-EARLY")
+lc.release(fd)
+PY
+out="$(mapfile -t e < <(env_args); env "${e[@]}" \
+  PALWARDEN_LIFECYCLE_STATE_DIR="$WORK/lcstate" \
+  RESTORE_BIN="$RESTORE" NEST_NAME="$NAME" \
+  python3 "$WORK/nested_holder.py" 2>&1)"
+assert_contains "$out" "rc=0" \
+  "F6: nested restore proceeds under borrowed ownership (no self-conflict) (got: $out)"
+assert_contains "$out" "held" \
+  "F6: the nested restore's cleanup did not release the outer lock (got: $out)"
 
 assert_report

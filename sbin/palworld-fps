@@ -23,6 +23,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+# Shared presence module: installed /usr/local/lib first, then the sibling
+# lib/ of a dev checkout (same pattern as palwarden-jobd/-webui; tests set
+# PYTHONPATH).
+sys.path.insert(0, "/usr/local/lib")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import palwarden_presence as presence  # noqa: E402
+
 DB_PATH = Path("/var/lib/palworld/metrics.sqlite3")
 RETENTION_SECONDS = 7 * 24 * 60 * 60
 # Env-overridable so the tests can drive `sample` against a stub helper; the
@@ -83,33 +90,14 @@ def connect(db_path: Path = DB_PATH) -> sqlite3.Connection:
         """
     )
     con.execute("CREATE INDEX IF NOT EXISTS idx_fps_events_time ON fps_events(event_at_ms)")
-    # Player presence (spec: docs/superpowers/specs/2026-08-16-player-presence-
-    # design.md). total_play_ms lives on the identity row so pruning sessions
-    # can never lose playtime. Deliberately no ip/ping/location columns.
-    con.execute(
-        """
-        CREATE TABLE IF NOT EXISTS player_identity (
-            player_uid    TEXT NOT NULL PRIMARY KEY,
-            steam_userid  TEXT,
-            name          TEXT NOT NULL,
-            level         INTEGER,
-            first_seen_ms INTEGER NOT NULL,
-            last_seen_ms  INTEGER NOT NULL,
-            total_play_ms INTEGER NOT NULL DEFAULT 0
-        )
-        """
-    )
-    con.execute(
-        """
-        CREATE TABLE IF NOT EXISTS player_sessions (
-            player_uid    TEXT NOT NULL,
-            started_at_ms INTEGER NOT NULL,
-            last_seen_ms  INTEGER NOT NULL,
-            samples       INTEGER NOT NULL
-        )
-        """
-    )
-    con.execute("CREATE INDEX IF NOT EXISTS idx_player_sessions_uid_time ON player_sessions(player_uid, last_seen_ms)")
+    # Player presence (specs: docs/superpowers/specs/2026-08-16-player-presence-
+    # design.md and the idle-shutdown/knock-wake §5.1): identity, sessions, and
+    # the idle-evidence singleton all live in lib/palwarden_presence.py so the
+    # sampler and the watcher share one schema owner. total_play_ms lives on the
+    # identity row so pruning sessions can never lose playtime. Deliberately no
+    # ip/ping/location columns. Migration is additive; the singleton begins
+    # unknown — historical identities never authorize a stop.
+    presence.create_schema(con)
     return con
 
 
@@ -121,11 +109,9 @@ def prune(con: sqlite3.Connection, retention_seconds: int = RETENTION_SECONDS) -
 
 
 def extract_json(text: str) -> dict[str, Any]:
-    start = text.find("{")
-    end = text.rfind("}")
-    if start < 0 or end < start:
-        raise ValueError("no JSON object found in API output")
-    return json.loads(text[start : end + 1])
+    # F3 (review follow-up): strict whole-output parse, shared with the
+    # watcher (see palwarden_presence.parse_api_json).
+    return presence.parse_api_json(text)
 
 
 def fetch_metrics(timeout: int = 5) -> dict[str, Any]:
@@ -144,10 +130,17 @@ def fetch_metrics(timeout: int = 5) -> dict[str, Any]:
 
 # Survives one missed 15s tick plus jitter. Env-overridable both as a real
 # knob and as the lever the tests use to force session splits without sleeping.
-PRESENCE_GRACE_MS = int(os.environ.get("PALWARDEN_PRESENCE_GRACE_MS", "60000"))
+PRESENCE_GRACE_MS = presence.PRESENCE_GRACE_MS
 
 
 def fetch_players(timeout: int = 5) -> list[dict[str, Any]]:
+    """Fetch and STRICTLY validate the online-players list.
+
+    Raises on any transport, JSON, or schema problem: a missing/wrong-shaped
+    'players' field or a bad list entry is an error, never a silent [] — a
+    broken REST answer must not masquerade as positive evidence of an empty
+    server (idle-shutdown/knock-wake spec §5.1).
+    """
     proc = subprocess.run(
         [API_HELPER, "players"],
         text=True,
@@ -158,84 +151,15 @@ def fetch_players(timeout: int = 5) -> list[dict[str, Any]]:
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "unknown API error").strip()
         raise RuntimeError(detail[:500])
-    payload = extract_json(proc.stdout)
-    players = payload.get("players", [])
-    return players if isinstance(players, list) else []
+    return presence.validate_players_payload(extract_json(proc.stdout))
 
 
-def record_presence(con: sqlite3.Connection, players: list[dict[str, Any]],
-                    at_ms: int, grace_ms: int = PRESENCE_GRACE_MS) -> int:
-    """Fold one tick's online-players list into identities and sessions.
-
-    A sighting within `grace_ms` of a session's tail extends it and credits the
-    identity's total with exactly the extension delta; beyond the grace it opens
-    a new session that credits nothing until its own first extension — one
-    sighting proves presence, not duration. Nothing else from the REST payload
-    is stored: ip, ping and location are deliberately dropped (see the spec).
-    """
-    seen = 0
-    for player in players:
-        uid = str(player.get("playerId") or "").strip()
-        # While a player is still loading in, the REST API lists them with the
-        # placeholder playerId "None" (observed on v1.0.3; some builds report
-        # all zeros instead) — a real sighting, but not an identity. Counting
-        # it would fold every player's loading screen into one shared phantom
-        # row, so skip it; their session starts once the real uid appears.
-        if not uid or uid == "None" or uid.strip("0") == "":
-            continue
-        seen += 1
-        name = str(player.get("name") or "")
-        steam = str(player.get("userId") or "").strip() or None
-        level = player.get("level")
-        level = int(level) if isinstance(level, (int, float)) else None
-        row = con.execute(
-            "SELECT 1 FROM player_identity WHERE player_uid = ?", (uid,)
-        ).fetchone()
-        if row is None:
-            con.execute(
-                """
-                INSERT INTO player_identity
-                    (player_uid, steam_userid, name, level, first_seen_ms, last_seen_ms, total_play_ms)
-                VALUES (?, ?, ?, ?, ?, ?, 0)
-                """,
-                (uid, steam, name, level, at_ms, at_ms),
-            )
-        else:
-            # Names and levels track the latest sighting (players rename);
-            # COALESCE keeps a known steam id / level over a missing one.
-            con.execute(
-                """
-                UPDATE player_identity
-                SET steam_userid = COALESCE(?, steam_userid), name = ?,
-                    level = COALESCE(?, level), last_seen_ms = ?
-                WHERE player_uid = ?
-                """,
-                (steam, name, level, at_ms, uid),
-            )
-        session = con.execute(
-            """
-            SELECT rowid, last_seen_ms FROM player_sessions
-            WHERE player_uid = ? ORDER BY last_seen_ms DESC LIMIT 1
-            """,
-            (uid,),
-        ).fetchone()
-        if session is not None and 0 <= at_ms - int(session["last_seen_ms"]) <= grace_ms:
-            delta = at_ms - int(session["last_seen_ms"])
-            con.execute(
-                "UPDATE player_sessions SET last_seen_ms = ?, samples = samples + 1 WHERE rowid = ?",
-                (at_ms, session["rowid"]),
-            )
-            con.execute(
-                "UPDATE player_identity SET total_play_ms = total_play_ms + ? WHERE player_uid = ?",
-                (delta, uid),
-            )
-        else:
-            con.execute(
-                "INSERT INTO player_sessions (player_uid, started_at_ms, last_seen_ms, samples) VALUES (?, ?, ?, 1)",
-                (uid, at_ms, at_ms),
-            )
-    con.commit()
-    return seen
+# record_presence moved to lib/palwarden_presence.py (_record_identities), so
+# the sampler and the idle watcher's final checks share ONE observation writer
+# and one payload validator (idle-shutdown/knock-wake spec §5.1). Playtime
+# semantics are unchanged: a sighting within grace extends the session and
+# credits exactly the delta; beyond it a new session opens. ip/ping/location
+# remain deliberately unstored.
 
 
 def prune_sessions(con: sqlite3.Connection, retention_seconds: int) -> int:
@@ -297,18 +221,42 @@ def sample(args: argparse.Namespace) -> int:
     except Exception as exc:
         ms = insert_sample(con, None, str(exc))
         note = f"error error={str(exc)[:200]!r}"
+    seq = None
     try:
+        # Reserve the observation sequence BEFORE the request, then apply the
+        # result under the sequence fence: an older in-flight observation can
+        # never overwrite a newer one (spec §5.1). No transaction is held over
+        # the HTTP call.
+        seq = presence.reserve_observation(con)
         players = fetch_players(timeout=args.timeout)
-        seen = record_presence(con, players, now_ms(), PRESENCE_GRACE_MS)
-        presence = f"players_online={seen}"
+        result = presence.apply_observation(con, seq, True, players,
+                                            now_ms(), PRESENCE_GRACE_MS)
+        if result["applied"]:
+            presence_note = f"players_online={result['seen']}"
+        else:
+            presence_note = "presence=superseded"
     except Exception as exc:
         # A gap, not an error: sessions simply do not extend. Named so an
         # operator reading the journal can tell presence apart from metrics.
         print(f"warning: presence pass failed: {str(exc)[:200]}", file=sys.stderr)
-        presence = "presence=skipped"
+        # F5 (review follow-up): once a sequence is reserved, the failure is
+        # applied THROUGH THAT SEQUENCE (fenced invalidate) — an older failure
+        # must not erase newer evidence and must not leave applied_seq behind
+        # for a stale in-flight response to overwrite. Before reservation, or
+        # when the fenced apply itself cannot write (the DB may be the
+        # casualty), fall back to the best-effort unsequenced invalidate.
+        if seq is None:
+            presence.invalidate(con)
+        else:
+            try:
+                presence.apply_observation(con, seq, False, None,
+                                           now_ms(), PRESENCE_GRACE_MS)
+            except sqlite3.Error:
+                presence.invalidate(con)
+        presence_note = "presence=skipped"
     deleted = prune(con, args.retention_days * 86400)
     pruned = prune_sessions(con, args.presence_retention_days * 86400)
-    print(f"sampled {note} at {iso_utc(ms)} {presence} deleted_old={deleted} pruned_sessions={pruned}")
+    print(f"sampled {note} at {iso_utc(ms)} {presence_note} deleted_old={deleted} pruned_sessions={pruned}")
     return 0
 
 

@@ -21,6 +21,18 @@ files, talk to the REST API, and touch `palworld`-owned files).
 
 ## Lifecycle
 
+Every tool in this section changes server state, and they all share one
+cooperative lock, `/run/palworld-lifecycle.lock` (test override
+`PALWARDEN_LIFECYCLE_LOCK`), held across the whole transaction — including the
+window where the server is stopped for a config apply. Graceful stop/restart,
+update, restore, the idle stop, every wake path and the container's
+`systemctl` shim take it; raw `s6-svc`, external signals and bare-metal root
+commands do not, and are documented bypasses rather than supported procedures
+([runbook §17](palworld-service-runbook.md#17-idle-shutdown-and-knock-wake)).
+Shell and Python share the same inode and flock protocol
+(`lib/palwarden_lifecycle.py`); nested calls inherit the validated descriptor
+instead of re-locking.
+
 ### `palworld-graceful-stop`
 `/usr/local/sbin/palworld-graceful-stop [--wait SECONDS] [--message TEXT]`
 
@@ -267,6 +279,29 @@ with the default used**, never treated as "no limit" or as zero
 the suites can point a tool at stubs and so packaging can relocate it; they are
 **not operator knobs** and are not documented per-tool.
 
+### `palworld-knock`
+`/usr/local/sbin/palworld-knock daemon [--port PORT]` · `palworld-knock wake [--reason TEXT]`
+
+The wake half of idle shutdown & knock wake
+([runbook §17](palworld-service-runbook.md#17-idle-shutdown-and-knock-wake)).
+`daemon` (supervised in the container as `palworld-knock`) leases UDP 8211 — the
+internal game port — only while the server is confirmed stopped *and* wanted
+down: one-second leases under the lifecycle lock, socket closed before the lock
+is released, config and state rechecked at every lease. Crash-backoff,
+supervisor recovery, maintenance or a busy lock never arm it. A matching packet
+(token = exact UTF-8 byte comparison; empty token = any nonempty datagram)
+wakes the server through the shared idempotent `start_if_down`: only a
+confirmed-stopped service starts, already-up and cooldown are successful no-ops,
+maintenance is refused, and nothing is ever queued for a delayed wake. The
+cooldown timestamp is written *before* the start and applies to UDP, CLI and
+API wakes alike — an ordinary administrative start is the deliberate override.
+`wake` invokes the same operation directly (it does not send a loopback packet)
+and is what the `server_wake` job runs. Exit codes: `0` success or explicit
+no-op, `64` usage, `65` refused/invalid state, `75` lifecycle busy (retry
+deliberately), `1` start/readiness failure. Readiness is bounded at 180s via
+`palworld-api`; REST unconfigured reports "started but readiness NOT verified",
+never healthy.
+
 ---
 
 ## REST API helpers
@@ -367,7 +402,9 @@ it for you). With no arguments it prints help and exits — the service uses
 Read endpoints (Basic auth is enough): `/api/health`, `/api/fps`, `/api/events`,
 `/api/service-events`, `/api/playtime` (the sampler's per-player presence
 rollup, feeding the Players tab), `/api/engine`, `/api/config` (passwords redacted),
-`/api/backups`, `/api/snapshots`, `/api/backup-schedule`, `/api/jobs`,
+`/api/backups`, `/api/snapshots`, `/api/backup-schedule`, `/api/palwarden-config`
+(the four non-secret idle/knock values plus `token_configured` — the token itself
+is never serialized, in either direction), `/api/jobs`,
 `/api/jobs/<id>`, `/api/token`. A failing tool answers `200` with
 `{"ok": false, "error": ...}` rather than a `500`, so one broken tool cannot blank
 the dashboard. `/api/backups` lists only names matching the archive pattern, so a
@@ -482,7 +519,13 @@ otherwise).
 
 Actions: `config_apply`, `engine_apply`, `config_pretty`, `snapshot_create`,
 `backup`, `mark`, `engine_save`, `settings_save`, `backup_import`,
-`backup_schedule_save` (file-only) and `graceful_restart`, `graceful_stop`,
+`backup_schedule_save` (file-only), `palwarden_config_save` (file-only; merges
+only the supplied keys against the effective config *at execution time* — an
+omitted `KNOCK_TOKEN` keeps it, an explicit empty string clears it — and public
+job serialization redacts token fields everywhere) and `graceful_restart`,
+`graceful_stop`, `server_wake` (fixed argv `palworld-knock wake`, optional
+validated reason; admitted only against a confirmed-idle lifecycle and fenced
+against an intervening maintenance transaction — see runbook §17),
 `update_check`, `update_apply`, `engine_rollback`, `api_save`,
 `engine_save_apply_restart`, `settings_save_apply_restart`, `backup_restore`,
 `backup_delete` (disruptive, `confirm: true` required).
@@ -557,6 +600,25 @@ usage, and recent markers. `discord` attaches the FPS/player graph. Drives the
 ---
 
 ## Watchers
+
+### `palworld-idle-watch`
+`/usr/local/sbin/palworld-idle-watch [--loop]`
+
+The stop half of idle shutdown & knock wake
+([runbook §17](palworld-service-runbook.md#17-idle-shutdown-and-knock-wake)).
+One-shot by default (one tick, exit `0` stopped / `75` skipped); `--loop` is the
+supervised s6 form with monotonic scheduling. A tick stops the server only on
+positive evidence of emptiness: `IDLE_TIMEOUT > 0`, service running with uptime
+covering the timeout, a *valid* sampler observation no more than 60 seconds old
+whose observed-empty interval covers the full timeout, and a final
+`palworld-api players` request under the lifecycle lock returning an empty
+list. Anything stale, malformed, loading or unknown is UNKNOWN, not idle — a
+dead sampler next to a healthy `/v1/api/info` never stops a server. The stop is
+`palworld-graceful-stop --wait 0` under inherited lifecycle ownership, with one
+Discord warning first. Config is re-read every tick (and at least once per
+second in `--loop`), so panel edits apply live; an overdue tick runs promptly.
+Test overrides: `PALWARDEN_OPS_FILE`, `PALWORLD_METRICS_DB`,
+`PALWARDEN_LIFECYCLE_LOCK`.
 
 ### `palworld-memory-watch`
 `/usr/local/sbin/palworld-memory-watch [--threshold PCT] [--wait S] [--message T]`
@@ -756,6 +818,7 @@ What it covers — the paths a stub server cannot exercise:
 |-------|----------------------------------|
 | `tests/live/test_restore_roundtrip.sh` | `backup_restore` end to end: stop, extract, swap by rename, chown, start, REST readiness — and the world actually reopens. |
 | `tests/live/test_stop_consistency.sh` | A graceful stop's `SIGINT` produces a world the game loads again; and `palworld-backups --if-due` against a real `Pal/Saved` produces an archive that really unpacks. |
+| `tests/live/test_idle_knock.sh` | The knock listener and the *real engine* contend for UDP 8211 and hand it back; an idle stop saves a real world that the knock wake reopens (same world directories); first knock wakes, a retry inside the cooldown does not, and after expiry knock wakes again. |
 | `tests/live/test_config_drift.sh` | The **semantic** drift comparison (`True` == `1`, `60.000000` == `60`) surviving the game's own rewrite of `Engine.ini`, applied `PalWorldSettings.ini` values surviving it too (with secrets still redacted), and `update_check` against real Steam. |
 
 ### One-time setup

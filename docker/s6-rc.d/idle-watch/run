@@ -1,0 +1,16 @@
+#!/command/with-contenv bash
+# shellcheck shell=bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Brian Grant
+#
+# Idle-shutdown watcher (idle-shutdown/knock-wake spec §5.2). Longrun with its
+# own monotonic --loop instead of a palwarden-run-periodic wrapper: an
+# IDLE_CHECK_INTERVAL edit must reschedule relative to the last tick without a
+# service restart (spec §7.2), which a fixed-period wrapper cannot express.
+#
+# Runs as ROOT (like jobd/memory-watch): a stop decision runs
+# palworld-graceful-stop under the shared lifecycle lock, and stopping the
+# server's s6 service requires s6 service control. IDLE_TIMEOUT=0 (the
+# default) keeps every tick a no-op — the service is supervised
+# unconditionally so enabling idle from the browser needs no recreate.
+exec /usr/local/sbin/palworld-idle-watch --loop

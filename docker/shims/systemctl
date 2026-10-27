@@ -11,6 +11,39 @@ set -u
 
 # s6 tools live in /command; ensure they're reachable regardless of caller PATH.
 PATH="/command:$PATH"
+
+# Task 3 (idle-shutdown/knock-wake): shared lifecycle lock. Mutating operations
+# (start/stop/restart, dispatched below) acquire-or-reuse the lock so a direct
+# `systemctl restart` serializes with update/restore/graceful-restart; read-only
+# operations (is-active, is-enabled, show, ...) do not take it. A caller that
+# already holds the lock (a controller invoked `systemctl` inside its
+# transaction) inherits it via FD_ENV and reuses rather than re-acquires.
+# Sourced optionally (no-op when the helper isn't installed). `full_args`
+# preserves the original argv so the re-exec bridge re-runs this shim with the
+# command intact.
+full_args=("$@")
+# Find the helper: explicit PALWARDEN_LIB_DIR, else the installed
+# /usr/local/lib (the image layout: shim in /usr/local/bin, helper in
+# /usr/local/lib), else the sibling lib/ of a dev checkout (a test pointing
+# PATH at docker/shims directly). When the helper genuinely isn't installed
+# anywhere, fall back to a no-op; when it IS found but the lock cannot be
+# taken, maybe_acquire fails loudly — enrollment never degrades silently.
+_pw_lc_helper="${PALWARDEN_LIB_DIR:-}"
+if [[ -z "$_pw_lc_helper" ]]; then
+  if [[ -f /usr/local/lib/palwarden-lifecycle-bash ]]; then
+    _pw_lc_helper=/usr/local/lib
+  else
+    _pw_lc_cand="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../lib" 2>/dev/null && pwd)" || _pw_lc_cand=""
+    if [[ -n "$_pw_lc_cand" && -f "$_pw_lc_cand/palwarden-lifecycle-bash" ]]; then
+      _pw_lc_helper="$_pw_lc_cand"
+    else
+      _pw_lc_helper=/usr/local/lib
+    fi
+  fi
+fi
+source "$_pw_lc_helper/palwarden-lifecycle-bash" 2>/dev/null || true
+declare -F palworld_lifecycle_maybe_acquire >/dev/null \
+  || palworld_lifecycle_maybe_acquire() { :; }
 S6_SVC_DIR="${PALWARDEN_S6_SVC_DIR:-/run/service}"
 CGROUP_MEM="${PALWARDEN_CGROUP_MEM:-/sys/fs/cgroup/memory.current}"
 
@@ -104,9 +137,12 @@ case "$cmd" in
       if [[ $value -eq 1 ]]; then echo "$out"; else echo "${prop}=${out}"; fi
     done
     exit 0 ;;
-  start)   s6-svc -u "$svcdir" 2>/dev/null; exit $? ;;
-  stop)    s6-svc -wD -d "$svcdir" 2>/dev/null; exit $? ;;
-  restart) s6-svc -r "$svcdir" 2>/dev/null; exit $? ;;
+  start)   palworld_lifecycle_maybe_acquire "${full_args[@]}" || exit 1; if is_server_svc; then palworld_wanted_down_clear; fi; s6-svc -u "$svcdir" 2>/dev/null; exit $? ;;
+  # The `down` marker is OURS to maintain (s6-svc -d creates no file; see
+  # lib/palwarden-lifecycle-bash): mark before the stop so a reader can never
+  # observe "down without marker" for a wanted-down service.
+  stop)    palworld_lifecycle_maybe_acquire "${full_args[@]}" || exit 1; if is_server_svc; then palworld_wanted_down_mark; fi; s6-svc -wD -d "$svcdir" 2>/dev/null; exit $? ;;
+  restart) palworld_lifecycle_maybe_acquire "${full_args[@]}" || exit 1; if is_server_svc; then palworld_wanted_down_clear; fi; s6-svc -r "$svcdir" 2>/dev/null; exit $? ;;
   daemon-reload|enable|disable) exit 0 ;;
   list-timers) echo "container: timers run as s6 services (palwarden-run-periodic/-daily)"; exit 0 ;;
   cat) echo "# container: ${svc_raw:-service} is managed by s6, not systemd"; exit 0 ;;

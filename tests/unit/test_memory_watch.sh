@@ -12,6 +12,7 @@ source "$DIR/../lib/assert.sh"
 WATCH="$DIR/../../sbin/palworld-memory-watch"
 
 WORK="$(mktemp -d)"
+export PALWARDEN_LIFECYCLE_STATE_DIR="$WORK/lifecycle-state"
 trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/bin"
 
@@ -124,6 +125,7 @@ chmod +x "$WORK/bin/api-unconfigured" "$WORK/bin/api-ready"
 run_restart() {
   PATH="$WORK/bin:$PATH" PALWARDEN_CONTAINER=1 \
   PALWARDEN_S6_SVC_DIR="$WORK/service" PALWORLD_API_BIN="$1" \
+  PALWARDEN_LIFECYCLE_LOCK="$WORK/lifecycle.lock" \
     timeout 20 bash "$RESTART" --startup-timeout 15
 }
 

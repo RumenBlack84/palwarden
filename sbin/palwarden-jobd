@@ -39,6 +39,8 @@ sys.path.insert(0, "/usr/local/lib")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import palwarden_archive as archive  # noqa: E402
 import palwarden_jobs as jobs  # noqa: E402
+import palwarden_lifecycle as lc  # noqa: E402
+import palwarden_ops as ops  # noqa: E402
 
 SBIN = Path(os.environ.get("PALWARDEN_SBIN_DIR", "/usr/local/sbin"))
 ENGINE_ENV = Path(os.environ.get("PALWORLD_ENGINE_ENV", "/etc/palworld/engine.env"))
@@ -366,6 +368,98 @@ def validate_message(params: dict) -> str | None:
     if "message" not in params or params.get("message") is None:
         return None
     return validate_text(params, "message")
+
+
+# --- wake fence + ops-config validation (spec §4.4, §7.2, plan Task 8) ------
+
+# The two fields the API mints at wake admission. Exported so palwarden-webui
+# can refuse a caller that supplies them: they bind a wake to a moment in the
+# lifecycle's timeline, and only the server can know that moment truthfully.
+WAKE_INTERNAL_FIELDS = frozenset({"wake_generation", "wake_expires_at"})
+# How long an admitted wake stays executable. Short on purpose: it is a
+# freshness window, not a queue allowance — a wake that waits longer than
+# this behind other work is stale and must fail rather than start late.
+WAKE_EXPIRY_SECONDS = 15
+WAKE_GENERATION_RE = re.compile(r"^[0-9a-f]{32}$")
+
+# Wrapped disruptive actions: action -> lifecycle operation class, for the
+# state marker jobd records around service-mutating maintenance (spec §4.4).
+# `backup_delete` is deliberately absent: it is disruptive (irreversible,
+# confirm-gated) but mutates no service, and rotating the generation for it
+# would invalidate fresh wakes with no safety gain.
+DISRUPTIVE_OPERATIONS = {
+    "graceful_restart": "maintenance",
+    "graceful_stop": "maintenance",
+    "update_apply": "update",
+    "backup_restore": "restore",
+    "engine_rollback": "config",
+    "api_save": "config",
+    "engine_save_apply_restart": "config",
+    "settings_save_apply_restart": "config",
+}
+
+
+def validate_reason(params: dict) -> str | None:
+    """Optional operator reason for a wake: printable, <=200, no flag shape.
+
+    The 200-character ceiling matches palworld-knock's own MAX_REASON_LEN;
+    the leading-"--" rejection keeps a value that argparse-style targets
+    would read as an option out of the fixed argv entirely (wake's own parser
+    would refuse it too — refusing here puts the reason on the *job*, not in
+    a child's stderr).
+    """
+    if "reason" not in params or params.get("reason") is None:
+        return None
+    value = params["reason"]
+    if (not isinstance(value, str) or not value or len(value) > 200
+            or not value.isprintable()):
+        raise ValueError("reason must be 1-200 printable characters")
+    if value.startswith("--"):
+        raise ValueError("reason must not start with '--'")
+    return value
+
+
+def validate_wake_generation(params: dict) -> str | None:
+    # Optional at VALIDATION time because the API validates the caller's
+    # params before it mints the fence (the caller must not supply it, and
+    # cannot be required to). Execution requires it: _wake_fence_refusal
+    # refuses a job that arrives without one.
+    if "wake_generation" not in params or params.get("wake_generation") is None:
+        return None
+    value = params["wake_generation"]
+    if not isinstance(value, str) or not WAKE_GENERATION_RE.fullmatch(value):
+        raise ValueError("wake_generation must be 32 lowercase hex characters")
+    return value
+
+
+def validate_wake_expiry(params: dict) -> int | None:
+    if "wake_expires_at" not in params or params.get("wake_expires_at") is None:
+        return None
+    value = params["wake_expires_at"]
+    # bool is an int subclass; reject it like validate_wait does, so
+    # {"wake_expires_at": true} can never mean "expires at the epoch".
+    if (isinstance(value, bool) or not isinstance(value, int)
+            or not (0 <= value <= 4_294_967_295)):
+        raise ValueError("wake_expires_at must be an integer epoch-seconds "
+                         "value 0-4294967295")
+    return value
+
+
+def validate_ops_settings(params: dict) -> dict[str, str]:
+    """Partial palwarden_ops payload: a subset of the five keys, canonicalised.
+
+    The merge against the current effective config happens at EXECUTION time
+    (spec §7.2), so this validates only what was supplied. Errors come from
+    palwarden_ops.canonical, which names the key and the violation but never
+    echoes a KNOCK_TOKEN value — a refused save cannot leak the token it was
+    refused for.
+    """
+    raw = params.get("settings")
+    if not isinstance(raw, dict):
+        raise ValueError("settings must be an object of palwarden config keys")
+    if not raw:
+        raise ValueError("settings must contain at least one key to save")
+    return {key: ops.canonical(key, value) for key, value in raw.items()}
 
 
 def validate_settings(params: dict) -> dict[str, str]:
@@ -964,6 +1058,22 @@ def _argv_backup_delete(params: dict) -> list[list[str]]:
     return [[str(SBIN / "palworld-backups"), "--delete", name]]
 
 
+def _argv_server_wake(params: dict) -> list[list[str]]:
+    """Fixed argv for the fenced wake. No option slot is caller-addressable:
+    reason is validated text, and the fence pair is the exact values the API
+    minted (re-validated here from the job file, which is untrusted input).
+    An absent reason lets wake's own default stand, same convention as
+    --wait/--message elsewhere.
+    """
+    argv = [str(SBIN / "palworld-knock"), "wake"]
+    reason = params.get("reason")
+    if reason:
+        argv += ["--reason", reason]
+    argv += ["--fence-generation", params["wake_generation"],
+             "--fence-expires-at", str(params["wake_expires_at"])]
+    return [argv]
+
+
 ACTIONS: dict[str, dict] = {
     "config_apply": {"argv": _argv_config_apply, "disruptive": False, "params": ()},
     "engine_apply": {"argv": _argv_engine_apply, "disruptive": False, "params": ("dry_run",)},
@@ -1004,6 +1114,21 @@ ACTIONS: dict[str, dict] = {
     "backup_delete": {"argv": _argv_backup_delete, "disruptive": True,
                       "params": ("backup",)},
     "backup_schedule_save": {"argv": None, "disruptive": False, "params": ("settings",)},
+    # The idle-shutdown config save (spec §7.2): file-only like engine_save,
+    # non-disruptive because it changes no service — the ops tools pick the new
+    # values up on their next tick. `settings` is a PARTIAL payload over the
+    # five palwarden_ops keys; the merge against the current effective config
+    # happens at execution time, so omitted keys (and an omitted KNOCK_TOKEN)
+    # keep their stored value.
+    "palwarden_config_save": {"argv": None, "disruptive": False,
+                              "params": ("settings",)},
+    # The explicit wake (spec §4.3, §4.4): non-disruptive (it only ever starts
+    # a confirmed-stopped server, idempotently) but fence-bound. `reason` is
+    # the operator's text; `wake_generation`/`wake_expires_at` are minted by
+    # the API at admission — recognised here so the worker can re-validate
+    # them, refused at admission when a caller tries to supply them.
+    "server_wake": {"argv": _argv_server_wake, "disruptive": False,
+                    "params": ("reason", "wake_generation", "wake_expires_at")},
 }
 
 
@@ -1060,6 +1185,14 @@ def validate_params(action: str, params: dict) -> tuple[dict | None, str | None]
         # Same slot again, third schema (the four BACKUP_* keys).
         if action == "backup_schedule_save":
             normalised["settings"] = validate_schedule(params)
+        # Fourth schema for the same slot name: the five palwarden_ops keys,
+        # partial, canonicalised (spec §7.2).
+        if action == "palwarden_config_save":
+            normalised["settings"] = validate_ops_settings(params)
+        if action == "server_wake":
+            normalised["reason"] = validate_reason(params)
+            normalised["wake_generation"] = validate_wake_generation(params)
+            normalised["wake_expires_at"] = validate_wake_expiry(params)
         if action in ("graceful_restart", "graceful_stop", "update_apply",
                       "engine_save_apply_restart", "settings_save_apply_restart",
                       "backup_restore"):
@@ -1164,7 +1297,8 @@ def backup_lock(job_id: str):
         os.close(fd)  # releases the flock
 
 
-def _run_step(job_id: str, argv: list[str]) -> int:
+def _run_step(job_id: str, argv: list[str], env: dict | None = None,
+              pass_fds: tuple = ()) -> int:
     """Run one step, recording its output **as it arrives**. Returns an exit code.
 
     This was `subprocess.run(..., capture_output=True, timeout=STEP_TIMEOUT)`, which
@@ -1202,7 +1336,8 @@ def _run_step(job_id: str, argv: list[str]) -> int:
     instead of failing the job.
     """
     proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT)
+                            stderr=subprocess.STDOUT,
+                            env=env, pass_fds=pass_fds)
     deadline = time.monotonic() + STEP_TIMEOUT
     pending = b""
     timed_out = False
@@ -1259,12 +1394,13 @@ def _run_step(job_id: str, argv: list[str]) -> int:
     return rc
 
 
-def _run_commands(job_id: str, action: str, params: dict) -> int:
+def _run_commands(job_id: str, action: str, params: dict,
+                  env: dict | None = None, pass_fds: tuple = ()) -> int:
     """Run an action's steps in order, stopping at the first failure."""
     exit_code = 0
     for argv in build_commands(action, params):
         try:
-            exit_code = _run_step(job_id, argv)
+            exit_code = _run_step(job_id, argv, env=env, pass_fds=pass_fds)
         except OSError as exc:
             jobs.append_output(job_id, f"failed to run {argv!r}: {exc}\n")
             return 1
@@ -1273,21 +1409,110 @@ def _run_commands(job_id: str, action: str, params: dict) -> int:
     return exit_code
 
 
-def run_job(job: dict) -> int:
-    """Validate, then execute a job's steps in order, recording output/state.
+def _mark_state(job_id: str, status: str, operation: str | None,
+                rotate: bool = False) -> None:
+    """Best-effort completion/orphan marker, never transaction admission.
 
-    Stops at the first failing step (composite actions like
-    engine_save_apply_restart never reach a restart after a failed apply).
-    Returns the exit code recorded on the job (0 on success).
+    Owners MUST use lc.begin_transaction before executing any steps. Once
+    admission succeeded, a failed completion leaves active/unsafe in place.
+    The warning rides in job output so the operator sees the degraded state.
     """
-    job_id = job["id"]
-    action = job.get("action")
-    params, error = validate_params(action, job.get("params") or {})
-    if error is not None:
-        jobs.append_output(job_id, f"refused: {error}\n")
-        jobs.update_job(job_id, state="failed", exit_code=1, finished_at=int(time.time()))
-        return 1
+    try:
+        lc.write_state(status, operation, rotate=rotate)
+    except (lc.LifecycleError, OSError) as exc:
+        try:
+            jobs.append_output(
+                job_id,
+                f"warning: lifecycle state not updated ({exc}); wake fencing "
+                f"is degraded until {lc.STATE_ENV} works\n")
+        except KeyError:
+            pass
 
+
+def _wake_fence_refusal(params: dict) -> str | None:
+    """Execution-time fence check in jobd, BEFORE the wake command runs.
+
+    The same fence `palworld-knock wake` re-checks under lifecycle ownership;
+    this half keeps a stale request from even spawning a process. A job that
+    never went through admission (no minted fence) is refused outright.
+    Expiry is checked first because it is the cheaper, clock-only test;
+    state problems (unreadable, non-idle, rotated generation) all refuse
+    without starting.
+    """
+    if (params.get("wake_generation") is None
+            or params.get("wake_expires_at") is None):
+        # A hand-written or truncated job file that never went through
+        # admission: no fence means no freshness guarantee, and the wake
+        # would start on the queue's word alone. Refuse.
+        return ("wake request carries no server-minted fence "
+                "(generation/expiry); refusing to start without it")
+    now = int(time.time())
+    if now >= params["wake_expires_at"]:
+        return (f"wake request expired: admitted for a short window, reached "
+                f"at {now}, past its {params['wake_expires_at']} deadline")
+    try:
+        state = lc.read_state()
+    except lc.LifecycleError as exc:
+        return f"lifecycle state unreadable, refusing to wake blind: {exc}"
+    if state["status"] != "idle":
+        return f"lifecycle status is {state['status']}, not idle; wake refused"
+    if state["generation"] != params["wake_generation"]:
+        return ("lifecycle generation changed since this wake was admitted "
+                "(maintenance ran, or the runtime restarted); wake refused")
+    return None
+
+
+def _scrub_config_token(job_id: str) -> None:
+    """Replace the queued KNOCK_TOKEN in a finished job's raw file (spec §7.3).
+
+    The token's only legitimate reader is this worker, and it has already
+    used it by the time a config-save job reaches any terminal state —
+    success, failure, validation refusal, or orphan reaping. What is left
+    behind is history, and history must not outlive the secret. Best-effort:
+    a job file that vanished mid-flight has nothing left to scrub.
+    """
+    try:
+        job = jobs.read_job(job_id)
+    except Exception:  # noqa: BLE001 - unreadable file: nothing to scrub
+        return
+    if not job or job.get("action") != "palwarden_config_save":
+        return
+    params = job.get("params")
+    if not isinstance(params, dict):
+        return
+    new_params = dict(params)
+    changed = False
+    settings = new_params.get("settings")
+    if isinstance(settings, dict) and "KNOCK_TOKEN" in settings:
+        redacted = dict(settings)
+        redacted["KNOCK_TOKEN"] = jobs.REDACTED
+        new_params["settings"] = redacted
+        changed = True
+    if "KNOCK_TOKEN" in new_params:  # hand-edited file that skipped the slot
+        new_params["KNOCK_TOKEN"] = jobs.REDACTED
+        changed = True
+    if not changed:
+        return
+    try:
+        jobs.update_job(job_id, params=new_params)
+    except KeyError:
+        pass
+
+
+def _execute_job(job_id: str, action: str, params: dict,
+                 env: dict | None = None, pass_fds: tuple = ()) -> int:
+    """Run a validated job's side effects; return the step exit code.
+
+    Split out of run_job so run_job owns exactly one terminal update per
+    path: the wrap (state marking) and the scrub must see every outcome —
+    including the early file-write failures — without six copies of the
+    bookkeeping.
+
+    `env`/`pass_fds` carry jobd's lifecycle ownership down to the steps
+    (F2): when jobd holds the lock it is the transaction owner, and the
+    controllers it spawns must BORROW the descriptor rather than try to
+    acquire the lock jobd already holds.
+    """
     # engine_save (and the save half of the composite action) writes a file
     # rather than running a command; do that first so a bad write fails the
     # whole job before any command runs.
@@ -1296,7 +1521,6 @@ def run_job(job: dict) -> int:
             write_engine_env(params["settings"])
         except (OSError, ValueError) as exc:
             jobs.append_output(job_id, f"engine_save failed: {exc}\n")
-            jobs.update_job(job_id, state="failed", exit_code=1, finished_at=int(time.time()))
             return 1
         jobs.append_output(job_id, "wrote engine.env\n")
 
@@ -1307,7 +1531,6 @@ def run_job(job: dict) -> int:
             write_settings_overrides(params["settings"])
         except (OSError, ValueError) as exc:
             jobs.append_output(job_id, f"settings_save failed: {exc}\n")
-            jobs.update_job(job_id, state="failed", exit_code=1, finished_at=int(time.time()))
             return 1
         jobs.append_output(job_id, f"wrote {SETTINGS_OVERRIDES.name}\n")
 
@@ -1319,9 +1542,33 @@ def run_job(job: dict) -> int:
             write_backup_schedule(params["settings"])
         except (OSError, ValueError) as exc:
             jobs.append_output(job_id, f"backup_schedule_save failed: {exc}\n")
-            jobs.update_job(job_id, state="failed", exit_code=1, finished_at=int(time.time()))
             return 1
         jobs.append_output(job_id, "wrote the backup schedule\n")
+
+    # The idle-shutdown config: merge the partial payload against the CURRENT
+    # effective config at execution time (spec §7.2 — omitted keys keep their
+    # value, an omitted token keeps the token) and write atomically. No argv,
+    # no shell: this is the one action whose whole effect is a file the ops
+    # tools re-read on their next tick. A malformed file on disk raises here
+    # and fails the job — fail closed rather than overwrite the evidence.
+    if action == "palwarden_config_save":
+        try:
+            current = ops.resolve()
+            merged = ops.merge(current, params["settings"])
+            ops.write_config(ops.OPS_FILE, merged)
+        except (OSError, ValueError) as exc:
+            jobs.append_output(job_id, f"palwarden_config_save failed: {exc}\n")
+            return 1
+        jobs.append_output(job_id, "wrote the ops config\n")
+
+    # The wake fence's jobd half: refuse an expired or generation-stale
+    # request before even spawning palworld-knock. (wake re-checks under
+    # ownership; this half keeps the queue honest about *why* it refused.)
+    if action == "server_wake":
+        refusal = _wake_fence_refusal(params)
+        if refusal is not None:
+            jobs.append_output(job_id, f"refused: {refusal}\n")
+            return 1
 
     # The backup family runs under the shared save-backup lock, so a panel action
     # and the scheduled `--if-due --prune` tick can never overlap; everything else
@@ -1332,13 +1579,128 @@ def run_job(job: dict) -> int:
         guard = contextlib.nullcontext()
     try:
         with guard:
-            exit_code = _run_commands(job_id, action, params)
+            return _run_commands(job_id, action, params, env=env,
+                                 pass_fds=pass_fds)
     except TimeoutError as exc:
         jobs.append_output(job_id, f"gave up waiting for the backup lock: {exc}\n")
+        return 1
+
+
+def run_job(job: dict) -> int:
+    """Validate, then execute a job's steps in order, recording output/state.
+
+    Stops at the first failing step (composite actions like
+    engine_save_apply_restart never reach a restart after a failed apply).
+    Returns the exit code recorded on the job (0 on success).
+
+    Service-mutating (wrapped) disruptive actions additionally record the
+    maintenance transaction in the lifecycle state file: active + a rotated
+    generation BEFORE any step, idle after success, unsafe after failure
+    (fail closed — an interrupted or half-failed maintenance inhibits wake
+    until acknowledge-maintenance, spec §4.4). `backup_delete` is disruptive
+    but mutates no service, so it is deliberately not wrapped: rotating for
+    it would invalidate fresh wakes for no safety gain.
+
+    F2 (review follow-ups): jobd may only publish that state when it OWNS
+    the lifecycle lock. It takes the lock nonblocking before the first step;
+    if the lock is busy a direct controller owns the state file and this job
+    writes nothing and runs no steps. `backup_restore` is excluded from the
+    wrap: palworld-restore
+    acquires the lifecycle lock itself AFTER releasing the backup lock, and
+    jobd holding the lifecycle lock across `backup_lock()` would invert the
+    spec §4.1 lock order. When jobd does own the lock it hands the
+    descriptor to every step (env + pass_fds) so nested controllers borrow.
+    """
+    job_id = job["id"]
+    action = job.get("action")
+    params, error = validate_params(action, job.get("params") or {})
+    if error is not None:
+        jobs.append_output(job_id, f"refused: {error}\n")
+        # Scrub BEFORE the terminal update: if the worker dies between the
+        # two, the job is still `running` and reap_orphans will finish the
+        # job and re-scrub (idempotent). The reverse order could strand a
+        # terminal job file holding the token forever — nothing revisits
+        # terminal jobs.
+        _scrub_config_token(job_id)
         jobs.update_job(job_id, state="failed", exit_code=1, finished_at=int(time.time()))
         return 1
 
+    op_class = DISRUPTIVE_OPERATIONS.get(action)
+    # F2: ownership-aware transaction marking (see the docstring above).
+    txn_fd = None
+    txn_env = None
+    if op_class is not None and action != "backup_restore":
+        try:
+            txn_fd = lc.acquire(timeout=0.0)
+        except lc.LifecycleError as exc:
+            # R3 (Sol review): running the steps anyway would execute the
+            # side effects that precede each step's own acquisition (the
+            # engine rollback truncates a file long before it reaches a
+            # restart). Refuse the whole job instead.
+            jobs.append_output(
+                job_id,
+                f"refused: the lifecycle lock is busy ({exc}); "
+                f"service-mutating steps will not run outside a lifecycle "
+                f"transaction\n")
+            _scrub_config_token(job_id)
+            jobs.update_job(job_id, state="failed", exit_code=1,
+                            finished_at=int(time.time()))
+            return 1
+
+    # R7 (Sol review): if _execute_job raises before assigning exit_code,
+    # the old finally evaluated `exit_code == 0` and died with
+    # UnboundLocalError BEFORE lc.release() — poll_once kept the daemon
+    # alive while the descriptor stayed locked forever.  Initialize the
+    # failure status and release unconditionally in a nested finally, so
+    # even a bookkeeping (_mark_state) failure cannot strand the lock.
+    exit_code = None
+    txn_begun = False
+    try:
+        if txn_fd is not None:
+            try:
+                lc.begin_transaction(op_class)
+            except lc.LifecycleError as exc:
+                jobs.append_output(job_id, f"refused: cannot publish lifecycle "
+                                   f"transaction ({exc}); no steps executed\n")
+                exit_code = 1
+            else:
+                txn_begun = True
+                txn_env = {**os.environ, **lc.ownership_env(txn_fd)}
+        if txn_fd is None or txn_begun:
+            exit_code = _execute_job(
+                job_id, action, params, env=txn_env,
+                pass_fds=(txn_fd,) if txn_fd is not None else ())
+    finally:
+        if txn_fd is not None:
+            # "Normal completion records idle, including handled failures only
+            # when service/data state is known safe" (spec §4.4). A non-zero step
+            # exit does not tell us the world is safe — a failed restart may have
+            # stopped the server mid-transaction — so failures record unsafe and
+            # make the operator look. exit_code None (unexpected raise) is a
+            # failure too: record unsafe.
+            #
+            # Review (Sol round 2, gemma scout): the release must be UNCONDITIONAL
+            # even if bookkeeping raises a BaseException (KeyboardInterrupt during
+            # a job) — hence the outer try/finally around the mark_state block.
+            try:
+                try:
+                    if txn_begun:
+                        _mark_state(job_id, "idle" if exit_code == 0 else "unsafe",
+                                    None if exit_code == 0 else op_class)
+                except Exception as exc:
+                    jobs.append_output(
+                        job_id, f"warning: lifecycle completion not recorded "
+                                f"({exc}); the lock is released regardless\n")
+            finally:
+                try:
+                    lc.release(txn_fd)
+                except lc.LifecycleError as exc:
+                    jobs.append_output(
+                        job_id, f"warning: releasing the lifecycle lock failed "
+                                f"({exc}); it drops when this worker exits\n")
+
     state = "succeeded" if exit_code == 0 else "failed"
+    _scrub_config_token(job_id)   # before the terminal update — see refusal path
     jobs.update_job(job_id, state=state, exit_code=exit_code, finished_at=int(time.time()))
     return exit_code
 
@@ -1349,12 +1711,21 @@ def reap_orphans() -> int:
     A job can only be `running` here because a previous worker claimed it and
     then died before finishing — this process only ever sees `running` jobs
     of its own making, moved there by claim_next just before run_job.
+
+    A reaped wrapped action was maintenance interrupted mid-transaction: the
+    state marker rotates to `unsafe` (spec §4.4) so no wake proceeds until
+    an operator acknowledges it, and a reaped config-save job is scrubbed —
+    the token's reader died with the worker.
     """
     reaped = 0
     for job in jobs.list_jobs(limit=1000):
         if job.get("state") == "running":
             jobs.append_output(job["id"], "worker restarted; this job did not finish\n")
+            _scrub_config_token(job["id"])   # before the terminal update
             jobs.update_job(job["id"], state="failed", exit_code=1, finished_at=int(time.time()))
+            op_class = DISRUPTIVE_OPERATIONS.get(job.get("action"))
+            if op_class is not None:
+                _mark_state(job["id"], "unsafe", op_class)
             reaped += 1
     return reaped
 
@@ -1395,6 +1766,19 @@ def poll_once() -> None:
             jobs.append_output(job["id"],
                                "worker hit an internal error; see the service log\n")
         except Exception:  # noqa: BLE001 - the job file may genuinely be gone
+            pass
+        # Same terminal bookkeeping as run_job/reap — scrub and unsafe
+        # marking BEFORE the terminal update (a crash between the two leaves
+        # a reap-able `running` job, never a stranded token in a terminal
+        # file): an internal error during wrapped maintenance is an
+        # interrupted transaction (unsafe), and a config-save job must never
+        # keep its token past its own failure.
+        try:
+            op_class = DISRUPTIVE_OPERATIONS.get(job.get("action"))
+            if op_class is not None:
+                _mark_state(job["id"], "unsafe", op_class)
+            _scrub_config_token(job["id"])
+        except Exception:  # noqa: BLE001 - best effort, like everything here
             pass
         try:
             jobs.update_job(job["id"], state="failed", exit_code=1,
@@ -1459,6 +1843,19 @@ def main(argv: list[str] | None = None) -> int:
         poll_once()
         jobs.prune()
         return 0
+
+    # Daemon mode is *the runtime* (systemd unit / s6 service): rotate the
+    # lifecycle generation before draining anything, so a wake admitted by a
+    # previous runtime cannot survive into this one (spec §4.4 — the queue
+    # lives on a persistent volume, the old generation must not). --once and
+    # --reap are one-shot tools (tests, cron), not runtime starts, and
+    # deliberately do not rotate. A failure here is loud but not fatal:
+    # without a state file wake admission fails closed anyway.
+    try:
+        lc.init_runtime()
+    except lc.LifecycleError as exc:
+        print(f"palwarden-jobd: lifecycle state unavailable: {exc} "
+              f"(wake admission will fail closed)", file=sys.stderr)
 
     reap_orphans()
     while True:

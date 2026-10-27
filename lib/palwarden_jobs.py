@@ -300,6 +300,63 @@ def list_jobs(limit: int = 50) -> list[dict]:
     return jobs[:limit]
 
 
+# The one marker the public serializer substitutes for a secret value. It is
+# deliberately not a legal config value anywhere (see the "<redacted> has no
+# placeholder semantics" rule in spec §7.2): it exists to say "a value was
+# here" to the browser, never to be written back.
+REDACTED = "<redacted>"
+
+# The only parameter slot that can ever hold a secret: the replacement knock
+# token of a palwarden_config_save job (spec §7.3 — the private queued payload
+# keeps it until the worker has used it; every browser-facing response must
+# not). Redaction is deliberately keyed by action, not by key name: other
+# actions legitimately carry arbitrary settings dicts, and rewriting those
+# would change the job API's existing fields.
+SECRET_PARAM_SLOTS = {"palwarden_config_save": "KNOCK_TOKEN"}
+
+
+def public_job(job: dict) -> dict:
+    """Serialize a job for a browser-facing response (enqueue, list, detail).
+
+    ONE function for every response path, so there is no endpoint that can
+    forget to redact. Narrow by design: only the token slot of a
+    palwarden_config_save job is replaced; every other field — including the
+    internal pending payload on disk, which the worker still needs — is
+    passed through untouched. The input dict is never mutated.
+
+    The worker must never call this: it reads raw jobs (read_job/claim_next)
+    because it is the one party that legitimately needs the token.
+    """
+    if not isinstance(job, dict):
+        return job
+    secret_key = SECRET_PARAM_SLOTS.get(job.get("action") or "")
+    if secret_key is None:
+        return job
+    params = job.get("params")
+    if not isinstance(params, dict):
+        return job
+    out: dict | None = None
+
+    settings = params.get("settings")
+    if isinstance(settings, dict) and secret_key in settings:
+        redacted_settings = dict(settings)
+        redacted_settings[secret_key] = REDACTED
+        out = dict(job)
+        out["params"] = dict(params)
+        out["params"]["settings"] = redacted_settings
+    # A hand-edited queue file could put the token anywhere; the two shapes a
+    # writer of any privilege plausibly produces are the settings slot (the
+    # real one) and a top-level key of the same name. Both are redacted;
+    # anything deeper is passed through as inert data, never executed.
+    if secret_key in params:
+        target = dict(out["params"]) if out is not None else dict(params)
+        target[secret_key] = REDACTED
+        if out is None:
+            out = dict(job)
+        out["params"] = target
+    return job if out is None else out
+
+
 def update_job(job_id: str, **fields) -> dict:
     job = read_job(job_id)
     if job is None:

@@ -214,7 +214,7 @@ when an admin password exists, so readiness could never be reached."
   # server is up *and* reachable the way every job will reach it.
   local deadline=$((SECONDS + LIVE_UP_TIMEOUT))
   while ((SECONDS < deadline)); do
-    if live_exec palworld-api info 2>/dev/null | grep -q 'HTTP 200'; then
+    if live_exec palworld-api info 2>/dev/null | grep -q servername; then
       live_log "server is REST-ready"
       return 0
     fi

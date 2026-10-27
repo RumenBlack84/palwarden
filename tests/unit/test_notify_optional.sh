@@ -31,6 +31,7 @@ if [ -e /usr/local/lib/palworld-notify ]; then
   echo "  (skipping behavioural checks: palworld-notify IS installed on this host)"
 else
   WORK="$(mktemp -d)"
+  export PALWARDEN_LIFECYCLE_STATE_DIR="$WORK/lifecycle-state"
   trap 'rm -rf "$WORK"' EXIT
   mkdir -p "$WORK/bin"
   # fake s6-svc so the container branch of graceful-stop can run
@@ -55,7 +56,9 @@ else
 
   # graceful-stop's container path has no other missing dependency, so it must
   # complete successfully with no notify helper at all.
-  out="$(env PATH="$WORK/bin:$PATH" PALWARDEN_CONTAINER=1 bash "$REPO/sbin/palworld-graceful-stop" 2>&1)"; rc=$?
+  out="$(env PATH="$WORK/bin:$PATH" PALWARDEN_CONTAINER=1 \
+         PALWARDEN_LIFECYCLE_LOCK="$WORK/lifecycle.lock" \
+         bash "$REPO/sbin/palworld-graceful-stop" 2>&1)"; rc=$?
   assert_eq "$rc" "0" "graceful-stop (container) succeeds without the notify helper"
   assert_not_contains "$out" "palworld_notify" "graceful-stop: notify never surfaces as an error"
 fi

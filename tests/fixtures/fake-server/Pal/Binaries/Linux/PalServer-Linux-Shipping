@@ -2,7 +2,14 @@
 # Test fixture: stand-in for the real Palworld server binary. It handles SIGINT
 # the way the real game does — "saves" (briefly) then exits cleanly — so tests
 # can verify graceful save-on-stop and s6 restart behavior.
-import signal, sys, time
+#
+# It ALSO really binds the game's UDP port (8211), the way the real game does:
+# that is what makes the knock listener's port handoff observable in Docker
+# acceptance (idle-shutdown/knock-wake spec §4.2) — while the game runs, the
+# helper must not be able to hold the port; after a wake, the game must own it
+# again. SO_REUSEADDR mirrors the real binary (restart loops must not stall on
+# TIME_WAIT); it does not allow two live binders.
+import os, signal, socket, sys, time
 
 def on_int(sig, frame):
     print("[game] SIGINT received: saving world...", flush=True)
@@ -11,6 +18,9 @@ def on_int(sig, frame):
     sys.exit(0)
 
 signal.signal(signal.SIGINT, on_int)
-print("[game] dedicated server running", flush=True)
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+sock.bind(("0.0.0.0", int(os.environ.get("FAKE_GAME_UDP_PORT", "8211"))))
+print("[game] dedicated server running (udp bound)", flush=True)
 while True:
     time.sleep(1)

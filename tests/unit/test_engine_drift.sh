@@ -557,4 +557,51 @@ assert_contains "$out" "regular file" "--check's FIFO refusal says it is not a r
 assert_not_contains "$out" "Traceback" "the FIFO refusal is a message, not a crash"
 rm -f "$INI"
 
+# --- Finding A (Brian's ruling 2026-10-26): absent == default == no drift ---
+# The real game rewrites Engine.ini writing ONLY non-default values, so an
+# absent managed value is the file saying "this is the default". Absence is
+# drift only when the wanted value differs from a default listed in the
+# engine-config table (tick=30 per Unreal docs; ConnectionTimeout=90 assumed
+# — the testbed shows the game round-trips keys a session read and drops
+# keys it never read, so strips alone do not prove defaultness), or when no
+# default is listed for the key (conservative: unknown stays drift).
+cat > "$ENV_FILE" <<'EOF'
+NET_SERVER_MAX_TICK_RATE=30
+CONNECTION_TIMEOUT=90
+EOF
+cat > "$INI" <<'EOF'
+[Core.System]
+Paths=%GAMEDIR%Content
+EOF
+out="$(check)"; rc=$?
+assert_eq "$rc" "0" "absent managed values equal to game defaults are no drift"
+assert_contains "$out" "OK" "defaults-only absence reports OK, not 'no managed values'"
+
+# Wanted value differing from the default: absence IS drift.
+cat > "$ENV_FILE" <<'EOF'
+NET_SERVER_MAX_TICK_RATE=50
+EOF
+out="$(check)"; rc=$?
+assert_ne "$rc" "0" "absent value differing from the default is drift"
+assert_contains "$out" "NET_SERVER_MAX_TICK_RATE" "the drift report names the key"
+
+# No verified default for the key: absence stays drift (conservative).
+cat > "$ENV_FILE" <<'EOF'
+MAX_CLIENT_RATE=80000
+EOF
+out="$(check)"; rc=$?
+assert_ne "$rc" "0" "absent value with no known default stays drift"
+assert_contains "$out" "MAX_CLIENT_RATE" "unknown-default drift names the key"
+
+# Default present physically still matches.
+cat > "$ENV_FILE" <<'EOF'
+NET_SERVER_MAX_TICK_RATE=30
+EOF
+cat > "$INI" <<'EOF'
+[/Script/OnlineSubsystemUtils.IpNetDriver]
+NetServerMaxTickRate=30
+EOF
+out="$(check)"; rc=$?
+assert_eq "$rc" "0" "present-and-equal-to-default still matches"
+
 assert_report

@@ -210,6 +210,7 @@ never the public Internet).
 | `palwarden-backups` | `/opt/palworld/backups` | World-save archives (embedded) |
 | `palwarden-config-snapshots` | `/opt/palworld/config-snapshots` | Config snapshots / rollback material (embedded) |
 | `palwarden-config-backups` | `/opt/palworld/config-backups` | `Engine.ini` pre-rollback copies (embedded) |
+| `palwarden-ops` | `/var/lib/palwarden-ops` | Idle/knock ops file, knock cooldown, lifecycle state marker (embedded) |
 
 `palwarden-backups` is deliberately its own volume and **not** a directory inside
 `palworld-saved`: a backup has to outlive the thing it backs up, and anything left
@@ -220,6 +221,15 @@ image path, which is pre-created root-owned `0755` — the ownership
 runtime `chown`. `docker compose down -v` deletes your backups along with
 everything else; copy them off the host (the Backups page's download button, or
 `docker cp`) before you do that.
+
+`palwarden-ops` has a different privilege shape from every volume above, which is
+why it is not inside `palwarden-state`: the image pre-creates it **root:steam
+0750** (fresh volumes inherit that), the ops file is written **root:steam 0640**
+by the root entrypoint/jobd — the steam web UI reads it through the group — and
+the knock cooldown and lifecycle marker stay root-only. Nothing chowns it at
+runtime. A `force-recreate` with this volume keeps everything the idle/knock
+browser panel saved (settings, token, cooldown); **deleting the volume resets
+them** to the compose seeds — that is the documented reset, not a rollback step.
 
 **`/opt/palworld` as a whole is *not* persisted** — only the paths named in
 the table above are. `/opt/palworld/restore-scratch` and `/opt/palworld/tools`
@@ -333,6 +343,55 @@ docker compose exec palwarden rm /var/lib/palworld/backup.env
 docker compose restart palwarden
 docker compose exec palwarden palworld-backups --show-schedule   # what the tick will do
 ```
+
+### Idle shutdown & knock wake
+
+`IDLE_TIMEOUT`, `IDLE_CHECK_INTERVAL`, `KNOCK_ENABLED`, `KNOCK_COOLDOWN`,
+`KNOCK_TOKEN` are **seeds, not settings**: the entrypoint writes the complete
+validated file to `/var/lib/palwarden-ops/palwarden.env` **only if it is absent**
+(even when every value is a default), and never re-renders it. The browser panel
+("Idle shutdown & knock wake" on the web UI) owns the file afterwards, and edits
+apply **live** — both helpers re-read the config continuously, so enabling or
+disabling either needs no service or container restart. Defaults: **idle off**
+(`IDLE_TIMEOUT=0`; opt in only after the telemetry page shows healthy empty
+observations), **knock on**.
+
+The knock listener binds the **internal** game port (8211/udp — the same port the
+server itself uses; only one of the two ever holds it). `PALWORLD_GAME_PORT`
+remaps the **host** side of that mapping; the internal port is not configurable.
+An empty `KNOCK_TOKEN` is an open doorbell: any UDP packet on the published port
+wakes the server. A token is a shared secret, not encryption and not replay
+protection. No token is ever baked into the image or logged.
+
+Every successful wake stamps a cooldown (`KNOCK_COOLDOWN`, default 600s) *before*
+starting, and all three wake paths — a UDP knock, `palworld-knock wake`, and the
+`server_wake` job — no-op inside that window. An ordinary administrative start
+(`docker compose start`, the shim) is the deliberate override and does not consult
+it; never reach for raw root `s6-svc` commands as a maintenance procedure next to
+the tooling — they bypass the lifecycle lock the rest of the system cooperates
+under. Idle eligibility likewise runs on positive evidence only: the last players
+observation must be at most 60 seconds old (fixed in v1) and the observed-empty
+interval must cover the full `IDLE_TIMEOUT`, plus a final empty-players check
+under the lifecycle lock. The full lifecycle protocol, bypass boundaries, error
+recovery and the remaining join race are in the service runbook,
+[§17](../docs/palworld-service-runbook.md#17-idle-shutdown-and-knock-wake).
+
+To re-seed from `.env`, delete the file and restart:
+
+```bash
+docker compose exec palwarden rm /var/lib/palwarden-ops/palwarden.env
+docker compose restart palwarden
+```
+
+### Upgrading and rolling back
+
+Keep idle **off across an upgrade** (the default): the telemetry page should show
+healthy empty observations before you opt in. Rolling the feature back is a panel
+edit — idle timeout 0, knock disabled — not a volume operation. **Never delete the
+`palwarden-ops` volume as routine rollback**: it holds the saved config, the
+cooldown and the lifecycle state, and recreating it resets all three (the `.env`
+seeds re-apply on the next start). Saves live elsewhere and are never part of this
+feature's rollback.
 
 ## Image internals
 

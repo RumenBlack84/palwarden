@@ -49,11 +49,14 @@
 #
 #   * NET_SERVER_MAX_TICK_RATE — an `int` setting (Unreal's own default is 30, so
 #     50/55 is non-default), and the example the brief names.
-#   * CONNECTION_TIMEOUT — a `float` setting (default 60, so 90/95 is
-#     non-default), and the one that actually exercises the documented
-#     `60.000000` == `60` case: `normalize_value` folds a float through
-#     `f"{n:g}"`, whereas its `int` branch is plain `int(v)`. Testing only an int
-#     key would leave the decimal half of the semantic comparison unexercised.
+#   * CONNECTION_TIMEOUT — a `float` setting. The product assumes default 90
+#     (unproven on the testbed: the game round-trips keys a session READ and
+#     drops keys it never read, so an observed strip proves only "never
+#     read"; an earlier "default 60" note here was wrong). Applying 90 keeps
+#     this suite on the present-and-matching path; the absent-equals-default
+#     rule is pinned by the unit suite (test_engine_drift.sh). The 95
+#     fallback exercises the float-formatting case (`95.000000` == `95` via
+#     `normalize_value`'s `f"{n:g}"` fold).
 #   * ServerDescription for PalWorldSettings.ini — a quoted free-text field, so it
 #     can carry this run's nonce (which is what makes the assertion
 #     self-contained); empty in Palworld's shipped config, so setting it is
@@ -74,11 +77,6 @@ source "$DIR/lib/testbed.sh"
 # itself on refusal.
 live_require_testbed
 
-# How long the graceful restart may take: a real save flushed on SIGINT plus a cold
-# start of the game. Its own bound rather than LIVE_JOB_TIMEOUT's 300s, matching
-# test_stop_consistency.sh's reasoning, and bounded all the same — an unbounded live
-# suite is one nobody watches long enough to notice.
-RESTART_TIMEOUT="${PALWARDEN_LIVE_RESTART_TIMEOUT:-420}"
 # SteamCMD has to fetch app info from Valve on a cold cache, which is comfortably
 # slower than any local job. Also bounded.
 UPDATE_TIMEOUT="${PALWARDEN_LIVE_UPDATE_TIMEOUT:-600}"
@@ -134,6 +132,24 @@ pick_alt() {
     "$2") printf '%s\n' "$3" ;;
     *)    printf '%s\n' "$2" ;;
   esac
+}
+
+# gstop -> 0 when a graceful_stop job succeeded. Wrapped jobs refuse while the
+# lifecycle lock is busy BY DESIGN (the operator retries — see the R3 refusal
+# test); a wake in flight holds the lock through world load. Retry the enqueue
+# on that refusal only; any other end state is a real failure.
+gstop() {
+  local id st _try
+  for _try in 1 2 3 4 5 6; do
+    id="$(live_enqueue graceful_stop '{"wait":0,"confirm":true}')" || return 1
+    st="$(live_wait_job "$id" 300)"
+    [ "$st" = succeeded ] && return 0
+    live_exec grep -q 'lifecycle lock is busy' \
+      "/var/lib/palwarden/jobs/$id.json" 2>/dev/null || { live_log "graceful_stop job $id ended $st"; return 1; }
+    live_log "graceful_stop refused: lifecycle busy; retrying ($_try/6)"
+    sleep 15
+  done
+  return 1
 }
 
 # engine_check -> three lines: ok, drift_ok, and the check text on one line.
@@ -286,6 +302,17 @@ assert_eq "$e_state" "succeeded" "engine_save writes engine.env (job $e_id)"
 assert_contains "$(live_exec cat "$ENGINE_ENV" 2>/dev/null)" "NET_SERVER_MAX_TICK_RATE=$TICK" \
   "engine.env now holds this run's expected tick rate"
 
+# Stop FIRST, then apply. The dedicated server rewrites Engine.ini at shutdown
+# from the config it read at startup, writing only non-default values, so an
+# apply issued while a session still runs is clobbered by that session's next
+# shutdown before it is ever read — measured on the testbed 2026-10 (four
+# experiments; also what jobd's engine_save_apply_restart comment documents
+# for the composite path). Applying while down means the bytes below are the
+# bytes the NEXT session reads, and that session's own shutdown rewrite is
+# what the drift assertions at the bottom then face.
+gstop || { fail "could not stop the server before applying Engine.ini"; assert_report; exit 1; }
+pass "server stopped through the supported job path before the apply"
+
 a_id="$(live_enqueue engine_apply '{}')" \
   || { fail "could not enqueue the engine_apply job"; assert_report; exit 1; }
 a_state="$(live_wait_job "$a_id")"
@@ -338,27 +365,26 @@ assert_eq "$c_state" "succeeded" "config_apply applies settings.env to PalWorldS
 assert_file_contains "$SETTINGS_INI" "ServerDescription=\"$DESCRIPTION\"" \
   "the applied description is in the live PalWorldSettings.ini"
 
-# --- restart, and let the game rewrite both files -----------------------------
-# THE POINT OF THE WHOLE SCENARIO. Through the real operator path — the same
-# graceful_restart the Overview page's button queues — because that is what
-# palworld-config-apply-env's own closing message tells the operator to do, and
-# because the shutdown half (SIGINT, save) and the startup half (read, normalise,
-# rewrite) are both parts of the rewriting under test. wait:0 skips the
-# player-warning window (nobody is playing); confirm:true is the gate jobd puts in
-# front of every disruptive action.
+# --- start a session that READS both applied files, then stop it so its -----
+# --- own shutdown rewrite is what the drift assertions then face -------------
+# THE POINT OF THE WHOLE SCENARIO, in the game's real order of operations: the
+# session that rewrites the files must be a session that READ the applied
+# values. Starting is an s6 up plus the same bounded readiness poll every job
+# uses (the applies already ran while down, so there is nothing left for a
+# restart job to apply); the stop is the supported graceful_stop job, whose
+# SIGINT save is the rewrite under test.
 ENGINE_SHA_BEFORE="$(sha256sum "$ENGINE_INI" 2>/dev/null | cut -d' ' -f1)"
-r_id="$(live_enqueue graceful_restart '{"wait":0,"confirm":true}')" \
-  || { fail "could not enqueue the graceful_restart job"; assert_report; exit 1; }
-r_state="$(live_wait_job "$r_id" "$RESTART_TIMEOUT")"
-assert_eq "$r_state" "succeeded" "graceful_restart runs to success against a real server (job $r_id)"
+live_exec s6-svc -u /run/service/palworld-server >/dev/null 2>&1 \
+  || { fail "could not start the server after the applies"; assert_report; exit 1; }
+ok=0
+for _ in $(seq 1 $((LIVE_UP_TIMEOUT / 5))); do
+  live_exec palworld-api info 2>/dev/null | grep -q servername && { ok=1; break; }
+  sleep 5
+done
+assert_eq "$ok" "1" "the session started onto the applied files becomes REST-ready"
 
-# live_up for the readiness poll rather than a loop of our own: it is already
-# bounded (LIVE_UP_TIMEOUT) and it measures readiness the same way every job does,
-# through palworld-api inside the container. Its `compose up -d --build` is a no-op
-# on a stack that is already up with an image built minutes ago; what is wanted from
-# it here is the poll. Without it the checks below could run against a server that
-# has not finished writing its config yet.
-live_up || { fail "the server did not become REST-ready again after the restart"; assert_report; exit 1; }
+gstop || { fail "could not stop the session that read the applied files"; assert_report; exit 1; }
+pass "the reading session stopped through the job path; its shutdown rewrite is now on disk"
 
 # Reported, not asserted. Whether the game rewrites Engine.ini byte-for-identically
 # is the game's business and could change with any patch, so making it an assertion

@@ -72,6 +72,7 @@ from pathlib import Path
 sys.path.insert(0, "/usr/local/lib")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import palwarden_archive as archive  # noqa: E402
+import palwarden_lifecycle as lifecycle  # noqa: E402
 
 # Written by palwarden-webui as the unprivileged service account.
 UPLOAD_DIR = Path(os.environ.get("PALWARDEN_UPLOAD_DIR", "/var/lib/palworld/uploads"))
@@ -146,6 +147,18 @@ SERVICE_GROUP = os.environ.get("PALWORLD_GROUP", "palworld")
 # polled at the same 3s interval. Matched rather than re-chosen: "up" has one
 # definition in this repo and it lives in that script.
 STARTUP_TIMEOUT = archive.env_int("PALWARDEN_RESTORE_STARTUP_TIMEOUT", 180)
+
+# The lifecycle lock this process holds (Task 3, spec §4.1). Set by
+# restore_archive between the safety backup and the graceful stop; `_run`
+# propagates it to every child so a nested palworld-graceful-stop or
+# `systemctl start` reuses the lock instead of deadlocking on itself. When
+# restore itself runs inside another controller's transaction the fd is already
+# in the environment and nothing is acquired here — the outer holder keeps
+# ownership.
+_lifecycle_fd: int | None = None
+# True when THIS process acquired the lock; False when it was borrowed from
+# an outer transaction (F6). Only the owner publishes state or releases.
+_lifecycle_owned: bool = False
 POLL_SECONDS = archive.env_int("PALWARDEN_RESTORE_POLL_SECONDS", 3)
 
 # Ceiling on the compressed size of the archive copied into scratch. Same purpose
@@ -490,8 +503,21 @@ def _run(argv: list[str], echo: bool = False) -> tuple[int, str]:
     it off because it can run dozens of times.
     """
     sys.stdout.flush()
+    env = None
+    pass_fds: tuple[int, ...] = ()
+    if _lifecycle_fd is not None:
+        # We hold the lifecycle lock: hand the descriptor (and FD_ENV naming
+        # it) to the child so enrolled sub-tools reuse the transaction's lock
+        # instead of contending with us. ownership_env() also clears the fd's
+        # CLOEXEC, but subprocess closes high descriptors by default — the fd
+        # must be named in pass_fds or FD_ENV would point the child at a
+        # closed descriptor and every enrolled sub-tool would refuse to run.
+        env = dict(os.environ)
+        env.update(lifecycle.ownership_env(_lifecycle_fd))
+        pass_fds = (_lifecycle_fd,)
     try:
-        proc = subprocess.run(argv, stdout=subprocess.PIPE, text=True, check=False)
+        proc = subprocess.run(argv, stdout=subprocess.PIPE, text=True,
+                              check=False, env=env, pass_fds=pass_fds)
     except OSError as exc:
         raise archive.ArchiveError(f"cannot run {argv[0]}: {exc}") from exc
     out = proc.stdout or ""
@@ -1816,6 +1842,13 @@ def restore_archive(name: str, wait: int | None = None,
     restore is over, so the copy, the validation, the extraction and the cleanup
     all reach the scratch file through one verified directory rather than through
     four independent resolutions of its path.
+
+    The lifecycle lock (Task 3, spec §4.1) is taken after the safety backup —
+    palworld-backup's own lock is already released by then, and the lifecycle
+    lock is never taken while any other lock is held (see the module docstring
+    in palwarden_lifecycle) — and held through the stop, the swap and the
+    start, so no other lifecycle controller can interleave with a half-applied
+    world. A busy lock aborts the restore before the server is touched.
     """
     _require_answerable_service_state()
     src = _backup_path(name)
@@ -1824,6 +1857,8 @@ def restore_archive(name: str, wait: int | None = None,
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     safety: str | None = None
     replaced: Path | None = None
+    _txn_completed = False  # set only on the fully-successful path (F1)
+    _txn_begun = False  # acquisition alone does not authorize completion
 
     _report_stale_replaced()
     dfd = _open_scratch_dir()
@@ -1836,6 +1871,39 @@ def restore_archive(name: str, wait: int | None = None,
                   f"bytes uncompressed), from the root-owned scratch copy {scratch}")
 
             safety = _safety_backup()
+
+            global _lifecycle_fd, _lifecycle_owned
+            kind, inherited_fd = lifecycle.ownership_from_env()
+            if kind == "borrowed":
+                # F6 (review follow-ups): a nested restore reuses the
+                # inherited descriptor instead of acquiring a NEW flock on
+                # the same file — that was a self-conflict that waited out
+                # the whole lifecycle timeout. The outer owner publishes
+                # state and releases; we do neither.
+                _lifecycle_fd = inherited_fd
+                _lifecycle_owned = False
+                print("note: borrowing the outer lifecycle transaction; "
+                      "state and release belong to the owner",
+                      file=sys.stderr)
+            else:
+                try:
+                    _lifecycle_fd = lifecycle.acquire(
+                        timeout=float(os.environ.get(
+                            "PALWARDEN_LIFECYCLE_TIMEOUT", "600")))
+                    _lifecycle_owned = True
+                except lifecycle.LifecycleError as exc:
+                    raise archive.ArchiveError(
+                        f"cannot take the lifecycle lock: {exc} — another "
+                        f"lifecycle transaction is in progress; nothing was "
+                        f"stopped and the world was left untouched") from exc
+                try:
+                    lifecycle.begin_transaction("restore")
+                except lifecycle.LifecycleError as exc:
+                    raise archive.ArchiveError(
+                        f"cannot publish lifecycle transaction: {exc}; nothing "
+                        f"was stopped and the world was left untouched") from exc
+                _txn_begun = True
+
             _graceful_stop(wait)
 
             # The entropy is not cosmetic and it is not about collisions. The
@@ -1943,6 +2011,7 @@ def restore_archive(name: str, wait: int | None = None,
                     f"the world was restored and {SERVICE_UNIT} was started, but "
                     f"the REST API did not become ready within {startup_timeout}s, "
                     f"so the startup is not confirmed")
+            _txn_completed = True
         except BaseException:
             _print_recovery(replaced, safety)
             raise
@@ -1952,9 +2021,35 @@ def restore_archive(name: str, wait: int | None = None,
         # bytes from. `scratch` is None when the copy itself never got as far as
         # creating a file, in which case there is nothing to remove and — as in
         # `_copy_fd_to_temp` — nothing of ours to guess at either.
-        if scratch is not None:
-            _unlink_quietly_at(dfd, scratch.name, scratch)
-        os.close(dfd)
+        try:
+            try:
+                if scratch is not None:
+                    _unlink_quietly_at(dfd, scratch.name, scratch)
+            finally:
+                os.close(dfd)
+        finally:
+            try:
+                if _lifecycle_fd is not None and _lifecycle_owned:
+                    try:
+                        # No completion after refused begin: nothing ran.
+                        if _txn_begun:
+                            lifecycle.write_state("idle" if _txn_completed else "unsafe")
+                    except lifecycle.LifecycleError as exc:
+                        print(f"palworld-restore: warning: completion not recorded "
+                              f"({exc}); wake stays fenced until ack", file=sys.stderr)
+                    finally:
+                        # Even scratch cleanup or completion BaseException must
+                        # release ownership in an imported/long-lived caller.
+                        try:
+                            lifecycle.release(_lifecycle_fd)
+                        except lifecycle.LifecycleError as exc:
+                            print(f"palworld-restore: warning: releasing the lifecycle "
+                                  f"lock failed ({exc}); it drops when this process exits",
+                                  file=sys.stderr)
+            finally:
+                # Borrowers never release their outer owner's descriptor.
+                _lifecycle_fd = None
+                _lifecycle_owned = False
 
     if state == "ready":
         print(f"started: {SERVICE_UNIT} is up and the REST API is healthy.")

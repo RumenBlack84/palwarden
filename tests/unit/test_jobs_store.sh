@@ -396,4 +396,65 @@ got = j.read_job(job["id"])
 print("ok" if got is not None and len(got["output"]) > 100000 else "REFUSED %r" % (got,))')"
 assert_eq "$out" "ok" "a job with the maximum permitted output still reads back"
 
+# --- public_job: the one serializer every browser-facing job response uses --
+# (spec §7.3, plan Task 8.) It redacts KNOCK_TOKEN narrowly — only the token
+# slot of a palwarden_config_save job — preserves every other field, never
+# mutates the job it was handed, and never touches the raw file (the worker
+# still needs the pending payload).
+reset
+out="$(py '
+import json, palwarden_jobs as j
+job = j.create_job("palwarden_config_save", {
+    "settings": {"KNOCK_TOKEN": "sekrit-token-9f3a", "IDLE_TIMEOUT": "30"}})
+pub = j.public_job(job)
+assert pub["params"]["settings"]["KNOCK_TOKEN"] != "sekrit-token-9f3a", pub
+assert pub["params"]["settings"]["IDLE_TIMEOUT"] == "30", pub
+assert pub["id"] == job["id"] and pub["action"] == job["action"], pub
+assert pub["state"] == job["state"] and pub["output"] == job["output"], pub
+# the caller-supplied dict is not mutated in place
+assert job["params"]["settings"]["KNOCK_TOKEN"] == "sekrit-token-9f3a", job
+# the raw queue file still carries the token: the worker needs it
+raw = json.loads((j.JOBS_DIR / (job["id"] + ".json")).read_text())
+assert raw["params"]["settings"]["KNOCK_TOKEN"] == "sekrit-token-9f3a", raw
+# and read_job (the worker path) is untouched by the serializer
+assert j.read_job(job["id"])["params"]["settings"]["KNOCK_TOKEN"] == "sekrit-token-9f3a"
+print("ok")')"
+assert_eq "$out" "ok" "public_job redacts the token, keeps everything else, leaves the file intact"
+
+reset
+out="$(py '
+import palwarden_jobs as j
+# other actions are never rewritten, even when they carry the same key names
+job = j.create_job("settings_save", {"settings": {"KNOCK_TOKEN": "not-a-knock-slot"}})
+assert j.public_job(job) == job, j.public_job(job)
+job = j.create_job("backup", {})
+assert j.public_job(job) == job
+# malformed/hand-edited params are passed through, never raise
+for weird in ({}, {"settings": None}, {"settings": "x"}, {"settings": [1]},
+              {"KNOCK_TOKEN": "top-level"}, None):
+    job = j.create_job("palwarden_config_save", weird) if weird is not None else None
+    if job is None:
+        continue
+    pub = j.public_job(job)
+    assert pub["action"] == "palwarden_config_save"
+# a top-level KNOCK_TOKEN on a config-save job is redacted too (defence
+# against a hand-edited file that skips the settings slot)
+job = j.create_job("palwarden_config_save", {"KNOCK_TOKEN": "sneaky"})
+pub = j.public_job(job)
+assert pub["params"]["KNOCK_TOKEN"] != "sneaky", pub
+print("ok")')"
+assert_eq "$out" "ok" "public_job is narrow: other actions untouched, malformed params survive"
+
+reset
+out="$(py '
+import palwarden_jobs as j
+# non-string token values (a hand-edited file could hold anything) are still
+# replaced, and the marker is a plain string
+job = j.create_job("palwarden_config_save", {"settings": {"KNOCK_TOKEN": {"nested": 1}}})
+pub = j.public_job(job)
+assert isinstance(pub["params"]["settings"]["KNOCK_TOKEN"], str), pub
+assert j.read_job(job["id"])["params"]["settings"]["KNOCK_TOKEN"] == {"nested": 1}
+print("ok")')"
+assert_eq "$out" "ok" "public_job replaces non-string token values without touching the file"
+
 assert_report
