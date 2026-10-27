@@ -1009,3 +1009,31 @@ Scratch logs: `palwarden-pr-final-lint.log`, `palwarden-pr-final-unit.log`,
 `palwarden-pr-merged-root-ack.log`, `palwarden-pr-merged-integration.log`,
 `palwarden-pr-final-idle-knock.log`. PR publication/CI status belongs to the PR;
 this entry records the verified local preparation, not a remote-success claim.
+
+## Hosted CI portability follow-up (PR #15)
+
+PR: https://github.com/RumenBlack84/palwarden/pull/15 (open, not merged).
+Hosted unit job 122375536110 in run 40556978116 exposed a defect in the NEW
+regression fixture: `os.environ["TMPDIR"]` raises KeyError on GitHub's runner,
+where TMPDIR is unset. All 14 methods failed during setup; no safety assertions
+ran in that hosted fixture. The other hosted unit suites passed.
+
+Reproduced locally with TMPDIR removed (RED, KeyError confirmed), then changed
+only temporary-directory selection to honor an explicit nonempty TMPDIR and use
+Python's standard fallback otherwise. The complete 14-test fixture passes with
+TMPDIR set, unset and empty; repository lint passes. Scratch-isolated probes
+cache tempfile's fallback under the approved scratch root rather than writing to
+the host's system temporary directory.
+
+An initial full-suite CI-environment mirror incorrectly bind-mounted the
+user-owned scratch root directly at the container's `/tmp`; that invalidated an
+existing foreign-owned-directory test which deliberately relies on root-owned
+`/tmp`. It is NOT a pass and no production guard was weakened. The corrected
+full-suite mirror leaves `/tmp` root-owned inside the disposable container and
+does not mount host system temporary paths. Its run and hosted rerun results are
+pending at this entry; they must not be inferred from the focused GREEN result.
+
+GitGuardian's five reported occurrences were also inspected: four are shell
+command-substitution expressions locating helpers, one is a synthetic queue-test
+token. No live credential was identified at those locations. The findings are
+documented on the PR, not dismissed or bypassed; owner triage remains separate.

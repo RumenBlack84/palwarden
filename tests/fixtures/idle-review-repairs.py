@@ -34,7 +34,9 @@ def load(name, path):
 
 class ReviewRepairs(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"], prefix="idle-repairs-")
+        # Honor an explicit scratch root, but TMPDIR is optional on CI/hosts.
+        self.tmp = tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR") or None,
+                                             prefix="idle-repairs-")
         self.addCleanup(self.tmp.cleanup)
         self.work = Path(self.tmp.name)
         env = patch.dict(os.environ, {
