@@ -20,6 +20,7 @@ if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
               palworld-fps-daily-report.timer palworld-memory-watch.timer \
               palworld-public-info-watch.timer palworld-service-events.timer \
               palworld-update-check.timer palworld-1dot0-watch.timer \
+              palworld-player-stats.timer \
               palworld-config-webui.service palwarden-jobd.service \
               palworld.service; do
     systemctl disable --now "$unit" 2>/dev/null || true

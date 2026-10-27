@@ -47,6 +47,31 @@ is passed off as ours.
 - **Not derived:** `webui/palwarden.html` (the control-plane dashboard) is
   first-party, AGPL-3.0, written from scratch.
 
+### palworld-save-tools — format reference (not bundled)
+- **Upstream:** cheahjs/palworld-save-tools (v0.24.0), **MIT**
+- **How we use it:** `lib/palwarden_gvas.py` is **first-party AGPL-3.0 code**
+  written against the GVAS wire format, with upstream as the reference for the
+  on-disk encodings (property headers, fstrings, the container layout). No
+  upstream code is vendored or imported; upstream also cannot read the `PlM`
+  (Oodle) containers current game versions write, which is half of why the
+  reader exists. Credit to the upstream project for mapping the format first.
+
+### pyooz / ooz — optional Oodle decompression
+- **Upstream:** zao/pyooz (PyPI `pyooz`, installs a module named `ooz`),
+  wrapping powzix/ooz — both **GPL-3.0-or-later** (pyooz via its trove
+  classifier; ooz via per-file license headers).
+- **How we use it:** an **optional, runtime-only** dependency of
+  `palworld-player-stats`: the game Oodle-compresses saves (`PlM` magic) since
+  ~0.6, and ooz is the only open-source decoder. Never bundled in the repo or
+  the deb; the Docker image pip-installs it behind `WITH_PLAYER_STATS=true`,
+  bare metal installs it by hand, and everything degrades gracefully without
+  it. GPLv3+ combines cleanly with our AGPL-3.0-or-later.
+- **Provenance caveat, recorded honestly:** ooz is a reverse-engineering of
+  RAD/Epic's proprietary Oodle codec. Its author licensed their code GPLv3+,
+  the code is widely redistributed across game-tooling communities, and no
+  dispute is known — but that history is worth knowing, and it is why the
+  dependency is optional and decompression-only.
+
 ## Trademark
 
 Palworld is a trademark of Pocketpair, Inc. `palwarden` is an unofficial,

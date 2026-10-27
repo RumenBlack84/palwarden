@@ -327,6 +327,11 @@ if [[ "$MODE" == "embedded" ]]; then
   # decided per tick inside palworld-backups, so switching backups off from the
   # panel needs no service change and switching them back on needs no recreate.
   enable_service backup-auto
+  # Save-derived player stats for the web UI's Players page, embedded only
+  # (external mode has no local save tree). Like backup-auto, enabled
+  # unconditionally: a missing pyooz codec is the tool's own degraded state,
+  # reported through the snapshot, not a reason to gate the service.
+  enable_service player-stats
 
   # Idle-shutdown watcher + UDP knock listener (spec §7.2): ALWAYS supervised
   # in embedded mode, deliberately NOT gated on IDLE_TIMEOUT/KNOCK_ENABLED.

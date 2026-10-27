@@ -974,3 +974,38 @@ Supersedes the remaining full-lint caveat in the preceding repair record:
   assertion/comment/dead-variable cleanup; previous evidence retains its scope.
 - Logs: scratch `idle-lint-cleanup-lint.log`, `idle-lint-cleanup-unit.log`.
   No staging, commits, pushes or production restarts performed.
+
+## Branch/PR preparation authorized (2026-10-27)
+
+Brian explicitly authorized branching, committing and submitting a PR. The feature
+is committed on `feature/idle-shutdown-knock-wake` as `d8fa81f`; the unrelated
+pre-existing `FAILED` artifact is excluded and left untouched. The staged
+whitespace check caught one trailing space in the formerly untracked integration
+script; it was removed before the feature commit.
+
+Fetching revealed `origin/master` had advanced by the player-stats-board PR.
+That upstream history is integrated without rewriting either history; the sole
+content conflict was docs/tools.md's read-endpoint list, resolved with both
+features retained and the config GET token-redaction wording clarified.
+
+Fresh combined-tree evidence:
+- Repository-wide lint PASS; full isolated trixie unit run PASS, all 39 suites
+  including upstream player-stats coverage and the jsdom tier.
+- Actual-root lifecycle/acknowledgement suite PASS 87/0 in a disposable container.
+- Initial combined Docker integration: general 134/0, persistence 32/0,
+  update/apply 12/0; idle/knock 44/1 because the assertion required the queued-job
+  diagnostic even when maintenance had already started and correctly returned
+  HTTP 409 for active lifecycle state. No wake was admitted.
+- Corrected only that assertion/comment to accept the two specific maintenance
+  blockers (queued disruptive work OR active lifecycle), never an arbitrary 409.
+  Fresh unit/lint runs passed afterward; idle/knock rerun PASS 45/0. Thus all four
+  Docker suites have passing combined-tree evidence; not a claim that the initial
+  combined integration invocation passed.
+- No additional real-game/real-browser run or production operation. Code64's
+  prior approval covers the production repairs, not a new full audit of upstream
+  player-stats changes or this subsequent test-assertion/merge-doc adjustment.
+
+Scratch logs: `palwarden-pr-final-lint.log`, `palwarden-pr-final-unit.log`,
+`palwarden-pr-merged-root-ack.log`, `palwarden-pr-merged-integration.log`,
+`palwarden-pr-final-idle-knock.log`. PR publication/CI status belongs to the PR;
+this entry records the verified local preparation, not a remote-success claim.

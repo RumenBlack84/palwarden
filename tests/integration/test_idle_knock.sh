@@ -171,8 +171,8 @@ docker exec pw-it11-a s6-svc -u /run/service/idle-watch
 # =============================================================================
 webui_creds pw-it11-a
 # The wake fence admits only against a CONFIRMED idle lifecycle; re-establish
-# idle (init-runtime rotates an idle generation) so a 409 below can only come
-# from the disruptive-job blocker, never from a stale status.
+# idle (init-runtime rotates an idle generation) before submitting fresh
+# maintenance. The worker may start that maintenance before the wake request.
 docker exec pw-it11-a python3 -m palwarden_lifecycle init-runtime --json >/dev/null
 # Stop via a queued disruptive job (the supported manual path).
 stop_id="$(api pw-it11-a -X POST -u "$WU:$WP" -H "X-Palwarden-Token: $WT" \
@@ -184,7 +184,11 @@ resp="$(api pw-it11-a -w '\n%{http_code}' -X POST -u "$WU:$WP" \
   -H "X-Palwarden-Token: $WT" -H 'Content-Type: application/json' \
   -d '{"action":"server_wake","params":{"reason":"itest-race"}}' http://127.0.0.1:8088/api/jobs)"
 assert_eq "$(printf '%s' "$resp" | tail -1)" "409" "4a: wake behind a queued maintenance job is refused with 409"
-assert_contains "$(printf '%s' "$resp" | tr -d '\n')" "disruptive" "4a: the 409 names the disruptive blocker"
+case "$resp" in
+  *"disruptive job is queued or running"*|*"lifecycle status is active, not idle"*)
+    pass "4a: the 409 names queued or active maintenance" ;;
+  *) fail "4a: the 409 did not name a maintenance blocker: $resp" ;;
+esac
 assert_eq "$(wait_job pw-it11-a "$stop_id" 60)" "succeeded" "4: graceful_stop job completed"
 
 # (4b) crash wanted-up: down WITHOUT the wanted-down marker = crash-backoff;
