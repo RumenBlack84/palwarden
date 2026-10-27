@@ -991,7 +991,18 @@ assert_contains "$(cli state --json)" '"status": "unsafe"' \
 cli complete 0 >/dev/null 2>&1
 assert_contains "$(cli state --json)" '"status": "unsafe"' \
     "11c: complete 0 cannot clear unsafe (recovery stays explicit)"
-python3 -c 'import palwarden_lifecycle as lc; lc.write_state("active", rotate=True)' >/dev/null
+python3 - <<'PY'
+import palwarden_lifecycle as lc
+
+try:
+    lc.write_state("active", rotate=True)
+except lc.UnsafeMaintenanceError:
+    pass
+else:
+    raise AssertionError("an ordinary active writer did not reject unsafe state")
+PY
+[ $? -eq 0 ] && pass "11c: active write raises UnsafeMaintenanceError" \
+    || fail "11c: active write did not raise the expected unsafe-state error"
 assert_contains "$(cli state --json)" '"status": "unsafe"' \
     "11c: a new active mark cannot erase unsafe either"
 # unsafe -> unsafe (escalation) and force (ack path) remain available.
