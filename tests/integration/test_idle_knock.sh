@@ -193,20 +193,19 @@ assert_eq "$(wait_job pw-it11-a "$stop_id" 60)" "succeeded" "4: graceful_stop jo
 
 # (4b) crash wanted-up: down WITHOUT the wanted-down marker = crash-backoff;
 # knock must not arm and an explicit wake must refuse.
+# Isolate the state verdict from the listener's nonblocking lease race.
+docker exec pw-it11-a s6-svc -d /run/service/palworld-knock
+wait_svc pw-it11-a palworld-knock down 30 || fail "4b: knock daemon did not stop"
 docker exec pw-it11-a s6-svc -d /run/service/palworld-server
 wait_svc pw-it11-a palworld-server down 60 || fail "4b: server did not stop"
 docker exec pw-it11-a rm -f /run/service/palworld-server/down
-code=""
-for _ in $(seq 1 40); do
-  code="$(docker exec pw-it11-a python3 /usr/local/sbin/palworld-knock wake --reason itest-crash 2>&1; echo "rc=$?")"
-  # rc=75 with "busy" is the daemon mid-lease; retry for the real verdict.
-  case "$code" in *"rc=75"*) case "$code" in *busy*) sleep 0.5; continue;; esac;; esac
-  break
-done
+code="$(docker exec pw-it11-a python3 /usr/local/sbin/palworld-knock wake --reason itest-crash 2>&1; echo "rc=$?")"
 assert_contains "$code" "refused" "4b: wake refused in crash-backoff (never start blind)"
 assert_contains "$code" "crash" "4b: the refusal names crash-backoff"
 assert_eq "$(svc_state pw-it11-a palworld-server)" "down" "4b: crash-backoff wake did not start the service"
 docker exec pw-it11-a sh -c 'mkdir -p /run/service/palworld-server && touch /run/service/palworld-server/down'
+docker exec pw-it11-a s6-svc -u /run/service/palworld-knock
+wait_svc pw-it11-a palworld-knock up 30 || fail "4b: knock daemon did not resume"
 
 # (4c) maintenance window under ownership: UDP must neither bind nor wake.
 docker exec -d pw-it11-a python3 -c '
@@ -215,9 +214,16 @@ p = subprocess.Popen([sys.executable, "-c",
   "import socket,time; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);"
   "s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind((\"0.0.0.0\",8211));"
   "print(s.recvfrom(64))"], stdout=subprocess.PIPE, text=True)
-rc = subprocess.run(["python3","-m","palwarden_lifecycle","acquire","--","sleep","12"]).returncode
+rc = subprocess.run(["python3","-m","palwarden_lifecycle","acquire","--",
+  "sh", "-c", "touch /tmp/itest-maintenance-ready; sleep 12"]).returncode
 sys.exit(rc)' >/dev/null 2>&1
+docker exec pw-it11-a sh -c 'for i in $(seq 1 100); do test -f /tmp/itest-maintenance-ready && exit 0; sleep 0.1; done; exit 1' \
+  || fail "4c: maintenance holder never acquired the lock"
 docker exec pw-it11-a sh -c 'sleep 3'   # holder owns lock + port
+code="$(docker exec pw-it11-a python3 /usr/local/sbin/palworld-knock wake --reason itest-busy 2>&1; echo "rc=$?")"
+assert_eq "$(printf '%s' "$code" | tail -1)" "rc=75" "4c: explicit wake exits busy while maintenance holds the lock"
+assert_contains "$code" "lifecycle is busy" "4c: explicit wake names lock contention"
+assert_eq "$(svc_state pw-it11-a palworld-server)" "down" "4c: busy explicit wake did not start the service"
 udp_send 18211 knock-during-maintenance
 docker exec pw-it11-a sh -c 'sleep 3'
 assert_eq "$(svc_state pw-it11-a palworld-server)" "down" "4c: UDP during a maintenance window does not wake"
@@ -236,19 +242,25 @@ wait_svc pw-it11-a palworld-server up 30 || fail "4d: start proceeded after the 
 # (4e) interrupted maintenance: an unsafe marker inhibits wake until an
 # operator acknowledges it (root, service stopped). Stop FIRST: wake reports
 # already-running while the service is up and never consults the state file.
+# A zero-timeout CLI cannot promise to win a daemon lease gap. Stop and wait
+# for the listener here: 4c separately proves real contention stays fail-closed.
+docker exec pw-it11-a s6-svc -d /run/service/palworld-knock
+wait_svc pw-it11-a palworld-knock down 30 || fail "4e: knock daemon did not stop"
 docker exec pw-it11-a palworld-graceful-stop --wait 0 >/dev/null 2>&1
 wait_svc pw-it11-a palworld-server down 60 || fail "4e: could not stop for the unsafe test"
 docker exec pw-it11-a rm -f /var/lib/palwarden-ops/knock.cooldown   # isolate the unsafe verdict from the scenario-2 cooldown
 docker exec pw-it11-a python3 -c 'import sys; sys.path.insert(0,"/usr/local/lib"); import palwarden_lifecycle as lc; lc.write_state("unsafe","update")'
-code=""
-for _ in $(seq 1 40); do
-  code="$(docker exec pw-it11-a python3 /usr/local/sbin/palworld-knock wake --reason itest-unsafe 2>&1; echo "rc=$?")"
-  case "$code" in *"rc=75"*) case "$code" in *busy*) sleep 0.5; continue;; esac;; esac
-  break
-done
+code="$(docker exec pw-it11-a python3 /usr/local/sbin/palworld-knock wake --reason itest-unsafe 2>&1; echo "rc=$?")"
+assert_eq "$(printf '%s' "$code" | tail -1)" "rc=65" "4e: unsafe wake returns a state refusal, not lock contention"
 assert_contains "$code" "refused" "4e: wake refused while maintenance is unacknowledged"
+assert_contains "$code" "unsafe" "4e: the refusal names the unsafe maintenance state"
+assert_eq "$(svc_state pw-it11-a palworld-server)" "down" "4e: unsafe wake did not start the service"
+assert_contains "$(docker exec pw-it11-a python3 -m palwarden_lifecycle state --json)" '"status": "unsafe"' \
+  "4e: wake preserves the unsafe marker until acknowledgment"
 ack="$(docker exec pw-it11-a python3 -m palwarden_lifecycle acknowledge-maintenance --confirm 2>&1; echo "rc=$?")"
 assert_contains "$ack" "rc=0" "4e: acknowledge-maintenance succeeds once the service is stopped"
+docker exec pw-it11-a s6-svc -u /run/service/palworld-knock
+wait_svc pw-it11-a palworld-knock up 30 || fail "4e: knock daemon did not resume"
 
 # (4f) fence expiry: a job file whose wake window lapsed is refused by the
 # worker (crafted queue file — the queue is the only writer path anyway).
