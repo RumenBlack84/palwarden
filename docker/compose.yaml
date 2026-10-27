@@ -79,6 +79,20 @@ services:
       # How often the tick *asks* whether a backup is due, not how often one is
       # taken. The interval above is what decides that, inside the tool.
       BACKUP_TICK_SECONDS: ${BACKUP_TICK_SECONDS:-900}
+      # --- Idle shutdown & knock wake (spec §7.1) --------------------------
+      # These five are SEEDS, read once when the ops file does not exist yet.
+      # The ops file on the palwarden-ops volume is the source of truth from
+      # then on — the browser panel owns it, and a changed value here does NOT
+      # override a saved one on the next `up`. Delete the file (or the volume)
+      # to re-seed. Defaults: idle OFF (opt-in), knock ON.
+      IDLE_TIMEOUT: ${IDLE_TIMEOUT:-0}              # minutes idle before stop; 0 = disabled
+      IDLE_CHECK_INTERVAL: ${IDLE_CHECK_INTERVAL:-60}  # seconds between eligibility ticks
+      KNOCK_ENABLED: ${KNOCK_ENABLED:-true}         # UDP wake listener on the game port
+      KNOCK_COOLDOWN: ${KNOCK_COOLDOWN:-600}        # seconds between knock wakes
+      KNOCK_TOKEN: ${KNOCK_TOKEN:-}                 # empty = open doorbell; never baked in the image
+      # The ops file + cooldown live on their own volume (the image default
+      # matches; repeated here so the mount and the path cannot drift).
+      PALWARDEN_OPS_FILE: /var/lib/palwarden-ops/palwarden.env
     ports:
       - "${PALWORLD_GAME_PORT:-8211}:8211/udp"
       - "127.0.0.1:${WEBUI_PORT:-8088}:8088"
@@ -106,6 +120,14 @@ services:
       # respectively), so neither needs a runtime chown.
       - palwarden-config-snapshots:/opt/palworld/config-snapshots
       - palwarden-config-backups:/opt/palworld/config-backups
+      # Idle/knock ops state: the ops file, the knock cooldown, and the
+      # lifecycle status/generation marker. On its OWN volume (not
+      # palwarden-state) because it is root-owned 0750 with the steam group
+      # reading only the 0640 config — a different privilege shape than the
+      # steam-owned state tree around it. A recreate with this volume keeps
+      # browser-saved settings and cooldown; deleting it resets them to the
+      # compose seeds (documented in docker/README.md).
+      - palwarden-ops:/var/lib/palwarden-ops
     stop_grace_period: 120s
     ulimits:
       nofile:
@@ -154,3 +176,4 @@ volumes:
   palwarden-backups:
   palwarden-config-snapshots:
   palwarden-config-backups:
+  palwarden-ops:

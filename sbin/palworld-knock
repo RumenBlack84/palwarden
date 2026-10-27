@@ -1,0 +1,458 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Brian Grant
+"""palworld-knock — idle-shutdown knock-wake entry points.
+
+`wake` is the local explicit wake: it invokes the one truthful idempotent
+start operation (lib/palwarden_lifecycle.start_if_down) directly, rather
+than sending an unchecked loopback packet.  `daemon` is the supervised UDP
+listener (Task 6): it arms ONLY while it owns the lifecycle lock AND the
+service is confirmed stopped/wanted-down, holds each listening lease for at
+most one second, closes its socket BEFORE releasing the lock, and routes a
+valid packet through the same start_if_down transaction as `wake`.
+
+Exit codes: 0 success or explicit no-op (already-running, cooldown);
+64 usage; 65 refused/invalid state; 75 lifecycle busy (retry deliberately,
+nothing is queued); 1 start/readiness failure.
+"""
+
+from __future__ import annotations
+
+import errno
+import fcntl
+import os
+import re
+import select
+import signal
+import socket
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, "/usr/local/lib")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import palwarden_lifecycle as lc  # noqa: E402
+
+USAGE = """\
+usage: palworld-knock wake [--reason TEXT]
+       palworld-knock wake [--fence-generation HEX32 --fence-expires-at EPOCH]
+       palworld-knock daemon [--port PORT]
+
+wake: wake the game server if it is confirmed stopped (idempotent:
+already-up or cooldown are successful no-ops; maintenance/busy is refused,
+never queued).
+
+The --fence-* pair is minted by the API at admission (spec §4.4): the wake
+re-checks, under lifecycle ownership and before touching anything, that the
+request has not expired and the lifecycle is still idle on that exact
+generation.  Both flags or neither; a stale fence is a refusal (65), never a
+start.
+
+daemon: supervised UDP knock listener.  Production binds the internal game
+port 8211; --port exists only for test fixtures.
+"""
+
+MAX_REASON_LEN = 200
+FENCE_GENERATION_RE = re.compile(r"^[0-9a-f]{32}$")
+FENCE_EPOCH_RE = re.compile(r"^(0|[1-9][0-9]{0,9})$")
+
+
+def _cmd_wake(argv):
+    reason = "explicit wake"
+    fence_gen = None
+    fence_exp = None
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--reason":
+            if i + 1 >= len(argv) or argv[i + 1].startswith("--"):
+                sys.stderr.write("palworld-knock: --reason requires a value\n")
+                return lc.EX_USAGE
+            reason = argv[i + 1]
+            i += 2
+            continue
+        if arg == "--fence-generation":
+            if i + 1 >= len(argv) or argv[i + 1].startswith("--"):
+                sys.stderr.write(
+                    "palworld-knock: --fence-generation requires a value\n")
+                return lc.EX_USAGE
+            fence_gen = argv[i + 1]
+            i += 2
+            continue
+        if arg == "--fence-expires-at":
+            if i + 1 >= len(argv) or argv[i + 1].startswith("--"):
+                sys.stderr.write(
+                    "palworld-knock: --fence-expires-at requires a value\n")
+                return lc.EX_USAGE
+            fence_exp = argv[i + 1]
+            i += 2
+            continue
+        sys.stderr.write(USAGE)
+        return lc.EX_USAGE
+    if not reason or len(reason) > MAX_REASON_LEN or any(
+        ord(c) < 32 or ord(c) == 127 for c in reason
+    ):
+        sys.stderr.write(
+            "palworld-knock: --reason must be printable and at most %d characters\n"
+            % MAX_REASON_LEN
+        )
+        return lc.EX_USAGE
+    # The fence is all-or-nothing: half a freshness guarantee is none.
+    if (fence_gen is None) != (fence_exp is None):
+        sys.stderr.write(
+            "palworld-knock: --fence-generation and --fence-expires-at are "
+            "used together or not at all\n")
+        return lc.EX_USAGE
+    if fence_gen is not None:
+        if not FENCE_GENERATION_RE.fullmatch(fence_gen):
+            sys.stderr.write(
+                "palworld-knock: --fence-generation must be 32 lowercase hex "
+                "characters\n")
+            return lc.EX_USAGE
+        if not FENCE_EPOCH_RE.fullmatch(fence_exp):
+            sys.stderr.write(
+                "palworld-knock: --fence-expires-at must be a plain "
+                "non-negative integer of epoch seconds\n")
+            return lc.EX_USAGE
+        fence_exp = int(fence_exp)
+
+    try:
+        # Nonblocking: a wake never waits behind maintenance and never queues
+        # itself for a delayed start (spec §4.3).
+        fd = lc.acquire(timeout=0, owner_pid=os.getpid(), owner_comm="palworld-knock")
+    except lc.LifecycleError as e:
+        sys.stderr.write(
+            "palworld-knock: lifecycle is busy (%s); retry deliberately later\n" % e
+        )
+        return lc.EX_BUSY
+
+    try:
+        # The fence re-check runs UNDER ownership and BEFORE start_if_down —
+        # the transaction that would change service state (and, for other
+        # transactions, the generation itself).  A request admitted against a
+        # rotated generation or a past expiry is stale no matter how healthy
+        # the world looks right now, so it is refused without even reporting
+        # already-running.  Lock/state disagreement reads unknown: refused.
+        if fence_gen is not None:
+            if int(time.time()) >= fence_exp:
+                sys.stderr.write(
+                    "palworld-knock: wake refused: the request expired before "
+                    "ownership was taken\n")
+                return lc.EX_DATAERR
+            try:
+                state = lc.read_state()
+            except lc.LifecycleError as e:
+                sys.stderr.write(
+                    "palworld-knock: wake refused: lifecycle state unreadable, "
+                    "refusing to wake blind (%s)\n" % e)
+                return lc.EX_DATAERR
+            if state["status"] != "idle":
+                sys.stderr.write(
+                    "palworld-knock: wake refused: lifecycle status is %s, not "
+                    "idle\n" % state["status"])
+                return lc.EX_DATAERR
+            if state["generation"] != fence_gen:
+                sys.stderr.write(
+                    "palworld-knock: wake refused: the lifecycle generation "
+                    "changed since this request was admitted (maintenance ran "
+                    "or the runtime restarted)\n")
+                return lc.EX_DATAERR
+        result = lc.start_if_down(fd, reason=reason)
+    finally:
+        try:
+            lc.release(fd, owner_pid=os.getpid(), owner_comm="palworld-knock")
+        except lc.LifecycleError as e:
+            sys.stderr.write("warning: lifecycle release failed: %s\n" % e)
+
+    status = result["status"]
+    message = result["message"]
+    if status == "started":
+        if result.get("readiness") == "unverified":
+            print("wake: %s — NOT reported healthy (REST unconfigured)" % message)
+        else:
+            print("wake: %s; ready" % message)
+        return 0
+    if status == "already-running":
+        print("wake: already-running — %s" % message)
+        return 0
+    if status == "cooldown":
+        print("wake: cooldown no-op — %s" % message)
+        return 0
+    if status == "refused":
+        sys.stderr.write("wake refused: %s\n" % message)
+        return lc.EX_DATAERR
+    sys.stderr.write("wake error: %s\n" % message)
+    return 1
+
+
+# ---------------------------------------------------------------------------
+# daemon — bounded-lease UDP listener (spec §4.2, §6.1)
+# ---------------------------------------------------------------------------
+
+DEFAULT_KNOCK_PORT = 8211   # the embedded container's internal game chat port
+MAX_LEASE_S = 1.0           # hard cap: no listening lease ever exceeds 1 s
+MIN_IDLE_S = 0.1            # spec floor: wait >=100 ms between leases
+RECV_MAX = 513              # TOKEN_MAX_BYTES (512) + 1: truncation is detectable
+LOG_RATE_S = 30.0           # repeated same-category warnings are this sparse
+
+
+def _env_float(name, default):
+    try:
+        return float(os.environ.get(name) or default)
+    except ValueError:
+        return default
+
+
+def _log(msg):
+    sys.stderr.write("palworld-knock: %s\n" % msg)
+    sys.stderr.flush()
+
+
+def _log_rate(state, key, msg):
+    """First occurrence logs immediately; repeats of the same category are
+    rate-limited so floods (or sustained EADDRINUSE) cannot grow logs."""
+    now = time.monotonic()
+    last = state.get(key)
+    if last is None or now - last >= LOG_RATE_S:
+        state[key] = now
+        _log(msg)
+
+
+def _accepts(data, token_bytes):
+    """Decide one datagram.  Returns (accept, invalid).
+
+    Token mode: exact UTF-8 byte comparison against the configured token —
+    arbitrary payloads are never decoded, so invalid UTF-8 simply cannot
+    match.  The receive buffer is token-max+1 bytes: a datagram that filled
+    it is oversized (or truncated) and is rejected outright, so a
+    token-plus-suffix packet can never truncate into an accepted token.
+    Doorbell mode (empty token): any NONEMPTY datagram is accepted, even one
+    that overflowed the bounded buffer; its payload is neither retained nor
+    parsed.
+    """
+    if token_bytes:
+        if len(data) >= RECV_MAX or not data:
+            return False, True
+        return data == token_bytes, not (data == token_bytes)
+    return bool(data), False
+
+
+def _handle_packet(data, fd):
+    """A valid packet under already-held ownership: the socket was closed by
+    the caller BEFORE we got here; revalidate config/token/cooldown now, then
+    run the shared synchronous start.  No detached process, no extra down."""
+    try:
+        import palwarden_ops
+        config = palwarden_ops.resolve()
+    except Exception as e:
+        _log_rate(_LOG_STATE, "config",
+                  "knock config unreadable, dropping wake: %s" % e)
+        return
+    if not config.get("KNOCK_ENABLED", False):
+        _log("knock disabled in config since the packet arrived; wake dropped")
+        return
+    token_bytes = str(config.get("KNOCK_TOKEN", "")).encode("utf-8")
+    if token_bytes and data != token_bytes:
+        # Token changed between the lease read and this revalidation: drop.
+        _log_rate(_LOG_STATE, "tokenchange",
+                  "knock token changed since the packet arrived; wake dropped")
+        return
+    result = lc.start_if_down(fd, reason="udp knock")
+    status = result.get("status")
+    if status == "started":
+        _log("wake started (readiness %s)" % result.get("readiness"))
+    elif status in ("already-running", "cooldown"):
+        # F10 (review follow-up): accepted-but-ineligible traffic is routine;
+        # aggregate repeats instead of logging one line per knock.
+        _log_rate(_LOG_STATE, "noop:" + status,
+                  "wake was a no-op (%s; repeats aggregated)" % status)
+    elif status == "refused":
+        _log_rate(_LOG_STATE, "refused",
+                  "wake refused: %s" % result.get("message"))
+    else:
+        _log_rate(_LOG_STATE, "starterr",
+                  "wake failed: %s" % result.get("message"))
+
+
+def _lease(state):
+    """One bounded lease: acquire, recheck everything, bind, listen <=1 s.
+
+    Returns "wake" only if a wake was issued.  The socket is ALWAYS closed
+    before the lock is released, so a supported manual start that wins the
+    lock next can bind the game socket immediately.
+    """
+    try:
+        fd = lc.acquire(timeout=_ACQUIRE_TIMEOUT_S,
+                        owner_pid=os.getpid(), owner_comm="palworld-knock")
+    except lc.LifecycleError as e:
+        # Lock contention is expected (maintenance, other controllers):
+        # bounded retry, never a wake.
+        _log_rate(state, "busy", "lifecycle busy, retrying: %s" % e)
+        return "busy"
+
+    sock = None
+    action = None
+    try:
+        try:
+            import palwarden_ops
+            config = palwarden_ops.resolve()
+        except Exception as e:
+            _log_rate(state, "config", "knock config unreadable, staying closed: %s" % e)
+            return "idle"
+        if not config.get("KNOCK_ENABLED", False):
+            _log_rate(state, "disabled", "knock disabled; listener stays closed")
+            return "idle"
+        st = lc.service_state()
+        if st != "stopped":
+            # running/starting/stopping/crash-backoff/unknown/no-supervisor:
+            # the listener arms ONLY on confirmed stopped AND wanted-down.
+            _log_rate(state, "state:" + st,
+                      "service is %s; listener stays closed" % st)
+            return "idle"
+        token = str(config.get("KNOCK_TOKEN", ""))
+        token_bytes = token.encode("utf-8")
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.bind(("0.0.0.0", _KNOCK_PORT))
+        except OSError as e:
+            sock.close()
+            sock = None
+            if getattr(e, "errno", None) == errno.EADDRINUSE:
+                _log_rate(state, "eaddrinuse",
+                          "game port %d already bound elsewhere; retrying next lease"
+                          % _KNOCK_PORT)
+            else:
+                _log_rate(state, "bind", "failed to bind port %d: %s" % (_KNOCK_PORT, e))
+            return "idle"
+        state["armed"] = _KNOCK_PORT
+        # F10 (review follow-up): log the closed->armed TRANSITION, not
+        # every lease. `armed_prev` remembers whether the previous lease had
+        # the listener armed — including a lease closed early for a wake
+        # handoff — so neither a quiet stopped period nor a sustained knock
+        # storm re-logs every cycle.
+        if not state.get("armed_prev"):
+            _log("listener armed on port %d (lease <= %.1fs)" % (_KNOCK_PORT, _LEASE_S))
+        state["armed_prev"] = True
+        # Monotonic lease deadline: invalid packets cannot extend it.
+        lease_deadline = time.monotonic() + _LEASE_S
+        while time.monotonic() < lease_deadline:
+            if state.get("stop"):
+                break
+            remaining = max(0.0, lease_deadline - time.monotonic())
+            r, _, _ = select.select([sock], [], [], min(remaining, 0.05))
+            if not r:
+                continue
+            data, _addr = sock.recvfrom(RECV_MAX)
+            accept, invalid = _accepts(data, token_bytes)
+            if accept:
+                payload = data
+                data = None
+                # Close the socket FIRST (still under ownership), then wake.
+                sock.close()
+                sock = None
+                _handle_packet(payload, fd)
+                action = "wake"
+                break
+            data = None  # rejected payloads are never retained
+            if invalid:
+                state["invalid_total"] = state.get("invalid_total", 0) + 1
+                now = time.monotonic()
+                if state.get("invalid_first") is None:
+                    state["invalid_first"] = now
+                    _log("rejected invalid knock packet (further invalid "
+                         "packets aggregated; payloads and source addresses "
+                         "are never logged)")
+                elif now - state["invalid_first"] >= LOG_RATE_S:
+                    _log("rejected %d invalid knock packets since the last report"
+                         % state.get("invalid_total", 0))
+                    state["invalid_first"] = now
+                    state["invalid_total"] = 0
+        return action or "idle"
+    finally:
+        if sock is not None:
+            sock.close()
+        # F10: armed_prev feeds the transition log above. A lease that never
+        # armed (busy / disabled / not-stopped / bind failure) resets it, so
+        # the next real arming logs exactly once.
+        state["armed_prev"] = state.get("armed") is not None
+        state["armed"] = None
+        try:
+            lc.release(fd, owner_pid=os.getpid(), owner_comm="palworld-knock")
+        except lc.LifecycleError as e:
+            _log_rate(state, "release", "warning: lifecycle release failed: %s" % e)
+
+
+def _daemon_main(argv):
+    global _KNOCK_PORT
+    argv = list(argv)
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--port":
+            if i + 1 >= len(argv):
+                sys.stderr.write("palworld-knock: --port requires a value\n")
+                return lc.EX_USAGE
+            try:
+                _KNOCK_PORT = int(argv[i + 1])
+            except ValueError:
+                sys.stderr.write("palworld-knock: --port must be an integer\n")
+                return lc.EX_USAGE
+            if not 1 <= _KNOCK_PORT <= 65535:
+                sys.stderr.write("palworld-knock: --port out of range\n")
+                return lc.EX_USAGE
+            i += 2
+            continue
+        sys.stderr.write(USAGE)
+        return lc.EX_USAGE
+
+    state = {"stop": False}
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda *_a: state.update(stop=True))
+    _LOG_STATE.clear()
+    _log("knock daemon starting (port %d)" % _KNOCK_PORT)
+    try:
+        while not state["stop"]:
+            try:
+                _lease(state)
+            except Exception:
+                # An unexpected error must not kill the listener: s6 would
+                # restart it silently, opening an unnoticed dead window for
+                # packets. (This guard was added chasing a live failure that
+                # turned out to be a test grep-pattern bug — the daemon was
+                # healthy all along — but the hazard it guards is real and
+                # matches the R7 class: an escaping exception here would be
+                # invisible behind s6 auto-restart.)
+                import traceback
+                traceback.print_exc()
+                time.sleep(1)
+            if state["stop"]:
+                break
+            time.sleep(_IDLE_S)
+    finally:
+        _log("knock daemon stopping")
+    return 0
+
+
+_LOG_STATE = {}
+_KNOCK_PORT = int(os.environ.get("PALWORLD_KNOCK_PORT") or DEFAULT_KNOCK_PORT)
+# Lease/idle timings are env-tunable but CLAMPED to the spec bounds: a lease
+# is never longer than 1 s and the between-lease wait is never under 100 ms.
+_LEASE_S = min(MAX_LEASE_S, _env_float("PALWARDEN_KNOCK_LEASE_S", MAX_LEASE_S))
+_IDLE_S = max(MIN_IDLE_S, _env_float("PALWARDEN_KNOCK_IDLE_S", 0.15))
+_ACQUIRE_TIMEOUT_S = max(0.0, _env_float("PALWARDEN_KNOCK_ACQUIRE_TIMEOUT_S", 1.0))
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "wake":
+        return _cmd_wake(argv[1:])
+    if argv and argv[0] == "daemon":
+        return _daemon_main(argv[1:])
+    sys.stderr.write(USAGE)
+    if argv:
+        sys.stderr.write("palworld-knock: unknown verb %r\n" % argv[0])
+    return lc.EX_USAGE
+
+
+if __name__ == "__main__":
+    sys.exit(main())

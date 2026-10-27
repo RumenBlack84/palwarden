@@ -182,9 +182,17 @@ done
 # wrote predictable, attacker-named paths into a directory a less-privileged
 # process could rename out from under it — see the long note in
 # sbin/palworld-config-snapshot.
-for d in /opt/palworld/backups /opt/palworld/config-snapshots; do
+for d in /opt/palworld/backups /opt/palworld/config-snapshots /var/lib/palwarden-ops; do
   run install -d -m 0755 -o root -g root "$d"
 done
+# /var/lib/palwarden-ops is the control-plane state volume (F1 decision C):
+# the lifecycle maintenance state (lib/palwarden_lifecycle defaults,
+# /var/lib/palwarden-ops/lifecycle), the ops config, and the knock cooldown
+# file.  The lifecycle LOCK itself is /run/palworld-lifecycle.lock (always
+# present, root-owned).  These trees are opened only by root-side controllers
+# (graceful-stop/-restart, update, restore, the s6 systemctl shim); the lock
+# file is 0600.  Without the directory every enrolled command aborts with
+# "lock parent unavailable" — enrollment deliberately never runs unlocked.
 # The control plane's job queue: written only by the unprivileged web UI (hence
 # the service account, not root), read and updated by the root worker
 # palwarden-jobd. 0700 because job files can carry config values.

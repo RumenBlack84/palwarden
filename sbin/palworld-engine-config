@@ -49,13 +49,31 @@ class Setting:
     minimum: float | None = None
     maximum: float | None = None
     description: str = ""
+    # Verified game default, normalised to this table's form. The dedicated
+    # server rewrites Engine.ini at shutdown from the config the session READ
+    # at startup (keys it never read are dropped; a defaults-only session
+    # writes no managed keys at all), so absence of a managed key can mean
+    # "effective value is the default". We apply the absent-equals-default
+    # rule ONLY for keys whose default is listed below; every other key
+    # keeps absence == drift (fail loud, not blind).
+    default: str | None = None
 
 
 SETTINGS: tuple[Setting, ...] = (
-    Setting("NET_SERVER_MAX_TICK_RATE", "/Script/OnlineSubsystemUtils.IpNetDriver", "NetServerMaxTickRate", "int", 15, 120, "Dedicated server network tick cap."),
+    # default 30: Unreal's documented dedicated-server tick; consistent with
+    # all testbed behaviour, though the testbed cannot independently prove
+    # defaultness (the game round-trips any value a session read).
+    Setting("NET_SERVER_MAX_TICK_RATE", "/Script/OnlineSubsystemUtils.IpNetDriver", "NetServerMaxTickRate", "int", 15, 120, "Dedicated server network tick cap.", default="30"),
     Setting("MAX_CLIENT_RATE", "/Script/OnlineSubsystemUtils.IpNetDriver", "MaxClientRate", "int", 10000, 500000, "Maximum bytes/sec per LAN client."),
     Setting("MAX_INTERNET_CLIENT_RATE", "/Script/OnlineSubsystemUtils.IpNetDriver", "MaxInternetClientRate", "int", 10000, 500000, "Maximum bytes/sec per internet client."),
-    Setting("CONNECTION_TIMEOUT", "/Script/OnlineSubsystemUtils.IpNetDriver", "ConnectionTimeout", "float", 10, 300, "Seconds before a stale connection times out."),
+    # default 90: ASSUMED, not testbed-proven — an earlier "measured" note
+    # here was wrong (the observed strip of 90 was a session that never read
+    # the key dropping it, not default-stripping; a session that reads 90
+    # round-trips it). 90 matches the value the product ships/expects, so
+    # the rule only silences drift for a value the operator already wanted
+    # at that level. Brian: confirm from product knowledge or drop the
+    # default to keep absence == drift for this key.
+    Setting("CONNECTION_TIMEOUT", "/Script/OnlineSubsystemUtils.IpNetDriver", "ConnectionTimeout", "float", 10, 300, "Seconds before a stale connection times out.", default="90"),
     Setting("TOTAL_NET_BANDWIDTH", "/Script/Engine.GameNetworkManager", "TotalNetBandwidth", "int", 10000, 2000000, "Total network bandwidth budget."),
     Setting("MAX_DYNAMIC_BANDWIDTH", "/Script/Engine.GameNetworkManager", "MaxDynamicBandwidth", "int", 10000, 500000, "Maximum dynamic bandwidth per client."),
     Setting("MIN_DYNAMIC_BANDWIDTH", "/Script/Engine.GameNetworkManager", "MinDynamicBandwidth", "int", 1000, 250000, "Minimum dynamic bandwidth per client."),
@@ -788,6 +806,13 @@ def check_expected_values(raw_values: dict[str, list[str]], expected: dict[str, 
     for env, want in expected.items():
         raws = raw_values.get(env)
         if not raws:
+            # Finding A (Brian's ruling): the game writes only non-default
+            # values, so an absent key asserts the default. Absence is no
+            # drift when the wanted value equals a VERIFIED default; with no
+            # verified default, absence stays drift (fail loud, not blind).
+            setting = SETTING_BY_ENV[env]
+            if setting.default is not None and want == setting.default:
+                continue
             missing.append(env)
             continue
         setting = SETTING_BY_ENV[env]
@@ -823,11 +848,16 @@ def format_check(check: dict[str, object], ini_path: Path | None = None) -> str:
     if check.get("ok"):
         return "Engine.ini check OK: managed values match /etc/palworld/engine.env."
     where = f" in {ini_path}" if ini_path else ""
-    if check.get("empty"):
-        return (f"Engine.ini check FAILED: no managed values{where}. "
-                "The server may have reset the file (it writes only non-default "
-                "values); re-apply with `palworld-engine-config apply`.")
     lines = ["Engine.ini check FAILED: managed values drifted from /etc/palworld/engine.env."]
+    if check.get("empty"):
+        # The file holds no managed keys at all. Under the absent-equals-
+        # default rule that alone is not failure (a defaults-only rewrite is
+        # the game's normal form); reaching here means at least one wanted
+        # value is NOT a verified default, so report the per-key detail and
+        # keep the operator hint.
+        lines.append("Note: the file carries no managed values at all (the game "
+                     "writes only non-default values); the entries below are "
+                     "wanted but not the default.")
     missing = check.get("missing") or []
     different = check.get("different") or []
     invalid = check.get("invalid") or []

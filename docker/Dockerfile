@@ -67,6 +67,17 @@ RUN HOME=/home/steam /command/s6-setuidgid steam \
 # the systemctl shim), not just inside s6 run scripts.
 ENV PATH="/command:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
+# /usr/local/lib is where COPY lib/ lands and where the sbin scripts look for
+# the shared modules, but Debian's python3 does NOT search it by default — so
+# `python3 -m palwarden_ops` / `-m palwarden_lifecycle` (the entrypoint's seed
+# and runtime-init path) need it on PYTHONPATH. The sbin scripts also insert it
+# themselves, which is what makes bare-metal installs (no PYTHONPATH) work.
+ENV PYTHONPATH=/usr/local/lib
+
+# PALWARDEN_OPS_FILE: the idle/knock ops file lives on the dedicated
+# palwarden-ops volume, not the bare-metal default /etc/palworld (the writable
+# layer dies on a recreate — same lesson as backup.env). The cooldown file
+# defaults beside it. See spec §7.1; compose.yaml repeats it for explicitness.
 ENV SteamAppId=2394010 \
     PALWORLD_APP_ID=2394010 \
     PALWORLD_INSTALL_DIR=/opt/palworld/server \
@@ -85,6 +96,7 @@ ENV SteamAppId=2394010 \
     UPDATE_WAIT=300 \
     PUBLIC_INFO_INTERVAL=600 \
     SERVICE_EVENTS_INTERVAL=60 \
+    PALWARDEN_OPS_FILE=/var/lib/palwarden-ops/palwarden.env \
     PALWORLD_STEAMCMD=/home/steam/steamcmd/steamcmd.sh \
     PALWORLD_DROP_PRIV="env HOME=/home/steam s6-setuidgid steam" \
     S6_CMD_WAIT_FOR_SERVICES_MAXTIME=0 \
@@ -156,6 +168,8 @@ RUN chmod +x \
         /etc/s6-overlay/s6-rc.d/service-events/run \
         /etc/s6-overlay/s6-rc.d/jobd/run \
         /etc/s6-overlay/s6-rc.d/backup-auto/run \
+        /etc/s6-overlay/s6-rc.d/palworld-knock/run \
+        /etc/s6-overlay/s6-rc.d/idle-watch/run \
     && (chmod +x /usr/local/sbin/palworld-* /usr/local/sbin/palwarden-* \
         /usr/local/bin/palworld-config-parser 2>/dev/null || true) \
     && install -d -o steam -g steam \
@@ -167,6 +181,7 @@ RUN chmod +x \
     && install -d -o root -g root -m 0755 \
         /opt/palworld/config-snapshots \
         /opt/palworld/backups \
+    && install -d -o root -g steam -m 0750 /var/lib/palwarden-ops \
     && install -d -o steam -g steam -m 0700 \
         /var/lib/palworld/uploads \
     && install -d -o root -g root -m 0700 \

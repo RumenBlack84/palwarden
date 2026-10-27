@@ -10,6 +10,7 @@ source "$DIR/../lib/assert.sh"
 SHIM="$DIR/../../docker/shims/systemctl"
 
 WORK="$(mktemp -d)"
+export PALWARDEN_LIFECYCLE_STATE_DIR="$WORK/lifecycle-state"
 trap 'rm -rf "$WORK"' EXIT
 
 # Fake s6 tool dir + service scandir.
@@ -34,6 +35,7 @@ run_shim() {
   PATH="$WORK/bin:$PATH" \
   PALWARDEN_S6_SVC_DIR="$WORK/run/service" \
   PALWARDEN_CGROUP_MEM="$WORK/cgmem" \
+  PALWARDEN_LIFECYCLE_LOCK="$WORK/lifecycle.lock" \
     bash "$SHIM" "$@"
 }
 
@@ -130,6 +132,22 @@ run_shim restart palworld.service
 assert_file_contains "$WORK/svc_calls" "-u" "start -> s6-svc -u"
 assert_file_contains "$WORK/svc_calls" "-d" "stop -> s6-svc -d"
 assert_file_contains "$WORK/svc_calls" "-r" "restart -> s6-svc -r"
+
+# Wanted-down MARKER discipline (Task 11 finding): s6-svc -d creates NO file,
+# so the shim itself must maintain <svcdir>/down — knock/idle classify
+# stopped vs crash-backoff by its presence, and a stop that leaves no marker
+# strands the service in "crash-backoff" forever.
+SVC="$WORK/run/service/palworld-server"
+rm -f "$SVC/down"
+run_shim stop palworld.service
+assert_file_exists "$SVC/down" "stop creates the wanted-down marker"
+run_shim start palworld.service
+if [ ! -e "$SVC/down" ]; then pass "start clears the wanted-down marker"
+else fail "start left a stale wanted-down marker"; fi
+: > "$SVC/down"
+run_shim restart palworld.service
+if [ ! -e "$SVC/down" ]; then pass "restart clears the wanted-down marker"
+else fail "restart left a stale wanted-down marker"; fi
 
 # unknown verbs are non-fatal
 assert_rc 0 run_shim daemon-reload

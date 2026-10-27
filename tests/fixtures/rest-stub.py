@@ -32,6 +32,14 @@ class H(BaseHTTPRequestHandler):
             }).encode()
         elif self.path.startswith("/v1/api/info"):
             body = json.dumps({"version": "v0.7.3", "servername": "Stub Server"}).encode()
+        elif self.path.startswith("/v1/api/players"):
+            # Presence evidence for the idle watcher. PALWORLD_STUB_PLAYERS=0
+            # yields the schema-valid EMPTY list (positive evidence of nobody
+            # online); the default keeps the historical 3-player shape.
+            n = int(os.environ.get("PALWORLD_STUB_PLAYERS", "3"))
+            players = ([{"playerUid": 1, "level": 10, "name": "Stub", "accountId": "a"}]
+                       if n >= 1 else [])
+            body = json.dumps({"players": players}).encode()
         else:
             self.send_response(404); self.end_headers(); return
         self.send_response(200)

@@ -54,7 +54,7 @@ docker run -d --name "$C" \
 # Wait for the (dummy) server + its REST API to come up.
 up=0
 for _ in $(seq 1 40); do
-  if docker exec "$C" sh -c 'sudo palworld-api info 2>/dev/null' | grep -q "HTTP 200"; then up=1; break; fi
+  if docker exec "$C" sh -c 'sudo palworld-api info 2>/dev/null' | grep -q "servername"; then up=1; break; fi
   sleep 1
 done
 if [ "$up" = 1 ]; then pass; else fail "server/REST did not come up"; fi
@@ -74,7 +74,7 @@ assert_eq "$(buildid)" "200" "manifest bumped to new build 200"
 # Server came back up after the restart, with a new supervised pid.
 up=0
 for _ in $(seq 1 20); do
-  docker exec "$C" sh -c 'sudo palworld-api info 2>/dev/null' | grep -q "HTTP 200" && { up=1; break; }; sleep 1
+  docker exec "$C" sh -c 'sudo palworld-api info 2>/dev/null' | grep -q "servername" && { up=1; break; }; sleep 1
 done
 if [ "$up" = 1 ]; then pass; else fail "server did not come back up after update"; fi
 assert_ne "$pid_before" "$(runpid)" "server service was restarted by the update"

@@ -82,6 +82,24 @@ the `bin/` parser (AGPL upstream); see `CREDITS.md`.
   (they control s6 services); those drop to steam for SteamCMD via
   `PALWORLD_DROP_PRIV`/`s6-setuidgid`.
 
+## Design and implementation review gate
+
+For nontrivial features, save the spec under `docs/superpowers/specs/` and the
+implementation plan under `docs/superpowers/plans/`. Review the spec in a fresh
+session or with an isolated reviewer before deriving the plan; review the plan
+against that spec and the actual repository before implementation. Record
+findings, their disposition, and pending checks; self-rereading is not an
+independent review. Explicit user-directed bypasses must be reported, not
+described as successful reviews.
+
+Require source evidence for claims about existing behavior. Challenge stale
+telemetry, concurrent lifecycle operations, interrupted save/restore/update
+flows, container **recreation** persistence, and secrets across queues/APIs/logs.
+Acceptance tests must prove observable safety properties, not merely that a
+mocked command was called. Distinguish unit, Docker, browser, and real-game
+verification; a skipped suite or unexecuted check is not a pass. Do not run
+production restarts or destructive recovery tests without explicit approval.
+
 ## Testing (do this for every change)
 
 ```bash

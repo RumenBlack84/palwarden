@@ -30,7 +30,7 @@ stub_tools() {
   for tool in palworld-backup palworld-config-pretty palworld-config-apply-env \
               palworld-config-snapshot palworld-engine-config palworld-graceful-restart \
               palworld-graceful-stop palworld-update palworld-api-save palworld-fps \
-              palworld-restore palworld-backups; do
+              palworld-restore palworld-backups palworld-knock; do
     cat > "$WORK/bin/$tool" <<EOF
 #!/usr/bin/env bash
 echo "\$(basename "\$0") \$*" >> "$WORK/argv.log"
@@ -59,6 +59,10 @@ jobd() {
   PALWORLD_BACKUP_SCHEDULE="${SCHEDULE_OVERRIDE:-$WORK/etc/backup.env}" \
   PALWARDEN_PARSER_BIN="$DIR/../../bin/palworld-config-parser" \
   PALWORLD_CONFIG_FILE="${CONFIG_FILE_OVERRIDE:-$WORK/PalWorldSettings.ini}" \
+  PALWARDEN_OPS_FILE="${OPS_FILE_OVERRIDE:-$WORK/ops.env}" \
+  PALWORLD_GROUP="$(id -gn)" \
+  PALWARDEN_LIFECYCLE_STATE_DIR="$WORK/lifecycle-state" \
+  PALWARDEN_LIFECYCLE_LOCK="$WORK/lifecycle.lock" \
   PALWORLD_SETTINGS_OVERRIDES="$WORK/etc/settings-overrides.env" \
     python3 "$JOBD" "$@"
 }
@@ -553,6 +557,9 @@ SAMPLES = {
     "settings": {"NET_SERVER_MAX_TICK_RATE": "60"},
     "backup": "Engine.ini.20260710T182037Z",
     "staged": archive_name,
+    "reason": "operator wake",
+    "wake_generation": "0" * 32,
+    "wake_expires_at": 4000000000,
 }
 # `settings` and `backup` mean different things to different actions (an engine
 # table vs the backup schedule; a config backup vs a world-save archive), so those
@@ -567,6 +574,8 @@ OVERRIDES = {
                                           "BACKUP_KEEP_MIN": 3}},
     "backup_restore": {"backup": archive_name},
     "backup_delete": {"backup": archive_name},
+    # Fourth `settings` schema: the five palwarden_ops keys (spec §7.2).
+    "palwarden_config_save": {"settings": {"IDLE_TIMEOUT": "30"}},
 }
 for action in mod.ACTIONS:
     keys = mod.recognised_params(action)
@@ -1026,7 +1035,13 @@ jobd --once >/dev/null 2>&1
 assert_eq "$(state_of "$id")" "failed" "empty settings object refused"
 
 # a quote in a string value round-trips through the always-quoted env format
-id="$(enqueue settings_save '{"settings": {"ServerDescription": "say \"hi\" (PvE)"}}')"
+# (heredoc, not an inline single-quoted literal: the \" sequence inside
+# nested single quotes sends shellcheck's lexer cascading across lines)
+desc_json="$(cat <<'JSON'
+{"settings": {"ServerDescription": "say \"hi\" (PvE)"}}
+JSON
+)"
+id="$(enqueue settings_save "$desc_json")"
 jobd --once >/dev/null 2>&1
 assert_eq "$(state_of "$id")" "succeeded" "string with quotes and parens accepted"
 assert_file_contains "$OVERRIDES" 'ServerDescription="say \"hi\" (PvE)"' "quotes escaped in the env file"
@@ -1084,5 +1099,477 @@ assert_contains "$(output_of "$id")" "timed out after 1s and was killed" \
   "...and the job says the step was killed rather than leaving the operator guessing"
 stub_tools
 
+# ===========================================================================
+# Task 8: palwarden_config_save, server_wake, the wake fence, and the token
+# lifecycle across the queue (spec §7.2, §7.3, §4.4).
+# ===========================================================================
+OPS="$WORK/ops.env"
+reset_ops() { rm -f "$OPS"; }
+LCS="$WORK/lifecycle-state"
+reset_state() { rm -rf "$LCS"; }
+lc_do() { PALWARDEN_LIFECYCLE_STATE_DIR="$LCS" PYTHONPATH="$LIB" python3 -c "$1"; }
+# state_cmp: "<status> <same|rotated>" for the current state vs $GEN.
+# GEN travels via the environment — never through shell string surgery.
+state_cmp() {
+  PALWARDEN_LIFECYCLE_STATE_DIR="$LCS" PYTHONPATH="$LIB" GEN="$GEN" python3 -c '
+import os, palwarden_lifecycle as lc
+st = lc.read_state()
+print(st["status"], "same" if st["generation"] == os.environ["GEN"] else "rotated")'
+}
+ops_get() { python3 -c "
+import json, sys
+for line in open(sys.argv[1]):
+    k, _, v = line.partition('=')
+    if k == sys.argv[2]:
+        print(json.loads(v)); break
+" "$OPS" "$1" 2>/dev/null || echo missing; }
+
+TOK="TOKMARKER-4c2e-unique"
+
+# --- palwarden_config_save: partial merge at execution time -----------------
+reset_ops
+id="$(enqueue palwarden_config_save '{"settings": {"IDLE_TIMEOUT": "30"}}')"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "succeeded" "config-save with a partial payload succeeds"
+assert_eq "$(ops_get IDLE_TIMEOUT)" "30" "the supplied key is written"
+assert_eq "$(ops_get IDLE_CHECK_INTERVAL)" "60" "omitted keys take the current effective value"
+# second save merges against the FILE, not the defaults
+id="$(enqueue palwarden_config_save '{"settings": {"KNOCK_COOLDOWN": "120"}}')"
+jobd --once >/dev/null 2>&1
+assert_eq "$(ops_get IDLE_TIMEOUT)" "30" "a later save does not reset earlier saved values"
+assert_eq "$(ops_get KNOCK_COOLDOWN)" "120" "...and applies its own key"
+# token: set, then keep-by-omission, then explicit clear
+id="$(enqueue palwarden_config_save "{\"settings\": {\"KNOCK_TOKEN\": \"$TOK\"}}")"
+jobd --once >/dev/null 2>&1
+assert_eq "$(ops_get KNOCK_TOKEN)" "$TOK" "a supplied token is written"
+id="$(enqueue palwarden_config_save '{"settings": {"IDLE_TIMEOUT": "45"}}')"
+jobd --once >/dev/null 2>&1
+assert_eq "$(ops_get KNOCK_TOKEN)" "$TOK" "an omitted token keeps the stored value"
+id="$(enqueue palwarden_config_save '{"settings": {"KNOCK_TOKEN": ""}}')"
+jobd --once >/dev/null 2>&1
+assert_eq "$(ops_get KNOCK_TOKEN)" "" "an explicit empty token clears it"
+
+# --- the raw job file never keeps the token once finished (scrub) -----------
+reset_ops
+id="$(enqueue palwarden_config_save "{\"settings\": {\"KNOCK_TOKEN\": \"$TOK\"}}")"
+raw_file="$WORK/jobs/$id.json"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "succeeded" "token save succeeds"
+assert_eq "$(grep -c "$TOK" "$raw_file" || true)" "0" "the finished job file no longer contains the token"
+assert_contains "$(output_of "$id")" "ops config" "the job reports the write"
+if grep -q "$TOK" <<<"$(output_of "$id")"; then
+  fail "job output must never echo the token"
+else
+  pass "job output does not echo the token"
+fi
+# queue hygiene: the file that *did* hold the token is owner-only. (The 0700
+# directory invariant is pinned in test_jobs_store/test_webui_jobs; this
+# harness pre-creates the queue dir, so its mode is not what the store chose.)
+assert_eq "$(stat -c %a "$raw_file")" "600" "the job file is 0600"
+
+# --- scrub on validation refusal and on orphan reaping ----------------------
+id="$(enqueue palwarden_config_save "{\"settings\": {\"KNOCK_TOKEN\": \"$TOK\", \"IDLE_TIMEOUT\": \"99999\"}}")"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "failed" "an out-of-range value fails the job"
+assert_eq "$(grep -c "$TOK" "$WORK/jobs/$id.json" || true)" "0" "a refused job's file is scrubbed too"
+# a control-character token is refused without echoing the value back
+id="$(enqueue palwarden_config_save "{\"settings\": {\"KNOCK_TOKEN\": \"a${TOK}\\u0007b\"}}")"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "failed" "a control-character token is refused"
+if grep -q "$TOK" "$WORK/jobs/$id.json"; then fail "refused token survives"; else pass "refused token is scrubbed"; fi
+if grep -q "$TOK" <<<"$(output_of "$id")"; then fail "validation error echoes the token"; else pass "validation error does not echo the token"; fi
+# orphan reaping scrubs a running config-save job left by a dead worker
+id="$(enqueue palwarden_config_save "{\"settings\": {\"KNOCK_TOKEN\": \"$TOK\"}}")"
+PALWARDEN_JOBS_DIR="$WORK/jobs" PYTHONPATH="$LIB" python3 -c "
+import sys, palwarden_jobs as j
+j.update_job(sys.argv[1], state='running')" "$id"
+jobd --reap >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "failed" "a running orphan is reaped"
+assert_eq "$(grep -c "$TOK" "$WORK/jobs/$id.json" || true)" "0" "the reaped job's file is scrubbed"
+
+# --- scrub even when the write itself fails ---------------------------------
+id="$(enqueue palwarden_config_save "{\"settings\": {\"KNOCK_TOKEN\": \"$TOK\"}}")"
+OPS_FILE_OVERRIDE="$WORK/nodir/ops.env" jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "failed" "a config write failure fails the job"
+assert_eq "$(grep -c "$TOK" "$WORK/jobs/$id.json" || true)" "0" "a failed write still scrubs"
+
+# --- validation gauntlet (the worker re-validates; no arbitrary keys) -------
+reset_ops
+for bad in '{"settings": "x"}' '{"settings": {"NOPE": "1"}}' \
+           '{"settings": {"IDLE_TIMEOUT": "030"}}' '{"settings": {"IDLE_TIMEOUT": -1}}' \
+           '{"settings": {"KNOCK_ENABLED": "TRUE"}}' '{"settings": {"KNOCK_TOKEN": 5}}' \
+           '{"settings": {"KNOCK_TOKEN": "'"$(python3 -c 'print("x"*513)')"'"}}' \
+           '{"wait": 5}'; do
+  id="$(enqueue palwarden_config_save "$bad")"
+  jobd --once >/dev/null 2>&1
+  assert_eq "$(state_of "$id")" "failed" "config-save refuses $bad"
+done
+# a malformed ops file on disk fails closed and is left byte-identical
+reset_ops
+printf 'IDLE_TIMEOUT=30\n' > "$OPS"   # not JSON-quoted: malformed
+before="$(sha256sum "$OPS" | cut -d' ' -f1)"
+id="$(enqueue palwarden_config_save '{"settings": {"IDLE_TIMEOUT": "45"}}')"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "failed" "a malformed ops file fails the save (fail closed)"
+assert_eq "$(sha256sum "$OPS" | cut -d' ' -f1)" "$before" "the malformed file is left untouched"
+reset_ops
+
+# --- server_wake: validation ------------------------------------------------
+bad_wake() {
+  local params="$1" what="$2"
+  local id; id="$(enqueue server_wake "$params")"
+  jobd --once >/dev/null 2>&1
+  assert_eq "$(state_of "$id")" "failed" "server_wake refuses $what"
+}
+bad_wake '{}' "missing fence fields"
+bad_wake '{"wake_generation": "zzzz0000000000000000000000000000", "wake_expires_at": 9999999999}' "a non-hex generation"
+bad_wake '{"wake_generation": "00000000000000000000000000000000", "wake_expires_at": "soon"}' "a non-integer expiry"
+bad_wake '{"wake_generation": "00000000000000000000000000000000", "wake_expires_at": -5}' "a negative expiry"
+bad_wake '{"wake_generation": "00000000000000000000000000000000", "wake_expires_at": 4294967296}' "an out-of-range expiry"
+bad_wake "{\"wake_generation\": \"$(python3 -c 'print("0"*32)')\", \"wake_expires_at\": 4000000000, \"reason\": \"$(python3 -c 'print("r"*201)')\"}" "an over-long reason"
+bad_wake "{\"wake_generation\": \"$(python3 -c 'print("0"*32)')\", \"wake_expires_at\": 4000000000, \"reason\": \"a\\u0001b\"}" "a control-character reason"
+bad_wake "{\"wake_generation\": \"$(python3 -c 'print("0"*32)')\", \"wake_expires_at\": 4000000000, \"binary\": \"/bin/sh\"}" "an arbitrary parameter"
+
+# --- server_wake: the fence at execution ------------------------------------
+wake_params() {  # wake_params <generation> <expires_at>
+  printf '{"reason": "operator wake", "wake_generation": "%s", "wake_expires_at": %s}' "$1" "$2"
+}
+NOW="$(date +%s)"
+reset_state
+lc_do 'import palwarden_lifecycle as lc; lc.ensure_state(); print(lc.read_state()["generation"])' > "$WORK/gen"
+GEN="$(cat "$WORK/gen")"
+: > "$WORK/argv.log"
+id="$(enqueue server_wake "$(wake_params "$GEN" "$((NOW + 60))")")"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "succeeded" "a fresh wake for the idle generation succeeds"
+assert_contains "$(cat "$WORK/argv.log")" "palworld-knock wake" "wake runs the fixed argv"
+assert_contains "$(cat "$WORK/argv.log")" "--fence-generation $GEN" "the fence generation rides in argv"
+assert_contains "$(cat "$WORK/argv.log")" "--reason operator wake" "the validated reason rides in argv"
+
+: > "$WORK/argv.log"
+id="$(enqueue server_wake "$(wake_params "$GEN" "$((NOW - 1))")")"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "failed" "an expired wake fails"
+assert_contains "$(output_of "$id")" "expired" "and says why"
+if grep -q "palworld-knock" "$WORK/argv.log"; then fail "expired wake still started"; else pass "an expired wake never runs the wake command"; fi
+
+id="$(enqueue server_wake "$(wake_params "f$(python3 -c 'print("0"*31)')" "$((NOW + 60))")")"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "failed" "a stale-generation wake fails"
+assert_contains "$(output_of "$id")" "generation" "and names the generation"
+if grep -q "palworld-knock" "$WORK/argv.log"; then fail "stale-generation wake started"; else pass "a stale-generation wake never starts"; fi
+
+lc_do 'import palwarden_lifecycle as lc; lc.write_state("active", "update", rotate=True)'
+id="$(enqueue server_wake "$(wake_params "$GEN" "$((NOW + 60))")")"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "failed" "a wake during active maintenance fails"
+if grep -q "palworld-knock" "$WORK/argv.log"; then fail "wake ran during maintenance"; else pass "wake refuses an active lifecycle"; fi
+
+reset_state   # missing state reads unknown -> fail closed
+id="$(enqueue server_wake "$(wake_params "$GEN" "$((NOW + 60))")")"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "failed" "a wake with no state file fails closed"
+
+reset_state
+mkdir -p "$LCS"; printf 'not json' > "$LCS/state.json"
+id="$(enqueue server_wake "$(wake_params "$GEN" "$((NOW + 60))")")"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "failed" "a corrupt state file fails the wake closed"
+
+# --- the wake job surfaces wake's own outcomes (plan item 3: already-running,
+# busy, cooldown, success and failure must each be a well-formed job) --------
+wake_outcome() {  # wake_outcome <exit> <stdout> <expected-state> <needle>
+  reset_state
+  lc_do 'import palwarden_lifecycle as lc; lc.ensure_state(); print(lc.read_state()["generation"])' > "$WORK/gen"
+  local gen; gen="$(cat "$WORK/gen")"
+  cat > "$WORK/bin/palworld-knock" <<EOF
+#!/usr/bin/env bash
+echo "$2"
+exit $1
+EOF
+  chmod +x "$WORK/bin/palworld-knock"
+  local id; id="$(enqueue server_wake "$(wake_params "$gen" "$((NOW + 60))")")"
+  jobd --once >/dev/null 2>&1
+  assert_eq "$(state_of "$id")" "$3" "a wake job whose child says '$2' is $3"
+  assert_contains "$(output_of "$id")" "$2" "the job output carries wake's own line"
+}
+wake_outcome 0 "wake: already-running - no start needed" succeeded "already-running"
+wake_outcome 0 "wake: cooldown - refusing to restart within the window" succeeded "cooldown"
+wake_outcome 75 "wake: lifecycle is busy; retry deliberately later" failed "busy"
+wake_outcome 1 "wake: start command failed" failed "failed"
+stub_tools
+# wake cannot be steered into a down request, a config apply, or a restart:
+# no parameter slot exists for any of them.
+for smuggled in '{"down": true}' '{"confirm": true}' '{"wait": 5}' \
+                '{"settings": {"IDLE_TIMEOUT": "30"}}' '{"message": "restart"}'; do
+  id="$(enqueue server_wake "$smuggled")"
+  jobd --once >/dev/null 2>&1
+  assert_eq "$(state_of "$id")" "failed" "server_wake refuses smuggled shape $smuggled"
+done
+
+# --- serial jobd maintenance invalidates a queued wake ----------------------
+reset_state
+lc_do 'import palwarden_lifecycle as lc; lc.ensure_state(); print(lc.read_state()["generation"])' > "$WORK/gen"
+GEN="$(cat "$WORK/gen")"
+: > "$WORK/argv.log"
+mid="$(enqueue graceful_stop '{"confirm": true}')"
+wid="$(enqueue server_wake "$(wake_params "$GEN" "$((NOW + 3600))")")"
+jobd --once >/dev/null 2>&1   # runs the stop (a maintenance transaction)
+jobd --once >/dev/null 2>&1   # then would run the wake
+assert_eq "$(state_of "$mid")" "succeeded" "the queued stop succeeds"
+assert_eq "$(state_of "$wid")" "failed" "the wake queued behind maintenance does not execute"
+assert_contains "$(output_of "$wid")" "generation" "it fails on the rotated generation"
+if grep -q "palworld-knock" "$WORK/argv.log"; then fail "delayed wake executed after maintenance"; else pass "no delayed wake after serial maintenance"; fi
+
+# --- the disruptive wrap marks state ----------------------------------------
+reset_state
+lc_do 'import palwarden_lifecycle as lc; lc.ensure_state(); print(lc.read_state()["generation"])' > "$WORK/gen"
+GEN="$(cat "$WORK/gen")"
+id="$(enqueue graceful_stop '{"confirm": true}')"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "succeeded" "the wrapped stop succeeds"
+out="$(state_cmp)"
+assert_eq "$out" "idle rotated" "a successful disruptive job leaves idle + a rotated generation"
+id="$(enqueue graceful_restart '{"confirm": true}')"
+cat > "$WORK/bin/palworld-graceful-restart" <<'EOF'
+#!/usr/bin/env bash
+exit 3
+EOF
+chmod +x "$WORK/bin/palworld-graceful-restart"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "failed" "the failing restart fails"
+out="$(lc_do 'import palwarden_lifecycle as lc; print(lc.read_state()["status"])')"
+assert_eq "$out" "unsafe" "a failed disruptive job leaves an unsafe marker (fail closed)"
+stub_tools
+# reaping a running disruptive orphan also marks unsafe
+reset_state
+lc_do 'import palwarden_lifecycle as lc; lc.ensure_state()'
+id="$(enqueue graceful_stop '{"confirm": true}')"
+PALWARDEN_JOBS_DIR="$WORK/jobs" PYTHONPATH="$LIB" python3 -c "
+import sys, palwarden_jobs as j
+j.update_job(sys.argv[1], state='running')" "$id"
+jobd --reap >/dev/null 2>&1
+out="$(lc_do 'import palwarden_lifecycle as lc; print(lc.read_state()["status"])')"
+assert_eq "$out" "unsafe" "an interrupted maintenance leaves unsafe"
+# backup_delete is disruptive but mutates no service: it must not rotate
+reset_state
+lc_do 'import palwarden_lifecycle as lc; lc.ensure_state(); print(lc.read_state()["generation"])' > "$WORK/gen"
+GEN="$(cat "$WORK/gen")"
+id="$(enqueue backup_delete "{\"confirm\": true, \"backup\": \"$ARCHIVE\"}")"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "succeeded" "backup_delete still works"
+out="$(state_cmp)"
+assert_eq "$out" "idle same" "backup_delete does not rotate the generation (no service mutation)"
+# a non-disruptive job never touches state
+id="$(enqueue backup '{}')"
+jobd --once >/dev/null 2>&1
+out="$(state_cmp)"
+assert_eq "$out" "idle same" "a non-disruptive job leaves the generation alone"
+
+# --- F2 (review follow-up): a successful job must never clear unsafe -------
+# `update_check`/`api_save` are wrapped disruptive operations; their success
+# used to write active->idle over an `unsafe/restore` marker without any
+# reconciliation. Recovery stays explicit (ack only).
+lc_state() {
+  PALWARDEN_LIFECYCLE_STATE_DIR="$WORK/lifecycle-state" PYTHONPATH="$LIB" \
+  python3 -c 'import palwarden_lifecycle as lc; print(lc.read_state()["status"])'
+}
+lc_gen() {
+  PALWARDEN_LIFECYCLE_STATE_DIR="$WORK/lifecycle-state" PYTHONPATH="$LIB" \
+  python3 -c 'import palwarden_lifecycle as lc; print(lc.read_state()["generation"])'
+}
+PALWARDEN_LIFECYCLE_STATE_DIR="$WORK/lifecycle-state" PYTHONPATH="$LIB" \
+  python3 -c 'import palwarden_lifecycle as lc; lc.write_state("unsafe", operation="restore", rotate=True)' >/dev/null
+gen_before="$(lc_gen)"
+id="$(enqueue update_check '{"confirm": true}')"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "succeeded" "F2: the update_check job itself succeeds"
+assert_eq "$(lc_state)" "unsafe" \
+  "F2: a successful job cannot clear the unsafe marker (recovery stays explicit)"
+assert_eq "$(lc_gen)" "$gen_before" \
+  "F2: the job did not rotate the generation while unsafe"
+
+# --- F2: a concurrent direct transaction keeps its state -------------------
+# While an outer owner holds the lifecycle lock, a job must not write state
+# at all: the holder's `active` marker and generation survive the job.
+cat > "$WORK/holder.py" <<'PY'
+import os, sys, time
+sys.path.insert(0, os.environ["LIB"])
+import palwarden_lifecycle as lc
+# The previous F2 case deliberately left `unsafe`; a fresh direct
+# transaction starts from idle (force = the ack path, used here only to
+# reset the fixture).
+lc.write_state("idle", force=True)
+fd = lc.acquire(timeout=5)
+lc.write_state("active", operation="maintenance", rotate=True)
+open(os.environ["HOLD_READY"], "w").close()
+t = time.time()
+while time.time() - t < 20 and not os.path.exists(os.environ["HOLD_GO"]):
+    time.sleep(0.05)
+lc.release(fd)
+PY
+rm -f "$WORK/hold.ready" "$WORK/hold.go"
+env LIB="$LIB" PYTHONPATH="$LIB" \
+  PALWARDEN_LIFECYCLE_LOCK="$WORK/lifecycle.lock" \
+  PALWARDEN_LIFECYCLE_STATE_DIR="$WORK/lifecycle-state" \
+  HOLD_READY="$WORK/hold.ready" HOLD_GO="$WORK/hold.go" \
+  python3 "$WORK/holder.py" &
+HOLDER_PID=$!
+ok=0
+for _ in $(seq 1 100); do [ -e "$WORK/hold.ready" ] && { ok=1; break; }; sleep 0.05; done
+assert_eq "$ok" "1" "F2: the outer direct transaction is holding the lock"
+gen_holder="$(lc_gen)"
+assert_eq "$(lc_state)" "active" "F2: the holder published active"
+id="$(enqueue graceful_restart '{"confirm": true, "wait": 0, "message": "raced"}')"
+jobd --once >/dev/null 2>&1
+assert_eq "$(lc_state)" "active" \
+  "F2: a job completing under a concurrent transaction cannot mark idle"
+assert_eq "$(lc_gen)" "$gen_holder" \
+  "F2: the job did not rotate the holder's generation"
+touch "$WORK/hold.go"
+wait "$HOLDER_PID" 2>/dev/null || true
+
+# --- R3 (Sol review): a busy lifecycle lock must REFUSE the wrapped job ----
+# Running the steps anyway executes side effects that precede each step's own
+# lock acquisition (engine rollback truncates a file before it ever reaches
+# the restart). The job fails instead.
+cat > "$WORK/holder2.py" <<'PY'
+import os, sys, time
+sys.path.insert(0, os.environ["LIB"])
+import palwarden_lifecycle as lc
+lc.write_state("idle", force=True)
+fd = lc.acquire(timeout=5)
+lc.write_state("active", operation="maintenance", rotate=True)
+open(os.environ["HOLD_READY"], "w").close()
+t = time.time()
+while time.time() - t < 20 and not os.path.exists(os.environ["HOLD_GO"]):
+    time.sleep(0.05)
+lc.release(fd)
+PY
+rm -f "$WORK/hold2.ready" "$WORK/hold2.go"
+: > "$WORK/argv.log"
+env LIB="$LIB" PYTHONPATH="$LIB" \
+  PALWARDEN_LIFECYCLE_LOCK="$WORK/lifecycle.lock" \
+  PALWARDEN_LIFECYCLE_STATE_DIR="$WORK/lifecycle-state" \
+  HOLD_READY="$WORK/hold2.ready" HOLD_GO="$WORK/hold2.go" \
+  python3 "$WORK/holder2.py" &
+HOLDER2_PID=$!
+ok=0
+for _ in $(seq 1 100); do [ -e "$WORK/hold2.ready" ] && { ok=1; break; }; sleep 0.05; done
+assert_eq "$ok" "1" "R3: outer transaction holds the lock"
+id="$(enqueue graceful_restart '{"confirm": true, "wait": 0, "message": "busy"}')"
+jobd --once >/dev/null 2>&1
+assert_eq "$(state_of "$id")" "failed" \
+  "R3: wrapped job is refused while the lifecycle lock is busy"
+assert_eq "$(wc -l < "$WORK/argv.log")" "0" \
+  "R3: refused job ran NO steps (no unprotected side effects)"
+touch "$WORK/hold2.go"
+wait "$HOLDER2_PID" 2>/dev/null || true
+
+# --- R7 (Sol round 2): an unexpected execution exception must never strand -
+# the lifecycle lock. The old finally evaluated `exit_code == 0` before
+# assignment (UnboundLocalError) and never reached lc.release(); poll_once
+# kept the daemon alive with the descriptor locked forever. Reproduction:
+# inject OSError at the execution boundary, then prove a separate
+# competitor can acquire the lock again and the marker recorded unsafe.
+cat > "$WORK/r7_driver.py" <<'PY'
+import importlib.machinery, importlib.util, sys
+loader = importlib.machinery.SourceFileLoader("jobd_under_test", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+mod = importlib.util.module_from_spec(spec)
+sys.modules[loader.name] = mod
+loader.exec_module(mod)
+import palwarden_jobs as jobs
+import palwarden_lifecycle as lc
+
+def fresh():
+    lc.ensure_state()
+    lc.write_state("idle", rotate=True, force=True)
+
+def lock_free():
+    try:
+        fd = lc.acquire(timeout=0.5)
+        lc.release(fd)
+        return True
+    except Exception:
+        return False
+
+def new_job():
+    return jobs.create_job("graceful_restart",
+                           {"confirm": True, "wait": 0, "message": "r7"})
+
+results = []
+
+# S1: unexpected execution exception -> propagates, records unsafe, releases.
+fresh()
+job = new_job()
+def boom(*a, **k):
+    raise OSError("injected execution-boundary failure")
+mod._execute_job = boom
+raised = False
+try:
+    mod.run_job(job)
+except OSError:
+    raised = True
+results.append(("execution-raise releases lock and records unsafe",
+                raised and lc.read_state()["status"] == "unsafe" and lock_free()))
+
+# S2: start bookkeeping raises (Exception) after acquire -> lock released.
+fresh()
+job = new_job()
+real_mark = mod._mark_state
+real_begin = lc.begin_transaction
+def mark_start_fail(*a, **k):
+    raise RuntimeError("injected start-bookkeeping failure")
+lc.begin_transaction = mark_start_fail
+raised = False
+try:
+    mod.run_job(job)
+except RuntimeError:
+    raised = True
+lc.begin_transaction = real_begin
+results.append(("start-bookkeeping raise releases lock",
+                raised and lock_free()))
+
+# S3: completion bookkeeping raises a BASEException (KeyboardInterrupt) ->
+# the nested finally must still release (review: except Exception is not
+# enough). _mark_state is completion-only; begin has its own mandatory helper.
+fresh()
+job = new_job()
+calls = {"n": 0}
+def mark_kbi_on_complete(*a, **k):
+    calls["n"] += 1
+    raise KeyboardInterrupt("injected interrupt during completion")
+mod._execute_job = lambda *a, **k: 0
+mod._mark_state = mark_kbi_on_complete
+raised = False
+try:
+    mod.run_job(job)
+except KeyboardInterrupt:
+    raised = True
+mod._mark_state = real_mark
+results.append(("completion BaseException still releases lock",
+                raised and lock_free()))
+
+fails = [n for n, ok in results if not ok]
+for n, ok in results:
+    print(("PASS " if ok else "FAIL ") + n)
+sys.exit(1 if fails else 0)
+PY
+r7_out="$(PALWARDEN_JOBS_DIR="$WORK/jobs" PYTHONPATH="$LIB" \
+  PALWARDEN_SBIN_DIR="$WORK/bin" PALWORLD_ENGINE_ENV="$WORK/etc/engine.env" \
+  PALWORLD_BACKUP_DIR="$WORK/backups" PALWARDEN_JOBD_LOCK="$WORK/jobd.lock" \
+  PALWARDEN_UPLOAD_DIR="$WORK/uploads" PALWARDEN_SAVE_BACKUP_DIR="$WORK/savebackups" \
+  PALWORLD_BACKUP_SCHEDULE="$WORK/etc/backup.env" \
+  PALWARDEN_PARSER_BIN="$DIR/../../bin/palworld-config-parser" \
+  PALWORLD_CONFIG_FILE="$WORK/PalWorldSettings.ini" \
+  PALWARDEN_OPS_FILE="$WORK/ops.env" PALWORLD_GROUP="$(id -gn)" \
+  PALWARDEN_LIFECYCLE_STATE_DIR="$WORK/lifecycle-state" \
+  PALWARDEN_LIFECYCLE_LOCK="$WORK/lifecycle.lock" \
+  python3 "$WORK/r7_driver.py" "$JOBD" 2>&1)"
+assert_contains "$r7_out" "PASS" \
+  "R7: execution exception propagates, records unsafe, and releases the lock"
+assert_not_contains "$r7_out" "FAIL" \
+  "R7: all three lock-release scenarios pass (output: $r7_out)"
 
 assert_report

@@ -76,6 +76,33 @@
             overflow: auto; font-family: var(--pw-mono); color: var(--pw-fg); }
   .pw-empty { color: var(--pw-fg-muted); font-style: italic; }
 
+  /* pw-btn: action button (same component as the Backups page's). */
+  .pw-btn { font: inherit; color: var(--pw-fg); background: var(--pw-bg);
+            border: 1px solid var(--pw-border); border-radius: 6px;
+            padding: var(--pw-space-1) var(--pw-space-3); cursor: pointer;
+            margin: 0 var(--pw-space-2) var(--pw-space-2) 0;
+            display: inline-block; text-decoration: none;
+            transition: color .15s ease, border-color .15s ease; }
+  .pw-btn:hover:enabled { color: var(--pw-accent); border-color: var(--pw-accent); }
+  .pw-btn--danger { color: var(--pw-warn); border-color: var(--pw-warn); }
+  .pw-btn[disabled] { color: var(--pw-idle); border-color: var(--pw-border);
+                      cursor: not-allowed; }
+
+  input { font: inherit; font-family: var(--pw-mono); color: var(--pw-fg);
+          background: var(--pw-bg); border: 1px solid var(--pw-border);
+          border-radius: 6px; padding: var(--pw-space-1) var(--pw-space-2); }
+  input[type="checkbox"] { width: 18px; height: 18px; padding: 0;
+                           accent-color: var(--pw-accent); }
+
+  /* Ops panel rows: label / control, like the Backups schedule card. */
+  #ops-form > div { display: grid; grid-template-columns: 1fr 14rem;
+                    gap: var(--pw-space-2); align-items: center;
+                    padding: var(--pw-space-2) 0;
+                    border-top: 1px solid var(--pw-border); }
+  #ops-form > div:first-child { border-top: 0; }
+  #ops-form label { font-weight: 600; }
+  #ops-form small { display: block; color: var(--pw-fg-muted); font-weight: 400; }
+
   @media (max-width: 900px) {
     .pw-vitals { grid-template-columns: repeat(2, 1fr); }
     .pw-grid { grid-template-columns: 1fr; }
@@ -157,15 +184,76 @@
       <details class="pw-card pw-section pw-section--teal" open><summary class="pw-section__header"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="5" rx="1"/><path d="M5 9v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V9"/><path d="M10 13h4"/></svg><h2>Backups</h2></summary><div class="pw-section__content"><pre class="pw-log" id="backups" aria-live="polite">…</pre></div></details>
       <details class="pw-card pw-section pw-section--gold" open><summary class="pw-section__header"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l9 5-9 5-9-5 9-5z"/><path d="M3 13l9 5 9-5"/></svg><h2>Snapshots</h2></summary><div class="pw-section__content"><pre class="pw-log" id="snapshots" aria-live="polite">…</pre></div></details>
       <details class="pw-card pw-section pw-section--green" open><summary class="pw-section__header"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="9" y1="6" x2="20" y2="6"/><line x1="9" y1="12" x2="20" y2="12"/><line x1="9" y1="18" x2="20" y2="18"/><circle cx="5" cy="6" r="1"/><circle cx="5" cy="12" r="1"/><circle cx="5" cy="18" r="1"/></svg><h2>Jobs</h2></summary><div class="pw-section__content"><pre class="pw-log" id="jobs" aria-live="polite">…</pre></div></details>
+      <details class="pw-card pw-card--full pw-section pw-section--indigo" open><summary class="pw-section__header"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v6"/><path d="M6.3 6.3a8 8 0 1 0 11.4 0"/></svg><h2>Idle shutdown &amp; knock wake</h2></summary><div class="pw-section__content">
+    <p role="status" class="pw-banner__meta"><span class="pw-pill pw-pill--idle" id="ops-status-pill">LOADING</span> <span id="ops-status">Loading the ops settings…</span></p>
+    <form id="ops-form" autocomplete="off">
+      <div>
+        <label for="ops-idle-timeout">Idle timeout (minutes)
+          <small>0 = never stop the server (the default). After this many minutes with the last player gone, the server saves and stops.</small>
+        </label>
+        <input type="number" id="ops-idle-timeout" min="0" max="10080" step="1">
+      </div>
+      <div>
+        <label for="ops-idle-interval">Idle check interval (seconds)
+          <small>1–3600 (default 60). How often the watcher checks emptiness and uptime.</small>
+        </label>
+        <input type="number" id="ops-idle-interval" min="1" max="3600" step="1">
+      </div>
+      <div>
+        <label for="ops-knock-enabled">Knock wake enabled
+          <small>Default on. Off closes the UDP listener by the next lease boundary; enabling re-arms when safe.</small>
+        </label>
+        <input type="checkbox" id="ops-knock-enabled">
+      </div>
+      <div>
+        <label for="ops-knock-cooldown">Wake cooldown (seconds)
+          <small>1–86400 (default 600). Minimum gap between wakes, whatever asked for one.</small>
+        </label>
+        <input type="number" id="ops-knock-cooldown" min="1" max="86400" step="1">
+      </div>
+      <div>
+        <label for="ops-knock-token">Knock token <span class="pw-pill pw-pill--idle" id="ops-token-pill">UNKNOWN</span>
+          <small>Up to 512 bytes. Leave blank to keep the stored token; use Clear to remove it. No token means open doorbell.</small>
+        </label>
+        <input type="password" id="ops-knock-token" placeholder="leave blank to keep" autocomplete="new-password">
+      </div>
+      <div>
+        <label for="ops-wake-reason">Wake reason (optional)
+          <small>1–200 printable characters, recorded on the wake job for the audit trail.</small>
+        </label>
+        <input type="text" id="ops-wake-reason" maxlength="200" placeholder="why the server is being woken">
+      </div>
+    </form>
+    <div id="ops-actions">
+      <button type="button" class="pw-btn" id="ops-save" disabled>Save changes</button>
+      <button type="button" class="pw-btn pw-btn--danger" id="ops-clear-token">Clear knock token</button>
+      <button type="button" class="pw-btn" id="ops-wake">Wake server now</button>
+    </div>
+    <details>
+      <summary>How this works</summary>
+      <ul>
+        <li><strong>Defaults:</strong> idle timeout 0 (off), check interval 60 s, knock enabled, cooldown 600 s, no token (open doorbell).</li>
+        <li><strong>First attempt is consumed:</strong> the UDP packet that wakes the server is spent on the wake — the player's client must retry after startup (typically under a minute).</li>
+        <li><strong>Open doorbell:</strong> with no token, <em>any</em> non-empty UDP packet to the game port wakes the server; the cooldown bounds how often. The game's own server password still gates joining — a wake request is not authentication.</li>
+        <li><strong>Token limits:</strong> the token is an exact byte comparison. It is not encryption and not replay protection.</li>
+        <li><strong>Partial save:</strong> saving merges only the fields you changed, at the moment the job runs. If someone else saves the same field in between, the last save wins — there is no version check.</li>
+        <li><strong>Immediate effect:</strong> edits apply within about a second (the next lease boundary or idle tick), without a restart. They cannot undo a start or stop that has already been issued.</li>
+        <li><strong>Persistence:</strong> environment seeds apply only while the config file does not exist. Settings saved here live on the ops volume and survive container recreation; changed Compose seeds never overwrite them.</li>
+      </ul>
+    </details>
+    <pre class="pw-log pw-empty" id="ops-log" aria-live="polite">Job progress appears here.</pre>
+      </div></details>
     </div>
   </div>
 </div>
 <script>
-// This dashboard is read-only: every fetch below is a GET, which needs nothing
-// beyond the Basic auth the browser already performed for this page. Mutations
-// are the Engine.ini editor's job, and so is the X-Palwarden-Token header they
-// require — it holds the token in sessionStorage (per-tab, unreadable by any
-// cross-origin page), which is why nothing here has to know about it.
+// Reads on this dashboard are plain GETs needing nothing beyond the Basic
+// auth the browser already performed for this page. The one mutating region
+// — the idle/knock panel below — additionally sends the X-Palwarden-Token
+// header (the CSRF defence the Engine.ini editor and Backups page use); the
+// token lives in sessionStorage under the same key those pages use, so a
+// rotated token self-heals on any 403, per-tab, unreadable by cross-origin
+// pages.
 async function get(path) {
   const res = await fetch(path, { headers: { "Accept": "application/json" } });
   if (!res.ok) throw new Error(path + " -> HTTP " + res.status);
@@ -375,6 +463,334 @@ async function pollJobs(attempt) {
   }
 }
 
+// --- idle shutdown / knock wake panel (spec §7.2) ---------------------------
+// The one mutating region on this page. Conventions are the Backups page's:
+// Basic auth (the browser holds it) plus X-Palwarden-Token as the CSRF
+// defence, a bounded poll of /api/jobs/<id> after every accepted request,
+// and every server-supplied string reaching the DOM through textContent.
+const TOKEN_KEY = "palwarden-token";
+const OPS_POLL_INTERVAL_MS = 2000;
+// A config save is one atomic file write and a wake is one start attempt;
+// five minutes is generous for both. On expiry the page says so and names
+// the job id — stopping the poll is not stopping the job (jobd runs
+// independently of this page).
+const OPS_POLL_MAX_ATTEMPTS = 150;
+// A status GET can fail while the job is perfectly healthy — jobd is a
+// separate process. Tolerate a run of consecutive failures (~20 s) before
+// giving up, and reset on any success.
+const OPS_POLL_MAX_STATUS_FAILURES = 10;
+const OPS_TERMINAL = ["succeeded", "failed"];
+
+function errText(e) { return String((e && e.message) || e); }
+function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+// Appends one line to the card's job log. Every line is server-influenceable
+// (the 403 reflects the request's Origin back; error/output come from the
+// API), so it only ever reaches the DOM through textContent.
+function opsLog(line) {
+  const pre = document.getElementById("ops-log");
+  const atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 4;
+  if (pre.classList.contains("pw-empty")) { pre.textContent = ""; pre.classList.remove("pw-empty"); }
+  pre.textContent += line + "\n";
+  if (atBottom) pre.scrollTop = pre.scrollHeight;
+}
+
+// kind is "idle" | "ok" | "warn" | "bad". The pill always carries its own
+// word, so the outcome never depends on colour alone.
+function opsStatus(kind, message) {
+  const pill = document.getElementById("ops-status-pill");
+  pill.className = "pw-pill pw-pill--" + kind;
+  pill.textContent = kind === "ok" ? "OK" : kind === "bad" ? "ERROR" :
+                     kind === "warn" ? "WARN" : "INFO";
+  text("ops-status", message);
+}
+
+// Resolves to the mutation token; same contract as the Backups page's
+// token(): cached in sessionStorage, GET /api/token on a miss, prompt
+// fallback for an older server, and a 401 (gone Basic session) refuses to
+// prompt for a token that could not help.
+async function opsToken() {
+  const cached = sessionStorage.getItem(TOKEN_KEY);
+  if (cached) return cached;
+  let unauthenticated = false;
+  try {
+    const res = await fetch("/api/token", { headers: { "Accept": "application/json" } });
+    if (res.status === 401) { unauthenticated = true; throw new Error("HTTP 401"); }
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const json = await res.json();
+    const payload = json && json.data;
+    if (!json || json.ok === false || !payload || !payload.token) {
+      throw new Error((json && json.error) ? json.error : "the response carried no token");
+    }
+    const t = String(payload.token);
+    sessionStorage.setItem(TOKEN_KEY, t);
+    return t;
+  } catch (e) {
+    if (unauthenticated) {
+      throw new Error("not signed in any more (GET /api/token answered 401) — " +
+                      "reload this page and re-enter the web UI credentials");
+    }
+    const why = errText(e);
+    opsLog("could not fetch the API token (" + why + "); asking for it instead");
+    const typed = window.prompt("palwarden could not supply the API token (" + why + "). " +
+      "Enter WEBUI_TOKEN from /etc/palworld/webui.env. Kept in this tab only.");
+    if (typed) { sessionStorage.setItem(TOKEN_KEY, typed); return typed; }
+    throw new Error("no API token available: " + why);
+  }
+}
+
+// Pure: the PUT body from the form against the loaded baseline. Only changed
+// keys ride (the worker merges at execution time, spec §7.2); ints are typed
+// numbers and the toggle a JSON boolean; the token is included ONLY when the
+// operator typed one — the placeholder is an attribute, never a value, and
+// clearing is its own button, never a side effect of Save. Range enforcement
+// is deliberately NOT duplicated here: the worker's validator is the single
+// source of truth and its 400 is rendered verbatim.
+function collectOpsSettings(form, baseline) {
+  const settings = {};
+  const ints = [
+    ["IDLE_TIMEOUT", form.idleTimeout, baseline.IDLE_TIMEOUT, "minutes"],
+    ["IDLE_CHECK_INTERVAL", form.idleInterval, baseline.IDLE_CHECK_INTERVAL, "seconds"],
+    ["KNOCK_COOLDOWN", form.cooldown, baseline.KNOCK_COOLDOWN, "seconds"],
+  ];
+  for (const entry of ints) {
+    const value = String(entry[1]).trim();
+    if (value === String(entry[2])) continue;
+    if (!/^(0|[1-9][0-9]*)$/.test(value)) {
+      return { error: entry[0] + " must be a whole number of " + entry[3] +
+               ", got \"" + value + "\"" };
+    }
+    settings[entry[0]] = Number(value);
+  }
+  if (form.knockEnabled !== baseline.KNOCK_ENABLED) {
+    settings.KNOCK_ENABLED = !!form.knockEnabled;
+  }
+  const token = String(form.token);
+  if (token !== "") settings.KNOCK_TOKEN = token;
+  return { settings: settings };
+}
+
+// Pure: server_wake params. A blank reason is omitted entirely (the worker
+// refuses an empty one); the wake fence fields are minted by the server and
+// this page never names them — a caller that supplies them is refused 400.
+function wakeParams(reason) {
+  const trimmed = String(reason === null || reason === undefined ? "" : reason).trim();
+  return trimmed === "" ? {} : { reason: trimmed };
+}
+
+function readOpsForm() {
+  return {
+    idleTimeout: document.getElementById("ops-idle-timeout").value,
+    idleInterval: document.getElementById("ops-idle-interval").value,
+    knockEnabled: document.getElementById("ops-knock-enabled").checked,
+    cooldown: document.getElementById("ops-knock-cooldown").value,
+    token: document.getElementById("ops-knock-token").value,
+  };
+}
+
+// The baseline is the last effective config read from the API. The form is
+// filled ONLY here — on initial load and after a successful save — never on
+// a timer, so the 15 s refresh loop cannot clobber in-progress edits.
+let opsBaseline = null;
+
+function fillOpsForm(d) {
+  opsBaseline = d;
+  document.getElementById("ops-idle-timeout").value = d.IDLE_TIMEOUT;
+  document.getElementById("ops-idle-interval").value = d.IDLE_CHECK_INTERVAL;
+  document.getElementById("ops-knock-enabled").checked = !!d.KNOCK_ENABLED;
+  document.getElementById("ops-knock-cooldown").value = d.KNOCK_COOLDOWN;
+  // The secret is never preloaded: GET carries only token_configured, and
+  // the field is blanked after every (re)load so a typed value cannot ride
+  // into a later save unnoticed.
+  document.getElementById("ops-knock-token").value = "";
+  const pill = document.getElementById("ops-token-pill");
+  pill.className = "pw-pill pw-pill--" + (d.token_configured ? "ok" : "warn");
+  pill.textContent = d.token_configured ? "CONFIGURED" : "UNSET";
+  syncOpsSave();
+}
+
+function syncOpsSave() {
+  const btn = document.getElementById("ops-save");
+  if (!opsBaseline) { btn.disabled = true; return; }
+  const collected = collectOpsSettings(readOpsForm(), opsBaseline);
+  btn.disabled = !!collected.error || Object.keys(collected.settings).length === 0;
+}
+
+function setOpsBusy(busy) {
+  // Scoped to this card: a running ops job must not disable the graph
+  // picker or anything else on the dashboard.
+  document.querySelectorAll("#ops-form input, #ops-actions button")
+    .forEach(function (node) { node.disabled = busy; });
+  if (!busy) syncOpsSave();
+}
+
+async function loadOps() {
+  try {
+    const r = await get("/api/palwarden-config");
+    const err = payloadError(r);
+    if (err) throw new Error(err);
+    fillOpsForm(r.data || {});
+    opsStatus("idle", "Settings loaded.");
+  } catch (e) {
+    // Fail closed: with no baseline there is nothing to diff against, so
+    // the form stays empty and Save stays disabled rather than guessing.
+    opsBaseline = null;
+    syncOpsSave();
+    opsStatus("bad", "could not load the ops settings: " + errText(e));
+  }
+}
+
+// Resolves to one of three outcomes, deliberately not to a thrown error:
+// losing sight of a job is not the same event as a job failing.
+async function pollOpsJob(id) {
+  let last = "";
+  let failures = 0;
+  for (let i = 0; i < OPS_POLL_MAX_ATTEMPTS; i++) {
+    if (i > 0) await sleep(OPS_POLL_INTERVAL_MS);
+    let job = null;
+    try {
+      const res = await fetch("/api/jobs/" + encodeURIComponent(id),
+                              { headers: { "Accept": "application/json" } });
+      let json = null;
+      try { json = await res.json(); } catch (e) { json = null; }
+      if (!res.ok || !json || json.ok === false || !json.data) {
+        throw new Error((json && json.error) ? json.error : ("job status: HTTP " + res.status));
+      }
+      job = json.data;
+    } catch (e) {
+      const detail = errText(e);
+      failures++;
+      opsLog("status check failed (" + failures + "/" + OPS_POLL_MAX_STATUS_FAILURES + "): " + detail);
+      if (failures >= OPS_POLL_MAX_STATUS_FAILURES) return { outcome: "unreachable", detail: detail };
+      continue;
+    }
+    failures = 0;
+    const state = String(job.state || "unknown");
+    if (state !== last) { opsLog("state: " + state); last = state; }
+    if (OPS_TERMINAL.indexOf(state) !== -1) return { outcome: "done", job: job };
+  }
+  return { outcome: "expired" };
+}
+
+// Shared tail for save/clear: report a polled job honestly. A failed job, an
+// expired poll or an unreachable status NEVER renders as success.
+async function reportOpsJob(action, id) {
+  const res = await pollOpsJob(id);
+  if (res.outcome === "expired") {
+    const msg = action + " is job " + id + ", still unfinished after " +
+      Math.round(OPS_POLL_MAX_ATTEMPTS * OPS_POLL_INTERVAL_MS / 60000) +
+      " minutes; this page stopped polling. The job itself is unaffected — " +
+      "check /api/jobs/" + id + ".";
+    opsLog(msg); opsStatus("warn", msg); return false;
+  }
+  if (res.outcome === "unreachable") {
+    const msg = "job status unreachable (" + res.detail + ") — the job may still be " +
+      "running. " + action + " is job " + id + "; check /api/jobs/" + id + ".";
+    opsLog(msg); opsStatus("warn", msg); return false;
+  }
+  const job = res.job;
+  if (job.output) opsLog(String(job.output));
+  if (job.state === "succeeded") return true;
+  const msg = action + " failed (exit " + String(job.exit_code) + "); see the log above";
+  opsLog(msg); opsStatus("bad", msg); return false;
+}
+
+// One mutation round trip: token, request, 202+id. Throws with the server's
+// own message (plus blocked_by when present) on anything else; a 403 drops
+// the cached token so a retry re-fetches it.
+async function opsMutate(method, path, body) {
+  const tok = await opsToken();
+  const res = await fetch(path, {
+    method: method,
+    headers: { "Content-Type": "application/json", "Accept": "application/json",
+               "X-Palwarden-Token": tok },
+    body: JSON.stringify(body),
+  });
+  let json = null;
+  try { json = await res.json(); } catch (e) { json = null; }
+  if (res.status === 202 && json && json.id) return json.id;
+  let msg = (json && json.error) ? json.error : ("HTTP " + res.status);
+  const b = json && json.blocked_by;
+  if (b) msg += " [blocked by " + b.action + " " + b.id + " (" + b.state + ")]";
+  if (res.status === 403) {
+    sessionStorage.removeItem(TOKEN_KEY);
+    msg += " — the API token was refused; it has been discarded, so retrying re-fetches it";
+  }
+  throw new Error(msg);
+}
+
+async function saveOps() {
+  if (!opsBaseline) { opsStatus("bad", "no settings loaded — nothing to compare against"); return; }
+  const collected = collectOpsSettings(readOpsForm(), opsBaseline);
+  if (collected.error) { opsStatus("bad", collected.error); return; }
+  const keys = Object.keys(collected.settings);
+  if (keys.length === 0) { opsStatus("idle", "nothing to save"); return; }
+  setOpsBusy(true);
+  try {
+    opsLog("PUT /api/palwarden-config " + keys.join(", "));
+    const id = await opsMutate("PUT", "/api/palwarden-config", collected.settings);
+    opsLog("job " + id + " accepted");
+    if (await reportOpsJob("save", id)) {
+      opsStatus("ok", "saved.");
+      await loadOps();  // show the effective config, not what we typed
+      opsStatus("ok", "saved.");  // loadOps's INFO must not overwrite the result
+    }
+  } catch (e) {
+    opsStatus("bad", errText(e));
+  } finally {
+    setOpsBusy(false);
+  }
+}
+
+// The explicit clear: its own button, its own confirmation, its own PUT of
+// exactly one key. Save never produces this body.
+async function clearOpsToken() {
+  if (!window.confirm("Remove the knock token? Until a new one is set, ANY " +
+                      "non-empty packet to the game port wakes the server " +
+                      "(the cooldown still applies).")) return;
+  setOpsBusy(true);
+  try {
+    opsLog("PUT /api/palwarden-config KNOCK_TOKEN (clear)");
+    const id = await opsMutate("PUT", "/api/palwarden-config", { KNOCK_TOKEN: "" });
+    opsLog("job " + id + " accepted");
+    if (await reportOpsJob("token clear", id)) {
+      opsStatus("ok", "knock token cleared — open doorbell until a new one is set.");
+      await loadOps();
+      opsStatus("ok", "knock token cleared — open doorbell until a new one is set.");
+    }
+  } catch (e) {
+    opsStatus("bad", errText(e));
+  } finally {
+    setOpsBusy(false);
+  }
+}
+
+// Authorized wake: fixed action, optional reason, nothing else. Admission
+// (lifecycle state, cooldown, blocking jobs) is the server's call — a 409
+// arrives as an error message and is rendered verbatim, never as success.
+async function wakeOpsServer() {
+  setOpsBusy(true);
+  try {
+    const params = wakeParams(document.getElementById("ops-wake-reason").value);
+    opsLog("POST /api/jobs server_wake");
+    const id = await opsMutate("POST", "/api/jobs", { action: "server_wake", params: params });
+    opsLog("job " + id + " accepted");
+    if (await reportOpsJob("wake", id)) {
+      opsStatus("ok", "wake job finished — the start was requested.");
+    }
+  } catch (e) {
+    opsStatus("bad", errText(e));
+  } finally {
+    setOpsBusy(false);
+  }
+}
+
+document.getElementById("ops-form").addEventListener("input", syncOpsSave);
+document.getElementById("ops-form").addEventListener("change", syncOpsSave);
+document.getElementById("ops-save").addEventListener("click", saveOps);
+document.getElementById("ops-clear-token").addEventListener("click", clearOpsToken);
+document.getElementById("ops-wake").addEventListener("click", wakeOpsServer);
+
 // --- performance graph -------------------------------------------------------
 // The same PNG palworld-fps posts to Discord, rendered on demand for the window
 // picked in the dropdown. Fetched as a blob rather than pointed at with an
@@ -429,6 +845,7 @@ setInterval(refresh, 15000);
 loadGraph();
 setInterval(loadGraph, GRAPH_REFRESH_MS);
 pollJobs();
+loadOps();
 </script>
 </body>
 </html>

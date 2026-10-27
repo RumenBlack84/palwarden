@@ -996,6 +996,175 @@ in [`docs/tools.md`](tools.md#refusals).
 If the install itself is damaged rather than the world, delete the whole testbed
 directory and redo the one-time install step in `docs/tools.md`.
 
+## 17. Idle shutdown and knock wake
+
+Two helpers let the server sleep while nobody plays and wake it with a packet on
+the game port: **`palworld-idle-watch`** stops the server after a configured
+period of *observed* emptiness, and **`palworld-knock`** listens on the game's
+UDP port while the server is deliberately down and starts it again on a matching
+packet. In the container (embedded mode) both are always supervised and re-read
+their config at least once per second, so the browser panel ("Idle shutdown &
+knock wake") turns either one on or off with no service or container restart.
+`install.sh` on bare metal installs the scripts and the state directory but
+ships no units for them yet — the always-on pairing is container-only for now;
+a systemd deployment is a known follow-up.
+
+**Wake holds the lifecycle lock while the world loads.** A wake transaction
+keeps the lifecycle lock through its REST-readiness poll — with the real game
+that is the world load, typically a minute and bounded by
+`PALWARDEN_WAKE_READY_TIMEOUT_S` (default 180s). During that window jobd
+refuses wrapped jobs with "the lifecycle lock is busy ... gave up after 0s";
+this is the reviewed refuse-when-busy design, not a fault. Wait for the server
+to answer its REST API (or simply retry the job) before queueing a
+restart/stop right after a wake.
+
+### Configuration and where it lives
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `IDLE_TIMEOUT` | `0` (off) | minutes of observed emptiness before a graceful stop; `0` disables; >=30 recommended |
+| `IDLE_CHECK_INTERVAL` | `60` | seconds between idle ticks (1..3600) |
+| `KNOCK_ENABLED` | `true` | UDP listener on the internal game port while the server is down |
+| `KNOCK_COOLDOWN` | `600` | seconds a wake must wait since the last one (1..86400) |
+| `KNOCK_TOKEN` | empty | shared secret a packet must match; empty = open doorbell |
+
+Resolution is **file -> environment -> built-in default**. The file
+(`/etc/palworld/palwarden.env` on the VM; `/var/lib/palwarden-ops/palwarden.env`
+on the container's `palwarden-ops` volume) is seeded complete and validated at
+container start **only if absent** and never re-rendered — the `IDLE_TIMEOUT=`
+/`KNOCK_*` lines in `docker/.env` are seeds, not settings. The panel owns the
+file afterwards: `PUT /api/palwarden-config` queues a `palwarden_config_save`
+job, and `GET /api/palwarden-config` returns the four non-secret values plus
+`token_configured` — never the token itself. The file is inert data (fixed
+keys, JSON-quoted values); it is never sourced as shell. An invalid file or a
+corrupt cooldown timestamp **fails closed**: idle never stops and knock never
+wakes on config the tools cannot trust.
+
+### What "idle" means: positive evidence, not absence of evidence
+
+A stop requires *proof the server is empty*, not merely no evidence to the
+contrary:
+
+1. `IDLE_TIMEOUT > 0`, the service is running, and its uptime covers the
+   timeout (a fresh process cannot inherit an old server's empty history).
+2. The sampler's presence state is valid: the last successful players
+   observation is at most **60 seconds** old — a fixed bound in v1,
+   independent of `IDLE_CHECK_INTERVAL` — and the current observed-empty
+   interval covers the full timeout. A stopped sampler, a malformed response,
+   or a clock discontinuity resets or inhibits eligibility; slower sampling
+   simply never qualifies.
+3. A final live `palworld-api players` request under the lifecycle lock: only
+   an empty list authorizes the stop. Loading placeholder entries count as
+   activity even without an identity row.
+
+The stop itself is the ordinary `palworld-graceful-stop --wait 0` path, so the
+world saves on the way down (SIGINT) exactly as a manual stop does. **A narrow
+join-versus-stop race remains** between that final REST check and the stop:
+game-level atomicity is not a thing, and a player connecting in that window is
+dropped by the stop. This is why idle stays off by default and why the
+recommendation is to enable it only after the telemetry page shows healthy
+empty observations.
+
+### Cooldown semantics
+
+Every successful wake records a timestamp at
+`/var/lib/palwarden-ops/knock.cooldown` *before* starting, and all three wake
+paths — a UDP knock, `palworld-knock wake`, and the `server_wake` job — respect
+the cooldown window and answer as a no-op inside it. An ordinary
+**administrative start is a deliberate override**: `systemctl start
+palworld.service` (or the shim) does not consult the cooldown, because an
+operator who starts the server means it. Never use raw root `s6-svc` commands
+as a "quick" maintenance procedure alongside the tooling — see the bypass
+boundaries below.
+
+### Lifecycle ownership and its bypass boundaries
+
+One cooperative lock, `/run/palworld-lifecycle.lock`, serializes every
+*supported* change to server state: graceful stop/restart (including the
+config-apply window between stop and start), update, restore/import, the idle
+stop, every wake, and the container's `systemctl` shim. Controllers hold it
+across their whole transaction; the knock listener leases the port under it
+(one-second leases, socket closed before the lock is released), so a supported
+manual start cannot reach the game while the listener owns the port. Outer
+job/update/backup locks are always taken *before* the lifecycle lock, never
+inside it.
+
+`/var/lib/palwarden-ops/lifecycle/state.json` records the current generation
+and whether maintenance is active. Every supported maintenance path — the
+graceful controllers, update, restore, and jobd's wrapped actions when jobd
+itself owns the lock — publishes `active` and rotates the generation *before*
+touching the service, so a queued `server_wake` is fenced against it:
+a wake enqueued before an intervening update/restore, or older than its
+15-second window, is refused at execution rather than starting the server
+blind. A job that finds the lock busy writes no state at all: the holder owns
+the marker.
+
+Publication is a prerequisite: if state initialization, abandoned-state
+escalation, or active publication fails, the controller refuses **before**
+service/world mutation, even when idle shutdown is disabled. Check free space
+and the lifecycle directory's ownership/permissions; repair the underlying
+storage/configuration rather than deleting the marker. An existing readable
+unsafe marker still permits deliberate maintenance/recovery without acknowledging
+it. A `palworld-update --check` or queued `update_check` only fetches metadata:
+its informational exit 10 (update available), or a failed check, does not rotate
+the lifecycle generation or manufacture unsafe maintenance.
+
+These are cooperative protocols, and their bypass boundaries are deliberate:
+raw `s6-svc`, external signals, container termination, and bare-metal root
+commands do **not** take the lock and are not serialized against it. An
+interrupted transaction therefore stays published: a crash or SIGKILL mid-run
+leaves `active`, a failed step leaves `unsafe`, and no ordinary writer can
+clear either — the marker is sticky until explicit recovery. After inspecting
+the server, an operator runs `python3 -m palwarden_lifecycle
+acknowledge-maintenance --confirm` as root; it clears the marker only when
+`service_state()` confirms the service is stopped/wanted-down on the live
+supervisor (crash-backoff, starting and unknown states refuse, and the command
+never starts the game). Do not clear that marker just because the lock became
+free.
+
+### Ports
+
+The listener binds the **internal** game port, UDP 8211 — the same port the
+server itself uses; only one of the two ever holds it. `PALWORLD_GAME_PORT`
+remaps the **host** side of the container's mapping; the internal port is not
+configurable (a custom internal port would need launch config, publishing and
+discovery managed together, and is unsupported in v1).
+
+### Tokens: what they are and are not
+
+Token matching is an exact UTF-8 byte comparison (<=512 bytes, no control
+characters); oversized or suffixed datagrams never match. A token is a shared
+secret, **not encryption and not replay protection**: anyone who captures one
+valid datagram can replay it to wake the server. That is an acceptable risk
+because waking is a low-impact action (cooldown bounds the rate), but it means
+the token authenticates nothing beyond "may wake the server". An empty token is
+an open doorbell: any nonempty packet on the published port wakes the server.
+No token is ever baked into the image, logged, or returned by the API.
+
+### Error recovery
+
+- Idle evidence stale/unknown/malformed: no stop, ever; the tick logs why.
+- Invalid config or cooldown file: fail closed with a bounded, actionable log.
+- Wake with REST unconfigured (`palworld-api` exit 2): reported as *started but
+  readiness NOT verified* only after confirming the service is still running —
+  never as healthy. An exited/unknown service instead produces a failure.
+- Readiness failure after a start: nonzero exit and a warning; the server is
+  left running (a failed readiness poll is not a reason to stop it).
+- Interrupted maintenance: see the unsafe marker above.
+- Notifications are best-effort: a missing or failing Discord helper can never
+  block a safe stop or wake.
+
+### Upgrade, rollback, and volume reset
+
+Keep **idle off across an upgrade** (`IDLE_TIMEOUT=0` is the default and the
+seeded value): establish healthy observation state on the telemetry page first,
+then opt in. To roll the feature back, disable it from the panel (idle timeout
+0, knock disabled) — that restores the old always-on policy without touching
+saves. **Never remove the `palwarden-ops` named volume as routine rollback**:
+it holds the saved config, the cooldown, and the lifecycle state, and deleting
+it resets all three (settings return to the `.env` seeds on the next start).
+Reverting the image, if needed, is separate from any of this.
+
 ## Short version
 
 The core service is simply:

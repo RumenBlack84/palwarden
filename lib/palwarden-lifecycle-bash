@@ -1,0 +1,105 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Brian Grant
+#
+# Shared lifecycle-lock enrollment for the bash lifecycle controllers
+# (palworld-graceful-stop, palworld-graceful-restart, palworld-update).
+#
+# Source this file, then call palworld_lifecycle_maybe_acquire with the script's
+# original "$@" BEFORE any mutation and before the script's own argument parser
+# consumes "$@".
+#
+# Contract (docs/superpowers/specs/2026-10-18-idle-shutdown-knock-wake.md,
+# section 4.1): a controller either BORROWS the lock (the acquire bridge has
+# already re-exec'd it in place, set PALWARDEN_LIFECYCLE_LOCK_FD, and left the
+# lock fd open without CLOEXEC so it survives every exec in the call chain) or
+# it ACQUIRES it by re-exec'ing itself under `palwarden_lifecycle acquire`.
+# The bridge holds the lock for the whole operation; the kernel releases it when
+# the process exits, gracefully or not.  Because every controller in the call
+# chain holds the same lock end-to-end, two concurrent lifecycle operations can
+# never overlap, and a nested controller reuses the outer lock instead of
+# deadlocking on itself.
+#
+# Help invocations never acquire (print-and-exit paths mutate nothing).
+
+# Directory containing this helper (== the directory holding
+# palwarden_lifecycle.py), captured at source time so it is correct regardless
+# of how the calling script was invoked (full path or via PATH).
+__palwarden_lc_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+
+# Wanted-down marker maintenance (idle-shutdown/knock-wake spec §4.1).
+# MEASURED on s6-overlay v3: `s6-svc -d` does NOT create a `down` file in the
+# service directory — the wanted state lives only inside supervise's binary
+# status blob. Our state classifier (palwarden_lifecycle.service_state) needs
+# a durable wanted-down signal, so EVERY container stop path must maintain
+# <svcdir>/down itself, and every start path must clear it. A down service
+# without the marker therefore means exactly "supervisor wants it up" =
+# crash-backoff, which is precisely the distinction knock/idle depend on.
+palworld_wanted_down_mark() {
+    local svcdir="${PALWARDEN_S6_SVC_DIR:-/run/service}/palworld-server"
+    mkdir -p "$svcdir" 2>/dev/null || true
+    : > "$svcdir/down" 2>/dev/null || true
+}
+
+palworld_wanted_down_clear() {
+    local svcdir="${PALWARDEN_S6_SVC_DIR:-/run/service}/palworld-server"
+    rm -f "$svcdir/down" 2>/dev/null || true
+}
+
+palworld_lifecycle_borrowed() {
+    # Is PALWARDEN_LIFECYCLE_LOCK_FD a REAL inherited lock descriptor?
+    # Never trust the variable's mere presence: a stale or forged FD_ENV
+    # must not let a controller run unlocked.  The module validates the
+    # fd itself (fstat + flock probe) — exit 0 means borrowed.
+    local libdir="${__palwarden_lc_dir:-${PALWARDEN_LIB_DIR:-/usr/local/lib}}"
+    env PYTHONPATH="${libdir}${PYTHONPATH:+:${PYTHONPATH}}" \
+        python3 -m palwarden_lifecycle borrowed >/dev/null 2>&1
+}
+
+palworld_lifecycle_maybe_acquire() {
+    # Already borrowing: the transaction is locked for this process's whole
+    # lifetime (fd inherited without CLOEXEC). Nothing to do — but only if
+    # the descriptor is genuinely ours (see palworld_lifecycle_borrowed).
+    if [[ -n "${PALWARDEN_LIFECYCLE_LOCK_FD:-}" ]]; then
+        if palworld_lifecycle_borrowed; then
+            # F1 (review follow-ups): the re-exec'd OWNER pass carries the
+            # TXN marker the acquire bridge exported. It closes its own
+            # transaction on exit — idle on success, unsafe on failure —
+            # because the kernel, not the bridge, releases the lock when
+            # this process dies.  TXN is unset immediately so every nested
+            # controller we spawn (inheriting the lock descriptor) is a
+            # plain borrower that never marks completion.  A SIGKILLed or
+            # unguarded-TERM'd owner skips the trap and leaves `active`:
+            # fail closed — wake stays fenced until acknowledge-maintenance.
+            if [[ "${PALWARDEN_LIFECYCLE_TXN:-}" == "1" ]]; then
+                unset PALWARDEN_LIFECYCLE_TXN
+                local lcpath="${__palwarden_lc_dir:-${PALWARDEN_LIB_DIR:-/usr/local/lib}}${PYTHONPATH:+:${PYTHONPATH}}"
+                # Double-quoted so lcpath bakes in NOW (a `local` would be
+                # gone when the trap fires); \$? expands at exit time.
+                trap "env PYTHONPATH=\"${lcpath}\" python3 -m palwarden_lifecycle complete \"\$?\" >/dev/null 2>&1 || true" EXIT
+            fi
+            return 0
+        fi
+        echo "palworld-lifecycle-bash: ${FD_ENV:-PALWARDEN_LIFECYCLE_LOCK_FD} is set but does not name a live lock descriptor" >&2
+        return 1
+    fi
+    # Help / usage: no mutation, so no lock — but ONLY for a bare help
+    # invocation. A mutating command that merely *contains* --help (e.g.
+    # `systemctl stop svc --help`, whose shim discards the flag and mutates
+    # anyway) must still enroll; skipping enrollment there lets the mutation
+    # run without the lock (Sol review R4).
+    if [[ $# -eq 1 && ( "$1" == "-h" || "$1" == "--help" ) ]]; then
+        return 0
+    fi
+    # Re-exec ourselves in place under the acquire bridge. Because this file is
+    # sourced (not a subshell), $0 is the calling script and "$@" is its
+    # original argument list; the bridge acquires the lock, clears CLOEXEC on
+    # the lock fd, sets FD_ENV, and exec's "$0" "$@". That re-exec'd instance
+    # reaches the guard above and returns immediately, then does the real work
+    # while holding the lock. PYTHONPATH points at this directory so the bridge
+    # can import the module.
+    local libdir="${__palwarden_lc_dir:-${PALWARDEN_LIB_DIR:-/usr/local/lib}}"
+    exec env PYTHONPATH="${libdir}${PYTHONPATH:+:${PYTHONPATH}}" \
+        python3 -m palwarden_lifecycle acquire \
+        --timeout "${PALWARDEN_LIFECYCLE_TIMEOUT:-600}" \
+        -- "$0" "$@"
+}

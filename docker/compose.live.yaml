@@ -53,8 +53,12 @@ services:
     image: palwarden-live:latest
     environment:
       # Overrides compose.yaml's ${UPDATE_ON_START:-true}. See above: the install
-      # is a deliberate one-time step, not part of a test run.
-      UPDATE_ON_START: "false"
+      # is a deliberate one-time step, not part of a test run. Interpolated, not
+      # literal: a literal "false" here would beat the documented
+      # `UPDATE_ON_START=true ... up` install command (a later -f file's literal
+      # environment value wins over an earlier file's interpolation), so the
+      # one-time install could never run. Ordinary runs get the pinned default.
+      UPDATE_ON_START: ${UPDATE_ON_START:-false}
     # Compose merges service volumes by target path, so these two replace the
     # named volumes at the same mount points and leave the rest alone.
     #

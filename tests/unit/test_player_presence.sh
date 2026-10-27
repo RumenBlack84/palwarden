@@ -235,4 +235,278 @@ out="$(python3 "$FPS" --db "$EMPTY_DB" playtime 2>&1)"; rc=$?
 assert_eq "$rc" "0" "playtime on an empty DB exits 0"
 assert_contains "$out" "No players" "an empty DB is a message, not a traceback"
 
+# ==============================================================================
+# Task 4 (idle-shutdown/knock-wake spec §5.1): presence_state singleton and the
+# observation sequence fence. Idle eligibility must rest on POSITIVE, fresh,
+# schema-valid empty observations — never on identity history.
+# ==============================================================================
+
+# Fresh DB: the singleton is created unknown (valid=0, empty_since NULL).
+q_db() { # <db> <sql> -> first row, pipe-joined, NULL as empty
+  python3 - "$1" "$2" <<'PYQ'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+rows = con.execute(sys.argv[2]).fetchall()
+print("|".join("" if c is None else str(c) for c in rows[0]) if rows else "NOROW")
+PYQ
+}
+FDB="$WORK/fresh_presence.sqlite3"
+python3 "$FPS" --db "$FDB" playtime >/dev/null 2>&1
+fstate="$(q_db "$FDB" 'SELECT valid, empty_since_ms, last_success_ms FROM presence_state;')"
+assert_eq "$fstate" "0||" "a fresh DB has presence_state unknown: valid=0, empty_since NULL, no last success"
+
+# Additive migration: a pre-Task-4 DB (identity/session rows, never sampled by
+# the new code) gains the singleton WITHOUT touching playtime data, and begins
+# UNKNOWN — historical identities alone must never initialize trusted emptiness.
+MDB="$WORK/migration.sqlite3"
+python3 "$FPS" --db "$MDB" playtime >/dev/null 2>&1
+python3 - "$MDB" <<'PY'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+# Simulate a pre-Task-4 DB: drop the singleton this build just added, leave
+# historical presence rows behind.
+con.execute("DROP TABLE presence_state")
+con.execute("INSERT INTO player_identity VALUES ('OLDUID',NULL,'Ancient',10,1000,2000,60000)")
+con.execute("INSERT INTO player_sessions VALUES ('OLDUID',1000,2000,5)")
+con.commit()
+PY
+before_identities="$(python3 - "$MDB" <<'PY'
+import sqlite3, sys
+print(sqlite3.connect(sys.argv[1]).execute("SELECT COUNT(*) FROM player_identity").fetchone()[0])
+PY
+)"
+before_total="$(python3 - "$MDB" <<'PY'
+import sqlite3, sys
+print(sqlite3.connect(sys.argv[1]).execute("SELECT SUM(total_play_ms) FROM player_identity").fetchone()[0])
+PY
+)"
+python3 "$FPS" --db "$MDB" playtime >/dev/null 2>&1
+assert_eq "$(q_db "$MDB" 'SELECT COUNT(*) FROM presence_state;')" "1" "migration adds exactly one presence_state row"
+assert_eq "$(q_db "$MDB" 'SELECT valid, empty_since_ms FROM presence_state;')" "0|" "a migrated DB with history begins unknown, not trusted-empty"
+assert_eq "$(python3 - "$MDB" <<'PY'
+import sqlite3, sys
+print(sqlite3.connect(sys.argv[1]).execute("SELECT COUNT(*) FROM player_identity").fetchone()[0])
+PY
+)" "$before_identities" "migration keeps every identity row"
+assert_eq "$(python3 - "$MDB" <<'PY'
+import sqlite3, sys
+print(sqlite3.connect(sys.argv[1]).execute("SELECT SUM(total_play_ms) FROM player_identity").fetchone()[0])
+PY
+)" "$before_total" "migration keeps all playtime"
+
+# --- empty-evidence lifecycle through the real sampler ------------------------
+# Seed a clean DB: one recent valid empty observation.
+EDB="$WORK/empty_evidence.sqlite3"
+printf '{"players": []}\n' > "$WORK/players.json"
+rm -f "$WORK/players.fail"
+env PALWORLD_API_BIN="$WORK/bin/palworld-api" \
+  python3 "$FPS" --db "$EDB" sample >/dev/null 2>&1
+state="$(q_db "$EDB" 'SELECT valid, empty_since_ms IS NOT NULL, last_success_ms IS NOT NULL FROM presence_state;')"
+assert_eq "$state" "1|1|1" "a valid empty observation sets valid=1, starts empty_since, records last_success"
+first_empty="$(q_db "$EDB" 'SELECT empty_since_ms FROM presence_state;')"
+
+# A second empty within the 60 s freshness window PRESERVES empty_since.
+sleep 0.2
+env PALWORLD_API_BIN="$WORK/bin/palworld-api" python3 "$FPS" --db "$EDB" sample >/dev/null 2>&1
+assert_eq "$(q_db "$EDB" 'SELECT empty_since_ms FROM presence_state;')" "$first_empty" \
+  "consecutive fresh empties preserve empty_since (interval continues)"
+
+# A stale gap (>60 s since last success) restarts the empty interval now.
+STALE_MS=$(( $(date +%s) * 1000 - 120000 ))
+python3 - "$EDB" "$STALE_MS" <<'PY'
+import sqlite3, sys
+stale = int(sys.argv[2])
+con = sqlite3.connect(sys.argv[1])
+con.execute("UPDATE presence_state SET last_success_ms=?, empty_since_ms=?", (stale, stale))
+con.commit()
+PY
+printf '{"players": []}\n' > "$WORK/players.json"
+env PALWORLD_API_BIN="$WORK/bin/palworld-api" python3 "$FPS" --db "$EDB" sample >/dev/null 2>&1
+new_empty="$(q_db "$EDB" 'SELECT empty_since_ms FROM presence_state;')"
+# window: (stale, stale + 125s) — 'now' is within ~1s of stale+120s; the bound
+# only has to exclude the stale value itself and any far-future timestamp.
+assert_eq "$(python3 -c "now=int('$new_empty'); print(now > $STALE_MS and now < $STALE_MS + 125000)")" "True" \
+  "a stale gap restarts the empty interval at now (not the stale value, not the future)"
+
+# A future last_success_ms is not trusted as fresh either.
+FUTURE_MS=$(( $(date +%s) * 1000 + 3600000 ))
+python3 - "$EDB" "$FUTURE_MS" <<'PY'
+import sqlite3, sys
+future = int(sys.argv[2])
+con = sqlite3.connect(sys.argv[1])
+con.execute("UPDATE presence_state SET last_success_ms=?, empty_since_ms=?", (future, future))
+con.commit()
+PY
+printf '{"players": []}\n' > "$WORK/players.json"
+env PALWORLD_API_BIN="$WORK/bin/palworld-api" python3 "$FPS" --db "$EDB" sample >/dev/null 2>&1
+new_empty="$(q_db "$EDB" 'SELECT empty_since_ms FROM presence_state;')"
+assert_eq "$(python3 -c "print(int('$new_empty') < $FUTURE_MS)")" "True" \
+  "a future last_success_ms is not treated as fresh; the interval restarts at now"
+
+# An occupied observation clears empty continuity (valid stays 1).
+player_json "022E0173000000000000000000000000" "Snax" 80 > "$WORK/players.json"
+env PALWORLD_API_BIN="$WORK/bin/palworld-api" python3 "$FPS" --db "$EDB" sample >/dev/null 2>&1
+assert_eq "$(q_db "$EDB" 'SELECT valid, empty_since_ms IS NULL FROM presence_state;')" "1|1" \
+  "an occupied observation clears empty_since while staying valid"
+
+# A loading placeholder counts as OCCUPIED: the list is nonempty even though no
+# identity is created — identity filtering must not classify it as empty.
+printf '{"players": [{"name": "Grimnyr", "playerId": "None", "userId": "steam_x", "level": 1}]}\n' > "$WORK/players.json"
+env PALWORLD_API_BIN="$WORK/bin/palworld-api" python3 "$FPS" --db "$EDB" sample >/dev/null 2>&1
+assert_eq "$(q_db "$EDB" 'SELECT valid, empty_since_ms IS NULL FROM presence_state;')" "1|1" \
+  "a loading-placeholder list is occupied, not an empty server"
+ids_before="$(q_db "$EDB" 'SELECT COUNT(*) FROM player_identity;')"
+assert_eq "$ids_before" "1" "the placeholder still created no identity"
+
+# --- invalidation: every failure mode poisons the well ------------------------
+run_invalidate_case() { # $1 = description
+  local desc="$1"
+  env PALWORLD_API_BIN="$WORK/bin/palworld-api" python3 "$FPS" --db "$EDB" sample >/dev/null 2>&1
+  assert_eq "$(q_db "$EDB" 'SELECT valid, empty_since_ms FROM presence_state;')" "0|" \
+    "$desc invalidates state and clears empty_since"
+  # and the NEXT empty success must start a NEW interval, not resume the old one
+  printf '{"players": []}\n' > "$WORK/players.json"
+  rm -f "$WORK/players.fail"
+  env PALWORLD_API_BIN="$WORK/bin/palworld-api" python3 "$FPS" --db "$EDB" sample >/dev/null 2>&1
+  assert_eq "$(q_db "$EDB" 'SELECT valid, empty_since_ms IS NOT NULL FROM presence_state;')" "1|1" \
+    "$desc: the next empty success starts a fresh interval"
+}
+
+# fetch_players must be STRICT: these are errors, never a silent [].
+touch "$WORK/players.fail"; run_invalidate_case "A players fetch failure"
+printf 'not json at all\n' > "$WORK/players.json"; run_invalidate_case "Malformed JSON"
+printf '{"currentplayernum": 0}\n' > "$WORK/players.json"; run_invalidate_case "A missing players field"
+printf '{"players": {"0": {}}}\n' > "$WORK/players.json"; run_invalidate_case "A non-list players field"
+printf '{"players": ["Snax is online"]}\n' > "$WORK/players.json"; run_invalidate_case "A non-object list entry"
+printf '{"players": [null]}\n' > "$WORK/players.json"; run_invalidate_case "A null list entry"
+
+# A failed presence pass never crashes the sampler and never stops future
+# observations: after all the failures above, a healthy empty tick works.
+out="$(env PALWORLD_API_BIN="$WORK/bin/palworld-api" python3 "$FPS" --db "$EDB" sample 2>&1)"; rc=$?
+assert_eq "$rc" "0" "the sampler survives the whole failure gauntlet"
+assert_eq "$(q_db "$EDB" 'SELECT valid FROM presence_state;')" "1" "healthy observations resume after failures"
+
+# Metrics failure must not poison presence evidence (independence preserved).
+before_valid="$(q_db "$EDB" 'SELECT valid FROM presence_state;')"
+touch "$WORK/metrics.fail"
+out="$(env PALWORLD_API_BIN="$WORK/bin/palworld-api" python3 "$FPS" --db "$EDB" sample 2>&1)"; rc=$?
+rm -f "$WORK/metrics.fail"
+assert_eq "$rc" "0" "a metrics failure still exits 0 with presence evidence intact"
+assert_eq "$(q_db "$EDB" 'SELECT valid FROM presence_state;')" "$before_valid" \
+  "metrics failure is independent of presence validity"
+
+# --- the observation sequence fence (module-level) -----------------------------
+# An older reserved-but-slow observation must never overwrite a newer applied
+# one, and a superseded occupied result must not retroactively extend playtime.
+FENCE_DB="$WORK/fence.sqlite3"
+out="$(PYTHONPATH="$DIR/../../lib" python3 - "$FENCE_DB" <<'PY' 2>&1
+import sqlite3, sys
+import palwarden_presence as presence
+
+con = sqlite3.connect(sys.argv[1])
+presence.create_schema(con)
+
+s1 = presence.reserve_observation(con)
+s2 = presence.reserve_observation(con)
+assert s2 > s1, f"sequences must increase: {s1} then {s2}"
+
+# s2 (occupied) applies first, out of order.
+r2 = presence.apply_observation(con, s2, True,
+                                [{"playerId": "A", "name": "Ada", "level": 1}],
+                                at_ms=2_000_000)
+assert r2["applied"], "newest sequence must apply"
+assert r2["seen"] == 1, "occupied observation counts one player"
+
+# s1 (empty, reserved earlier, delivered late) is superseded: refused.
+r1 = presence.apply_observation(con, s1, True, [], at_ms=1_999_000)
+assert not r1["applied"], "an older sequence must never overwrite a newer applied one"
+
+row = con.execute("SELECT valid, empty_since_ms FROM presence_state").fetchone()
+assert row[0] == 1 and row[1] is None, f"state must still reflect the occupied s2: {row}"
+
+# The superseded occupied result must not extend playtime either.
+r3 = presence.apply_observation(con, 1, True,
+                                [{"playerId": "A", "name": "Ada", "level": 2}],
+                                at_ms=3_000_000)
+assert not r3["applied"], "sequence 1 is older than the applied counter; refuse"
+ident = con.execute("SELECT last_seen_ms, total_play_ms FROM player_identity WHERE player_uid='A'").fetchone()
+assert ident[0] == 2_000_000, f"superseded result must not move last_seen: {ident}"
+
+# invalidate() poisons the well; a later reserved observation refreshes it.
+presence.invalidate(con)
+row = con.execute("SELECT valid, empty_since_ms FROM presence_state").fetchone()
+assert row[0] == 0 and row[1] is None, f"invalidate must clear validity and empty_since: {row}"
+
+s4 = presence.reserve_observation(con)
+r4 = presence.apply_observation(con, s4, True, [], at_ms=2_600_000)
+assert r4["applied"], "a fresh reservation applies after invalidation"
+row = con.execute("SELECT valid, empty_since_ms, last_success_ms FROM presence_state").fetchone()
+assert row == (1, 2_600_000, 2_600_000), f"fresh empty after invalidate starts the interval now: {row}"
+
+# counters are exposed alongside the singleton
+alloc, applied = con.execute("SELECT allocated_seq, applied_seq FROM presence_state").fetchone()
+assert alloc >= applied and applied >= s2, f"counters must track: allocated={alloc} applied={applied}"
+print("FENCE_OK")
+PY
+)"
+assert_contains "$out" "FENCE_OK" "sequence fence: out-of-order apply refused, playtime not extended, invalidate/refresh coherent (output: $out)"
+
+# ==============================================================================
+# F3 (review follow-up): strict API JSON parsing, shared by sampler and watcher.
+# The reviewer's exact reproductions: a top-level array and duplicate keys must
+# be parse ERRORS — never a silently-empty player list.
+# ==============================================================================
+parse_out="$(PYTHONPATH="$DIR/../../lib" python3 - <<'PY'
+import palwarden_presence as p
+cases = [
+    ('[{"players": []}]', False),                          # top-level array
+    ('{"players": [{"playerId": "A"}], "players": []}', False),  # dup keys
+    ('{"players": []} trailing', False),                   # trailing garbage
+    ('{"players": []}', True),                             # legitimate empty
+    ('{"players": {"a": 1}}', False),                      # wrong shape
+    ('{"meta": {"a": 1, "a": 2}, "players": []}', False),  # nested dup keys
+    ('not json', False),
+    ('', False),
+]
+bad = []
+for text, want_ok in cases:
+    try:
+        p.validate_players_payload(p.parse_api_json(text))
+        ok = True
+    except p.PresencePayloadError:
+        ok = False
+    except Exception as e:
+        ok = "unexpected %r" % (e,)
+    if ok is not want_ok:
+        bad.append((text, want_ok, ok))
+print("PARSE_OK" if not bad else "PARSE_BAD %s" % (bad,))
+PY
+)"
+assert_contains "$parse_out" "PARSE_OK" "strict API JSON parser ($parse_out)"
+
+# The sampler must treat the same payloads as FAILED passes: invalidate the
+# idle evidence, never record an empty observation.
+printf '[{"players": []}]\n' > "$WORK/players.json"
+out="$(sample 2>&1)"; rc=$?
+assert_eq "$rc" "0" "sample survives a top-level-array players payload (rc=$rc)"
+assert_contains "$out" "presence pass failed" \
+  "array payload is reported as a failed presence pass (got: $out)"
+assert_eq "$(q 'SELECT valid FROM presence_state;')" "0" \
+  "array payload invalidates presence evidence (never counts as empty)"
+
+printf '{"players": [{"playerId": "A"}], "players": []}\n' > "$WORK/players.json"
+out="$(sample 2>&1)"; rc=$?
+assert_eq "$rc" "0" "sample survives duplicate-key players payload (rc=$rc)"
+assert_contains "$out" "presence pass failed" \
+  "duplicate keys are an error, not a last-wins empty list (got: $out)"
+assert_eq "$(q 'SELECT valid FROM presence_state;')" "0" \
+  "duplicate-key payload invalidates presence evidence"
+
+# A legitimate empty object still records a valid empty observation.
+printf '{"players": []}\n' > "$WORK/players.json"
+out="$(sample 2>&1)"; rc=$?
+assert_eq "$rc" "0" "sample handles the legitimate empty response (rc=$rc)"
+assert_eq "$(q 'SELECT valid FROM presence_state;')" "1" \
+  "legitimate empty response stays a valid observation"
+
 assert_report

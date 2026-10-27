@@ -46,6 +46,7 @@ import socketserver
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.parse
 from pathlib import Path
 
@@ -60,6 +61,12 @@ import palwarden_jobs as jobs  # noqa: E402
 # (palworld-restore, palwarden-jobd) decides the same thing again about the same
 # bytes. Two copies of ARCHIVE_RE would drift and only one would get the next fix.
 import palwarden_archive as archive  # noqa: E402
+# Same single-implementation rule for the wake fence's inputs: the lifecycle
+# state/generation this server reads at wake admission is the exact file the
+# root worker and the controllers write, and the ops config this server
+# resolves for GET /api/palwarden-config is the exact file the worker saves.
+import palwarden_lifecycle as lc  # noqa: E402
+import palwarden_ops as ops  # noqa: E402
 
 WEBUI_ENV = Path(os.environ.get("PALWARDEN_WEBUI_ENV", "/etc/palworld/webui.env"))
 
@@ -457,6 +464,37 @@ def find_blocking_job(actions: frozenset[str]) -> dict | None:
     return candidates[-1]
 
 
+def wake_admission(jobd) -> tuple[dict | None, str | None]:
+    """Admission-time half of the wake fence (spec §4.4, plan Task 8).
+
+    A wake is admitted only against a *confirmed idle* lifecycle and only with
+    no disruptive job queued or running ahead of it (jobd is serial, so a wake
+    behind an update would otherwise execute as a delayed wake after it). The
+    generation and the 15-second expiry it binds to are minted HERE, from the
+    state file, never from the request: this is a freshness fence, not an
+    authorization credential. Missing state reads `unknown` and a corrupt file
+    raises — both refuse admission (fail closed); the execution-time re-checks
+    in jobd and under wake's own ownership cover the window after admission.
+    """
+    try:
+        state = lc.read_state()
+    except lc.LifecycleError as exc:
+        return None, f"lifecycle state unreadable, wake not admitted: {exc}"
+    if state["status"] != "idle":
+        return None, (f"lifecycle status is {state['status']}, not idle; "
+                      "wake not admitted")
+    generation = state["generation"]
+    if not isinstance(generation, str) or not generation:
+        return None, "lifecycle generation is unknown; wake not admitted"
+    blocker = find_blocking_job(disruptive_actions(jobd))
+    if blocker is not None:
+        return None, (f"a disruptive job is queued or running: "
+                      f"{blocker['action']} {blocker['id']} "
+                      f"({blocker.get('state')}); wake not admitted")
+    return ({"wake_generation": generation,
+             "wake_expires_at": int(time.time()) + jobd.WAKE_EXPIRY_SECONDS}), None
+
+
 def check_jobs_dir() -> str | None:
     """Return None if the queue directory is usable, else why it is not.
 
@@ -760,6 +798,19 @@ def ep_backup_schedule(_query: dict) -> dict:
     return result
 
 
+def ep_palwarden_config(_query: dict) -> dict:
+    """GET /api/palwarden-config: the four non-secret values + token_configured.
+
+    resolve() re-reads the file on every call, so a saved change is visible
+    without restarting this process (spec §7.2 live reload). An unreadable or
+    malformed config raises ConfigError and the route wrapper answers 500 —
+    fail closed rather than present defaults as if they were the truth. The
+    public view carries neither the token nor a redaction sentinel; the token
+    is reported only as the boolean token_configured (spec §7.3).
+    """
+    return {"ok": True, "data": ops.public_view(ops.resolve())}
+
+
 # `[^/]+` and then percent-decoded, in that order: a name containing a real slash
 # never matches (it falls through to the unknown-endpoint 404), and an *encoded*
 # one decodes to something valid_archive_name refuses. The raw path is matched
@@ -778,6 +829,7 @@ READ_ENDPOINTS = {
     "/api/backups": ep_backups,
     "/api/snapshots": ep_snapshots,
     "/api/backup-schedule": ep_backup_schedule,
+    "/api/palwarden-config": ep_palwarden_config,
 }
 
 
@@ -1310,10 +1362,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send_json(400, {"ok": False,
                                   "error": f"{action!r} is not an allowed action"})
             return
+        # The wake fence fields are minted by the server from the state file;
+        # a caller that supplies its own generation or expiry is forging
+        # freshness, so it is refused outright rather than silently replaced.
+        if action == "server_wake":
+            supplied = sorted(k for k in params if k in jobd.WAKE_INTERNAL_FIELDS)
+            if supplied:
+                self._send_json(400, {
+                    "ok": False,
+                    "error": ("server_wake fields are minted by the server, "
+                              "never supplied by the caller: "
+                              + ", ".join(supplied))})
+                return
         normalised, error = jobd.validate_params(action, params)
         if error is not None:
             self._send_json(400, {"ok": False, "error": error})
             return
+
+        if action == "server_wake":
+            admission, admission_error = wake_admission(jobd)
+            if admission_error is not None:
+                self._send_json(409, {"ok": False, "error": admission_error})
+                return
+            normalised.update(admission)
 
         # Only disruptive jobs serialise against each other: a queued backup or
         # snapshot must not stand in the way of a restart the operator wants.
@@ -1345,7 +1416,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send_json(500, {"ok": False,
                                   "error": f"cannot write the job file: {exc.strerror}"})
             return
-        self._send_json(202, {"ok": True, "id": job["id"]})
+        # The response goes through the one public serializer even though it
+        # carries only the id today: routing every job-bearing response through
+        # public_job means there is no path that can forget to redact later.
+        self._send_json(202, {"ok": True, "id": jobs.public_job(job)["id"]})
 
     # --- routes -----------------------------------------------------------
     def do_GET(self) -> None:  # noqa: N802 - stdlib naming
@@ -1439,8 +1513,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _send_jobs(self, path: str) -> None:
         if path == "/api/jobs":
             # Same window find_blocking_job uses, so a job that can 409 a
-            # request is always visible here.
-            self._send_json(200, {"ok": True, "data": jobs.list_jobs(limit=JOBS_LIST_LIMIT)})
+            # request is always visible here. Every entry passes through the
+            # one public serializer: a queued config-save job's token is
+            # redacted in the browser view while the raw file keeps it for
+            # the worker (spec §7.3).
+            self._send_json(200, {"ok": True,
+                                  "data": [jobs.public_job(job)
+                                           for job in jobs.list_jobs(
+                                               limit=JOBS_LIST_LIMIT)]})
             return
         job_id = urllib.parse.unquote(path[len("/api/jobs/"):])
         # read_job returns None for a missing, corrupt or invalidly-named id, so a
@@ -1449,7 +1529,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if job is None:
             self._send_json(404, {"ok": False, "error": "unknown job"})
             return
-        self._send_json(200, {"ok": True, "data": job})
+        self._send_json(200, {"ok": True, "data": jobs.public_job(job)})
 
     def do_POST(self) -> None:  # noqa: N802
         if not self._authenticated():
@@ -1476,6 +1556,76 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._note_client_gone("enqueueing a job", exc)
         except Exception as exc:  # never leak a traceback to the browser
             self._send_json_safely(500, {"ok": False, "error": f"internal error: {exc}"})
+
+    def do_PUT(self) -> None:  # noqa: N802
+        if not self._authenticated():
+            return
+        path = urllib.parse.urlparse(self.path).path
+        if path != "/api/palwarden-config":
+            self._reject(404, "unknown endpoint")
+            return
+        try:
+            self._save_palwarden_config()
+        except CLIENT_GONE as exc:
+            self._note_client_gone("saving the palwarden config", exc)
+        except Exception as exc:  # never leak a traceback to the browser
+            self._send_json_safely(500, {"ok": False,
+                                         "error": f"internal error: {exc}"})
+
+    def _save_palwarden_config(self) -> None:
+        """PUT /api/palwarden-config: queue a palwarden_config_save job.
+
+        The body is the partial config object itself: omitted keys keep their
+        current value, and an omitted KNOCK_TOKEN keeps the stored token
+        (spec §7.2). Everything else deliberately mirrors POST /api/jobs —
+        the same mutation checks (token header, origin, body cap), the same
+        root-owned validators (jobd.validate_params, so the worker re-checks
+        the same rules from scratch), and the same job handle back (202 + id,
+        polled at /api/jobs/<id>). The response never carries the submitted
+        token, and the queued job file is the only place it lives.
+        """
+        if not check_token(self.headers, self.credentials):
+            self._reject(403, f"missing or invalid {TOKEN_HEADER} header")
+            return
+        if not origin_ok(self.headers):
+            self._reject(403, "cross-origin request refused")
+            return
+        if self.jobs_dir_error:
+            self._reject(500, self.jobs_dir_error)
+            return
+        body, error = self._read_body()
+        if error is not None:
+            self._reject(400, error)
+            return
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except ValueError:  # covers UnicodeDecodeError and JSONDecodeError
+            self._send_json(400, {"ok": False, "error": "body must be UTF-8 JSON"})
+            return
+        if not isinstance(payload, dict):
+            self._send_json(400, {"ok": False,
+                                  "error": "body must be a JSON object of config keys"})
+            return
+        try:
+            jobd = load_jobd_module()
+        except Exception as exc:  # a broken install must not leak a traceback
+            self._send_json(500, {"ok": False,
+                                  "error": f"cannot load the job validators: {exc}"})
+            return
+        normalised, error = jobd.validate_params(
+            "palwarden_config_save", {"settings": payload})
+        if error is not None:
+            # validate_params errors name the key and the violation, never the
+            # value, so this echo cannot leak a submitted token.
+            self._send_json(400, {"ok": False, "error": error})
+            return
+        try:
+            job = jobs.create_job("palwarden_config_save", normalised)
+        except OSError as exc:
+            self._send_json(500, {"ok": False,
+                                  "error": f"cannot write the job file: {exc.strerror}"})
+            return
+        self._send_json(202, {"ok": True, "id": jobs.public_job(job)["id"]})
 
     # --- logging: request lines only, never headers -----------------------
     def log_message(self, fmt: str, *args) -> None:

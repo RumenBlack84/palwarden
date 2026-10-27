@@ -11,6 +11,7 @@ source "$DIR/../lib/assert.sh"
 UPDATE="$DIR/../../sbin/palworld-update"
 
 WORK="$(mktemp -d)"
+export PALWARDEN_LIFECYCLE_STATE_DIR="$WORK/lifecycle-state"
 trap 'rm -rf "$WORK"' EXIT
 
 mkdir -p "$WORK/steamapps"
@@ -39,6 +40,7 @@ set_local_build() { printf '"AppState"\n{\n\t"buildid"\t\t"%s"\n}\n' "$1" > "$WO
 
 run_update() {
   PALWORLD_INSTALL_DIR="$WORK" PALWORLD_STEAMCMD="$WORK/steamcmd" PALWORLD_DROP_PRIV="" \
+  PALWARDEN_LIFECYCLE_LOCK="$WORK/lifecycle.lock" \
     bash "$UPDATE" "$@"
 }
 

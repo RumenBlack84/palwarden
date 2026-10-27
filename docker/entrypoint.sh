@@ -182,6 +182,49 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Idle-shutdown / knock-wake ops state (spec §7.1, plan Task 10).
+#
+# The ops file is the single source of truth for the five idle/knock knobs and
+# lives on the dedicated palwarden-ops volume (image + compose point
+# PALWARDEN_OPS_FILE at it; the cooldown file defaults beside it). Docker seeds
+# a fresh volume from the image path — root:steam 0750, which is exactly what
+# the layout needs (root writes, the steam web UI reads the 0640 file) — so
+# there is deliberately NO runtime chown/chmod here: a recursive chown of a
+# mounted volume is banned (runbook §11), and chmodding/chowning a path we have
+# not validated would follow a planted symlink. A wrong-shaped directory is an
+# actionable boot failure instead.
+OPS_DIR="$(dirname "${PALWARDEN_OPS_FILE:-/etc/palworld/palwarden.env}")"
+if [[ ! -d "$OPS_DIR" ]]; then
+  log "ERROR: ops directory $OPS_DIR is missing or not a directory (fresh volume should inherit root:steam 0750 from the image path)." >&2
+  exit 65
+fi
+# Seed IF ABSENT through the shared Python renderer — never a second bash
+# serializer. An existing file is never re-rendered (changed compose seeds do
+# not override browser-saved values) but IS validated: an invalid file fails
+# the boot visibly rather than silently enabling knock (fail closed).
+if ! ops_seed_msg="$(python3 -m palwarden_ops seed 2>&1)"; then
+  log "ERROR: ops config seeding failed — fix the IDLE_*/KNOCK_* environment seeds or the file, or delete it to re-seed:" >&2
+  log "  $ops_seed_msg" >&2
+  exit 65
+fi
+log "ops config: $ops_seed_msg"
+# Root-first runtime initialization (plan Task 2 finding F3): the state dir
+# under the root-owned ops volume must exist before the steam web UI reads it,
+# and the idle generation rotates so a wake admitted by the previous runtime
+# cannot execute after this boot. An active/unsafe maintenance marker survives
+# untouched and keeps inhibiting wake until acknowledged.
+# A fresh container boot is wanted-up: clear any stale wanted-down marker
+# (s6-svc creates none; WE maintain <svcdir>/down — see lifecycle-bash lib),
+# otherwise the first service_state() would read the old stop as still wanted.
+rm -f "/run/service/palworld-server/down" 2>/dev/null || true
+if ! lifecycle_init="$(python3 -m palwarden_lifecycle init-runtime --json 2>&1)"; then
+  log "ERROR: lifecycle runtime initialization failed (fail closed — wake admission needs trustworthy state):" >&2
+  log "  $lifecycle_init" >&2
+  exit 65
+fi
+log "lifecycle runtime initialized: $lifecycle_init"
+
+# ---------------------------------------------------------------------------
 # Select which s6 services run this boot (idempotent across restarts).
 # ---------------------------------------------------------------------------
 mkdir -p "$S6_USER_CONTENTS"
@@ -194,7 +237,9 @@ rm -f "$S6_USER_CONTENTS"/palworld-server \
       "$S6_USER_CONTENTS"/public-info-watch \
       "$S6_USER_CONTENTS"/service-events \
       "$S6_USER_CONTENTS"/jobd \
-      "$S6_USER_CONTENTS"/backup-auto
+      "$S6_USER_CONTENTS"/backup-auto \
+      "$S6_USER_CONTENTS"/palworld-knock \
+      "$S6_USER_CONTENTS"/idle-watch
 enable_service() { : > "$S6_USER_CONTENTS/$1"; log "service enabled: $1"; }
 
 if [[ "$MODE" == "embedded" ]]; then
@@ -287,6 +332,16 @@ if [[ "$MODE" == "embedded" ]]; then
   # unconditionally: a missing pyooz codec is the tool's own degraded state,
   # reported through the snapshot, not a reason to gate the service.
   enable_service player-stats
+
+  # Idle-shutdown watcher + UDP knock listener (spec §7.2): ALWAYS supervised
+  # in embedded mode, deliberately NOT gated on IDLE_TIMEOUT/KNOCK_ENABLED.
+  # Each helper re-reads the ops config continuously and decides per tick /
+  # per lease, so enabling or disabling either from the browser takes effect
+  # live — no service toggle, no recreate. Idle ships off (IDLE_TIMEOUT=0);
+  # knock ships on. Neither runs in external mode: there is no local s6
+  # service to stop or wake.
+  enable_service palworld-knock
+  enable_service idle-watch
 
   # Upgrade guard for the release that moved /opt/palworld/backups onto its own
   # volume. Before it, archives lived in the container's writable layer, which

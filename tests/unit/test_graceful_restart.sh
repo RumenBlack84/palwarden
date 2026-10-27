@@ -19,6 +19,7 @@ source "$DIR/../lib/assert.sh"
 TOOL="$DIR/../../sbin/palworld-graceful-restart"
 
 WORK="$(mktemp -d)"
+export PALWARDEN_LIFECYCLE_STATE_DIR="$WORK/lifecycle-state"
 trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/bin"
 LOG="$WORK/order.log"
@@ -56,6 +57,7 @@ chmod +x "$WORK/bin/"*
 
 restart() {  # restart <extra flags...>
   PATH="$WORK/bin:$PATH" PALWARDEN_CONTAINER=1 \
+  PALWARDEN_LIFECYCLE_LOCK="$WORK/lifecycle.lock" \
   PALWORLD_API_BIN="$WORK/bin/palworld-api" \
   PALWORLD_APPLY_BIN="${APPLY_BIN_OVERRIDE:-$WORK/bin/apply-ok}" \
   PALWARDEN_ENGINE_CONFIG_BIN="$WORK/bin/engine-ok" \

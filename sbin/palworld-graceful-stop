@@ -6,6 +6,30 @@ source /usr/local/lib/palworld-notify 2>/dev/null || true
 # Notifications are optional: no-op when the helper isn't installed, rather than
 # aborting on "command not found".
 declare -F palworld_notify >/dev/null || palworld_notify() { :; }
+
+# Task 3 (idle-shutdown/knock-wake): shared lifecycle lock. Acquire-or-reuse the
+# lock before any mutation so concurrent stop/restart/update/restore operations
+# serialize. Sourced optionally (no-op when not installed, e.g. a bare dev
+# checkout); must run before the arg parser below consumes "$@".
+# See lib/palwarden-lifecycle-bash and spec section 4.1.
+# Find the helper: explicit PALWARDEN_LIB_DIR, else the sibling lib/ of a dev
+# checkout (sbin/../lib), else the installed /usr/local/lib. When the helper
+# genuinely isn't installed anywhere (a bare checkout without it), fall back to
+# a no-op; when it IS found but the lock cannot be taken, maybe_acquire fails
+# loudly — enrollment never degrades silently to unlocked.
+_pw_lc_helper="${PALWARDEN_LIB_DIR:-}"
+if [[ -z "$_pw_lc_helper" ]]; then
+  _pw_lc_cand="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" 2>/dev/null && pwd)" || _pw_lc_cand=""
+  if [[ -n "$_pw_lc_cand" && -f "$_pw_lc_cand/palwarden-lifecycle-bash" ]]; then
+    _pw_lc_helper="$_pw_lc_cand"
+  else
+    _pw_lc_helper=/usr/local/lib
+  fi
+fi
+source "$_pw_lc_helper/palwarden-lifecycle-bash" 2>/dev/null || true
+declare -F palworld_lifecycle_maybe_acquire >/dev/null \
+  || palworld_lifecycle_maybe_acquire() { :; }
+palworld_lifecycle_maybe_acquire "$@"
 waittime=300
 message="Server maintenance: saving and stopping in 5 minutes."
 while [[ $# -gt 0 ]]; do
@@ -22,6 +46,14 @@ if [[ "${PALWARDEN_CONTAINER:-0}" == "1" ]]; then
   PATH="/command:$PATH"   # ensure s6 tools are reachable
   svcdir="${PALWARDEN_S6_SVC_DIR:-/run/service}/palworld-server"
   palworld_notify start "graceful stop requested (container); bringing the server service down (SIGINT save)."
+  # Mark wanted-down BEFORE the stop: s6-svc -d creates no marker file, and
+  # idle-watch/knock classify stopped vs crash-backoff by its presence.
+  if declare -F palworld_wanted_down_mark >/dev/null; then
+      palworld_wanted_down_mark
+  else
+      mkdir -p "$svcdir" 2>/dev/null || true
+      : > "$svcdir/down" 2>/dev/null || true
+  fi
   s6-svc -wD -d "$svcdir"
   palworld_notify success "server service stopped (container)."
   echo "server service stopped."

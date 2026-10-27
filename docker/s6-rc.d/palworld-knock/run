@@ -1,0 +1,18 @@
+#!/command/with-contenv bash
+# shellcheck shell=bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Brian Grant
+#
+# UDP knock listener (idle-shutdown/knock-wake spec §4.2, §6). Longrun, NOT a
+# palwarden-run-periodic timer: the listener holds bounded leases on the game
+# port and must react to packets, not ticks.
+#
+# Runs as ROOT (no s6-setuidgid, like jobd/memory-watch): waking the server
+# means starting its s6 service, which requires s6 service control, and the
+# wake path takes the shared lifecycle lock the root controllers hold
+# (update/restore/graceful-restart). KNOCK_ENABLED is NOT an entrypoint
+# service gate — the listener decides enablement per lease and reloads the
+# ops config continuously, so toggling knock from the browser needs no
+# service or container restart (spec §7.2). When disabled it closes the
+# socket by the next lease boundary and idles.
+exec /usr/local/sbin/palworld-knock daemon

@@ -29,10 +29,12 @@ PORT_OH=18095
 PID=""
 PID_RO=""
 PID_OH=""
+PID2=""
 cleanup() {
   [ -n "$PID" ] && kill "$PID" 2>/dev/null
   [ -n "$PID_RO" ] && kill "$PID_RO" 2>/dev/null
   [ -n "$PID_OH" ] && kill "$PID_OH" 2>/dev/null
+  [ -n "$PID2" ] && kill "$PID2" 2>/dev/null
   chmod u+w "$WORK/nowrite" 2>/dev/null
   rm -rf "$WORK"
 }
@@ -112,6 +114,10 @@ start_server() {  # start_server <port> <jobs-dir> <logfile>
   PALWORLD_CONFIG_FILE="$WORK/cfg/PalWorldSettings.ini" \
   PALWORLD_ENGINE_ENV="$WORK/engine.env" \
   PALWORLD_BACKUP_DIR="$WORK/backups" \
+  PALWARDEN_OPS_FILE="$WORK/ops.env" \
+  PALWORLD_GROUP="$(id -gn)" \
+  PALWARDEN_LIFECYCLE_STATE_DIR="$WORK/lifecycle-state" \
+  PALWARDEN_LIFECYCLE_LOCK="$WORK/lifecycle.lock" \
     python3 "$WEBUI" --serve >"$3" 2>&1 &
   for _ in $(seq 1 40); do
     curl -s -o /dev/null "http://127.0.0.1:$1/" && return 0
@@ -855,5 +861,234 @@ assert_eq "$(post_json '{"action":"engine_save","params":{"settings":{"NET_SERVE
   "202" "the string-valued payload the page posts is accepted by the API"
 assert_eq "$(post_json '{"action":"engine_save_apply_restart","params":{"settings":{"NET_SERVER_MAX_TICK_RATE":"60"},"confirm":true}}')" \
   "409" "the disruptive payload the page posts validates (and serialises behind the pending restart)"
+
+# ===========================================================================
+# Task 8: /api/palwarden-config (GET/PUT), server_wake admission, and the
+# token lifecycle across the public API (spec §7.2, §7.3, §4.4).
+# A dedicated server on a fresh queue: wake admission must see a queue with
+# no leftovers from the tests above.
+# ===========================================================================
+PORT2=$((PORT + 1))
+JOBS2="$WORK/jobs-t8"
+LCS2="$WORK/lifecycle-state"
+start_server "$PORT2" "$JOBS2" "$WORK/server-t8.log"
+PID2=$!   # cleanup must reap this one too: a leaked server squats the port
+          # and every later run silently tests the stale process instead
+U2="http://127.0.0.1:$PORT2"
+
+WTOK="WEBUI-TOKEN-MARKER-9d41"
+ops_write() {  # ops_write '<json partial over the defaults>'
+  PYTHONPATH="$REPO/lib" PALWARDEN_OPS_FILE="$WORK/ops.env" \
+  PALWORLD_GROUP="$(id -gn)" python3 -c '
+import json, sys
+import palwarden_ops as ops
+cfg = dict(ops.DEFAULTS)
+cfg.update(json.loads(sys.argv[1]))
+ops.write_config(ops.OPS_FILE, cfg)' "$1"
+}
+lc2() { PALWARDEN_LIFECYCLE_STATE_DIR="$LCS2" PYTHONPATH="$REPO/lib" python3 -c "$1"; }
+get_cfg()  { body -u "$CREDS" "$U2/api/palwarden-config"; }
+put_code() { code -u "$CREDS" -H "$TOKHDR" -H 'Content-Type: application/json' \
+               -X PUT --data-binary "$1" "$U2/api/palwarden-config"; }
+put_body() { body -u "$CREDS" -H "$TOKHDR" -H 'Content-Type: application/json' \
+               -X PUT --data-binary "$1" "$U2/api/palwarden-config"; }
+wake_code() { code -u "$CREDS" -H "$TOKHDR" -H 'Content-Type: application/json' \
+               -X POST -d "{\"action\":\"server_wake\",\"params\":$1}" "$U2/api/jobs"; }
+wake_body() { body -u "$CREDS" -H "$TOKHDR" -H 'Content-Type: application/json' \
+               -X POST -d "{\"action\":\"server_wake\",\"params\":$1}" "$U2/api/jobs"; }
+job_raw()   { cat "$JOBS2/$1.json"; }
+
+# --- GET /api/palwarden-config ----------------------------------------------
+assert_eq "$(code "$U2/api/palwarden-config")" "401" "config GET needs the Basic session"
+rm -f "$WORK/ops.env"
+cfg="$(get_cfg)"
+assert_contains "$cfg" '"IDLE_TIMEOUT": 0' "GET yields the effective defaults (idle starts disabled)"
+assert_contains "$cfg" '"IDLE_CHECK_INTERVAL": 60' "...including the check interval"
+assert_contains "$cfg" '"token_configured": false' "no token stored reads as false"
+if grep -q "KNOCK_TOKEN" <<<"$cfg"; then fail "GET must not carry a KNOCK_TOKEN field at all"; else pass "GET carries no KNOCK_TOKEN field"; fi
+ops_write "{\"KNOCK_TOKEN\": \"$WTOK\"}"
+cfg="$(get_cfg)"
+assert_contains "$cfg" '"token_configured": true' "a stored token reads as true"
+if grep -q "$WTOK" <<<"$cfg"; then fail "GET leaked the stored token"; else pass "GET never carries the stored token"; fi
+if grep -q "redacted" <<<"$cfg"; then fail "config GET must not use a redaction sentinel"; else pass "no magic sentinel in the config view"; fi
+# a malformed file fails closed (500), not defaults-as-truth
+printf 'IDLE_TIMEOUT=30\n' > "$WORK/ops.env"
+assert_eq "$(code -u "$CREDS" "$U2/api/palwarden-config")" "500" "a malformed ops file answers 500, not defaults"
+
+# --- PUT /api/palwarden-config: the mutation gauntlet ------------------------
+assert_eq "$(code -u "$CREDS" -X PUT -H 'Content-Type: application/json' \
+  -d '{"IDLE_TIMEOUT":"30"}' "$U2/api/palwarden-config")" "403" "PUT needs the token header"
+assert_eq "$(code -u "$CREDS" -H "$TOKHDR" -H 'Sec-Fetch-Site: cross-site' -X PUT \
+  -H 'Content-Type: application/json' -d '{"IDLE_TIMEOUT":"30"}' "$U2/api/palwarden-config")" \
+  "403" "cross-origin PUT refused"
+assert_eq "$(code -X PUT "$U2/api/palwarden-config")" "401" "unauthenticated PUT is 401"
+assert_eq "$(put_code 'not json')" "400" "PUT refuses non-JSON"
+assert_eq "$(put_code '["IDLE_TIMEOUT"]')" "400" "PUT refuses a non-object body"
+assert_eq "$(put_code '{}')" "400" "PUT refuses an empty object (nothing to save)"
+assert_eq "$(put_code '{"NOPE":"1"}')" "400" "PUT refuses an unknown key"
+assert_eq "$(put_code '{"IDLE_TIMEOUT":"99999"}')" "400" "PUT refuses an out-of-range value"
+assert_eq "$(put_code '{"KNOCK_TOKEN":"'"$(python3 -c 'print("x"*513)')"'"}')" "400" "PUT refuses an oversized token"
+leak="$(put_body '{"KNOCK_TOKEN":"a\u0007'"$WTOK"'"}')"
+assert_eq "$(code -u "$CREDS" -H "$TOKHDR" -H 'Content-Type: application/json' -X PUT \
+  -d '{"KNOCK_TOKEN":"a\u0007'"$WTOK"'"}' "$U2/api/palwarden-config")" "400" "PUT refuses a control-character token"
+if grep -q "$WTOK" <<<"$leak"; then fail "the 400 error echoes the submitted token"; else pass "the 400 error never echoes the submitted token"; fi
+
+# --- PUT success: job handle back, token only in the private queue -----------
+enq="$(put_body '{"IDLE_TIMEOUT":"30"}')"
+assert_contains "$enq" '"id"' "PUT returns a job handle"
+CID="$(printf '%s' "$enq" | sed -n 's/.*"id": *"\([0-9a-f]*\)".*/\1/p')"
+assert_eq "$(python3 -c "
+import json, sys
+job = json.load(open(sys.argv[1]))
+print(job['action'], job['state'], job['params']['settings']['IDLE_TIMEOUT'])" \
+  "$JOBS2/$CID.json")" "palwarden_config_save queued 30" \
+  "the queued job carries the normalised partial"
+assert_eq "$(stat -c %a "$JOBS2/$CID.json")" "600" "the queued job file is 0600"
+enq="$(put_body "{\"KNOCK_TOKEN\": \"$WTOK\", \"IDLE_TIMEOUT\": \"45\"}")"
+CID2="$(printf '%s' "$enq" | sed -n 's/.*"id": *"\([0-9a-f]*\)".*/\1/p')"
+if grep -q "$WTOK" <<<"$enq"; then fail "the 202 response echoes the submitted token"; else pass "the 202 response carries only the job id"; fi
+if grep -q "$WTOK" "$JOBS2/$CID2.json"; then pass "the private queue keeps the token for the worker"; else fail "the queued job lost its token before the worker ran"; fi
+detail="$(body -u "$CREDS" "$U2/api/jobs/$CID2")"
+if grep -q "$WTOK" <<<"$detail"; then fail "job detail leaks the queued token"; else pass "job detail redacts the queued token"; fi
+assert_contains "$detail" '"KNOCK_TOKEN": "<redacted>"' "job detail shows the redaction marker"
+assert_contains "$detail" '"IDLE_TIMEOUT": "45"' "job detail keeps the non-secret fields"
+listing="$(body -u "$CREDS" "$U2/api/jobs")"
+if grep -q "$WTOK" <<<"$listing"; then fail "the job list leaks the queued token"; else pass "the job list redacts the queued token"; fi
+
+# --- server_wake admission ----------------------------------------------------
+assert_eq "$(wake_code '{"wake_generation":"'"$(python3 -c 'print("0"*32)')"'","wake_expires_at":4000000000}')" \
+  "400" "a caller-supplied wake_generation is refused"
+assert_eq "$(wake_code '{"wake_expires_at":4000000000}')" \
+  "400" "a caller-supplied wake_expires_at is refused"
+assert_eq "$(wake_code '{"reason":"'"$(python3 -c 'print("r"*201)')"'"}')" \
+  "400" "an over-long reason is refused"
+rm -rf "$LCS2"
+assert_eq "$(wake_code '{}')" "409" "no state file means unknown: wake not admitted"
+lc2 'import palwarden_lifecycle as lc; lc.ensure_state(); lc.write_state("active", "update", rotate=True, force=True)'
+assert_eq "$(wake_code '{}')" "409" "active maintenance: wake not admitted"
+lc2 'import palwarden_lifecycle as lc; lc.write_state("unsafe", "restore")'
+assert_eq "$(wake_code '{}')" "409" "an unsafe marker: wake not admitted"
+lc2 'import palwarden_lifecycle as lc; lc.write_state("idle", rotate=True, force=True)'
+GEN2="$(lc2 'import palwarden_lifecycle as lc; print(lc.read_state()["generation"])')"
+NOW2="$(date +%s)"
+assert_eq "$(wake_code '{"reason":"player at the gate"}')" "202" "an idle lifecycle admits the wake"
+wid="$(printf '%s' "$(wake_body '{"reason":"player at the gate"}')" | sed -n 's/.*"id": *"\([0-9a-f]*\)".*/\1/p')"
+out="$(python3 -c "
+import json, sys, time
+job = json.load(open(sys.argv[1]))
+p = job['params']
+now = int(sys.argv[3])
+gen_ok = p['wake_generation'] == sys.argv[2]
+exp = p['wake_expires_at']
+print('gen' if gen_ok else 'BADGEN',
+      'exp' if now + 12 <= exp <= now + 16 else 'BADEXP %d' % exp,
+      p.get('reason'))" "$JOBS2/$wid.json" "$GEN2" "$NOW2")"
+assert_eq "$out" "gen exp player at the gate" \
+  "the server mints the generation and a ~15s expiry itself"
+# a queued disruptive job fences admission (posted to THIS server's fresh
+# queue — the main server's queue carries leftovers from the tests above)
+assert_eq "$(code -u "$CREDS" -H "$TOKHDR" -H 'Content-Type: application/json' \
+  -d '{"action":"graceful_stop","params":{"confirm":true}}' "$U2/api/jobs")" "202" \
+  "a disruptive job queues behind nothing"
+assert_eq "$(wake_code '{}')" "409" "a queued disruptive job blocks wake admission"
+rm -f "$JOBS2"/*.json   # clear the blocker for anything below
+
+# --- exercise the real collectOpsSettings()/wakeParams() under node ----------
+# Task 9: the panel's payload builder decides what the PUT body carries —
+# only changed keys, typed values, and the token only when the operator
+# actually typed one. Extract the two pure functions from the dashboard and
+# run them against a stubbed form and baseline (same tier style as the
+# editor's collectSettings() checks above).
+if command -v node >/dev/null 2>&1; then
+  OPS_JS="$WORK/ops_panel.js"
+  {
+    awk '/^function collectOpsSettings\(form, baseline\)/{f=1} f{print} f && /^}/{exit}' "$REPO/webui/palwarden.html"
+    awk '/^function wakeParams\(reason\)/{f=1} f{print} f && /^}/{exit}' "$REPO/webui/palwarden.html"
+  } > "$OPS_JS"
+  cat >> "$OPS_JS" <<'EOF'
+
+let failures = 0;
+function check(desc, cond) { if (!cond) { failures++; console.log("FAIL: " + desc); } }
+
+const BASE = { IDLE_TIMEOUT: 0, IDLE_CHECK_INTERVAL: 60, KNOCK_ENABLED: true,
+               KNOCK_COOLDOWN: 600, token_configured: false };
+const FORM = { idleTimeout: "0", idleInterval: "60", knockEnabled: true,
+               cooldown: "600", token: "" };
+function form(over) { return Object.assign({}, FORM, over); }
+
+// unchanged form -> nothing to save
+let r = collectOpsSettings(form(), BASE);
+check("unchanged form yields no error", !r.error);
+check("unchanged form yields no keys", Object.keys(r.settings).length === 0);
+
+// one changed number -> exactly that key, typed as a number
+r = collectOpsSettings(form({ idleTimeout: "300" }), BASE);
+check("one changed key", JSON.stringify(r.settings) === '{"IDLE_TIMEOUT":300}');
+
+// whitespace survives typing but not the wire
+r = collectOpsSettings(form({ idleInterval: " 45 " }), BASE);
+check("whitespace trimmed to a number", JSON.stringify(r.settings) === '{"IDLE_CHECK_INTERVAL":45}');
+
+// a non-integer is an operator error, not a silent drop
+r = collectOpsSettings(form({ cooldown: "abc" }), BASE);
+check("non-integer reports an error", !!r.error && !r.settings);
+
+// the toggle sends a JSON boolean
+r = collectOpsSettings(form({ knockEnabled: false }), BASE);
+check("knock toggle is a boolean", r.settings.KNOCK_ENABLED === false);
+
+// token: blank means keep — the placeholder is an attribute, never a value
+r = collectOpsSettings(form({ token: "" }), BASE);
+check("blank token is omitted", !("KNOCK_TOKEN" in r.settings));
+
+// typed token rides alone when nothing else changed
+r = collectOpsSettings(form({ token: "s3cr3t" }), BASE);
+check("typed token is sent verbatim", r.settings.KNOCK_TOKEN === "s3cr3t");
+check("typed token rides alone", Object.keys(r.settings).length === 1);
+
+// mixed edit: numbers + toggle + token together
+r = collectOpsSettings(form({ idleTimeout: "120", knockEnabled: false, token: "t0" }), BASE);
+check("mixed edit carries three keys",
+      Object.keys(r.settings).sort().join(",") === "IDLE_TIMEOUT,KNOCK_ENABLED,KNOCK_TOKEN");
+
+// a blank field must never serialise as an empty-string clear (the clear is
+// its own button, never a side effect of Save)
+check("blank never serialises as empty-string clear",
+      !("KNOCK_TOKEN" in collectOpsSettings(form(), BASE).settings));
+
+// wake params: blank/whitespace reason is omitted entirely (the worker
+// refuses an empty reason), text is trimmed, and no fence field appears
+check("blank reason omitted", JSON.stringify(wakeParams("")) === "{}");
+check("whitespace reason omitted", JSON.stringify(wakeParams("   ")) === "{}");
+check("reason trimmed",
+      JSON.stringify(wakeParams("  player at the gate ")) === '{"reason":"player at the gate"}');
+check("wake params never carry fence fields",
+      !("wake_generation" in wakeParams("x")) && !("wake_expires_at" in wakeParams("x")));
+
+console.log(failures === 0 ? "OK" : "FAIL");
+EOF
+  ops_out="$(node "$OPS_JS" 2>&1)"
+  assert_eq "$ops_out" "OK" "collectOpsSettings()/wakeParams() extracted from the dashboard build acceptable payloads"
+elif [ -n "${CI:-}" ]; then
+  fail "node is required in CI to execute the dashboard's ops-panel builders"
+else
+  echo "  (skipping the node checks of the ops panel: node not found)" >&2
+fi
+
+# The panel must never preload or echo the secret: the token field is a
+# password input with no value attribute, and the page never names the
+# server-minted fence fields (a caller that supplies them is refused 400).
+DASH="$REPO/webui/palwarden.html"
+assert_file_contains "$DASH" 'type="password"' "the token field is a password input"
+if grep -q 'ops-knock-token[^>]*value=' "$DASH"; then
+  fail "the token input carries a value attribute (secret preloaded)"
+else
+  pass "the token input carries no value attribute"
+fi
+if grep -q 'wake_generation\|wake_expires_at' "$DASH"; then
+  fail "the dashboard names the server-minted wake fence fields"
+else
+  pass "the dashboard never names the wake fence fields"
+fi
 
 assert_report

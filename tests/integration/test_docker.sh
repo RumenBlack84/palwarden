@@ -54,6 +54,21 @@ assert_contains "$svcA" "config-webui" "A: webui enabled"
 assert_contains "$svcA" "memory-watch" "A: watchdog enabled"
 assert_not_contains "$svcA" "fps-sample" "A: no telemetry without password"
 assert_not_contains "$svcA" "daily-report" "A: no report without webhook"
+# Task 10 wiring: both idle/knock helpers are ALWAYS supervised in embedded
+# mode (enablement is the ops file's business, decided per tick/lease inside
+# each helper — not an entrypoint service gate).
+assert_contains "$svcA" "palworld-knock" "A: knock listener supervised (embedded)"
+assert_contains "$svcA" "idle-watch" "A: idle watcher supervised (embedded)"
+# Fresh volume + no seeds -> the complete default ops file exists, root:steam
+# 0640 inside the root:steam 0750 ops directory (spec §7.1).
+assert_rc 0 docker exec pw-it-a grep -qF 'IDLE_TIMEOUT="0"' /var/lib/palwarden-ops/palwarden.env
+assert_rc 0 docker exec pw-it-a grep -qF 'KNOCK_ENABLED="true"' /var/lib/palwarden-ops/palwarden.env
+assert_eq "$(docker exec pw-it-a stat -c '%U:%G:%a' /var/lib/palwarden-ops/palwarden.env)" \
+    "root:steam:640" "A: ops file root:steam 0640"
+assert_eq "$(docker exec pw-it-a stat -c '%U:%G:%a' /var/lib/palwarden-ops)" \
+    "root:steam:750" "A: ops dir root:steam 0750"
+# Root-first lifecycle state exists before any steam process could need it.
+assert_rc 0 docker exec pw-it-a sh -c 'test -f /var/lib/palwarden-ops/lifecycle/state.json'
 
 # systemctl shim reports the server active
 assert_eq "$(docker exec pw-it-a systemctl is-active palworld.service)" "active" "A: shim is-active"
@@ -93,6 +108,10 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
 done
 assert_contains "$svcC" "fps-sample" "C: telemetry enabled"
 assert_not_contains "$svcC" "palworld-server" "C: no server in external mode"
+# Task 10: external mode starts NEITHER idle/knock helper (no local s6
+# service to stop or wake).
+assert_not_contains "$svcC" "palworld-knock" "C: no knock listener in external mode"
+assert_not_contains "$svcC" "idle-watch" "C: no idle watcher in external mode"
 docker exec pw-it-c sh -c 'sleep 6'
 okrows="$(docker exec pw-it-c python3 -c "import sqlite3;print(sqlite3.connect('/var/lib/palworld/metrics.sqlite3').execute('select count(*) from fps_samples where ok=1').fetchone()[0])" 2>/dev/null)"
 if [ "${okrows:-0}" -gt 0 ]; then pass; else fail "C: expected ok telemetry rows from stub, got '${okrows:-0}'"; fi
