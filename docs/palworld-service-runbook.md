@@ -1165,6 +1165,135 @@ it holds the saved config, the cooldown, and the lifecycle state, and deleting
 it resets all three (settings return to the `.env` seeds on the next start).
 Reverting the image, if needed, is separate from any of this.
 
+## 18. Migrating a bare-metal server to the container (cutover procedure)
+
+The bare-metal deployment is deprecated (frozen at the v0.2.0 feature
+set; removed in v0.3.0). This is the procedure proven on 2026-11-03
+against the maintainer's server; the spec behind it is
+`docs/superpowers/specs/2026-11-03-docker-only-migration.md`. Rehearse
+first with a *copy* of the save on a disposable host (§16 testbed) —
+only then cut over.
+
+### 18.1 Preflight (read-only)
+
+- Docker + Compose v2 on the target host (the same host is the usual
+  case; the game port and public IP live there). Ubuntu 24.04:
+  `apt-get install -y docker.io docker-compose-v2 && systemctl enable
+  --now docker`.
+- Disk: game install (~5 GB) is copied into a volume, so budget ~6 GB
+  beyond current usage. Memory: unchanged from bare metal.
+- Record the game version from
+  `steamapps/appmanifest_2394010.acf` (`buildid`). Do **not** probe
+  with `PalServer.sh --version` — it *starts a second server*.
+- Note the service account's uid (`id palworld`). Container-side files
+  must be owned by uid 1000 (the image's `steam`); a different uid
+  means a remap at seed time (18.4).
+- Check nothing else holds 8088/8211/8212 once the old units are down.
+
+### 18.2 Stop gracefully and take insurance copies
+
+1. `systemctl stop palworld.service` — SIGINT makes the server save;
+   confirm `Deactivated successfully` in the journal and no leftover
+   `PalServer` processes. An unchanged `Level.sav` mtime is normal:
+   the game skips rewriting when nothing changed since the last
+   autosave.
+2. Insurance copy, kept in two places:
+   `tar cf /root/palwarden-cutover/saved-pre-cutover.tar -C
+   /opt/palworld/server/Pal Saved` plus an off-host copy
+   (`ssh host sudo cat … > local`; `/root` needs sudo on both ends).
+   Record the sha256.
+3. Pull the released image and present it under the tag compose
+   expects: `docker pull ghcr.io/<owner>/palwarden:0.2.0 && docker tag
+   … palwarden:latest`.
+
+### 18.3 Deployment directory and .env
+
+Create `/opt/palwarden/docker/` with the repo's `docker/compose.yaml`
+and a `0600 .env` carrying at least: `ADMIN_PASSWORD` (game REST;
+migrate from `/etc/palworld/settings.env`), `DISCORD_WEBHOOK` (from
+`/etc/palworld/notify.env`'s `PALWORLD_DISCORD_WEBHOOK`),
+`WEBUI_USER`/`WEBUI_PASSWORD` (see the credential caveat in 18.6), a
+generated `KNOCK_TOKEN` (empty token = open doorbell; never ship one
+on a routable host), `IDLE_TIMEOUT=0` (keep idle off across the
+upgrade — §17), `UPDATE_ON_START=false` when the install is seeded
+locally, and `COMPOSE_PROFILES=embedded` **in the file** (a shell
+`VAR=x sudo docker compose` loses the variable to sudo).
+
+### 18.4 Disarm the old stack and seed the volumes
+
+1. `systemctl stop` then `disable` every `palworld*`/`palwarden*`
+   unit (server, webui, jobd, all timers). Files stay on disk as the
+   rollback; verify `systemctl list-unit-files --state=enabled | grep
+   -c pal` is 0 and no timers remain armed.
+2. Create the seven volumes (`palwarden_<name>`) and seed each with a
+   tar pipe, remapping ownership to 1000 where the image seeds steam
+   ownership:
+
+   ```
+   sudo tar cf - -C <src> . | sudo docker run --rm -i \
+     -v palwarden_<vol>:/dst alpine \
+     sh -c 'tar xf - -C /dst && chown -R 1000:1000 /dst'
+   ```
+
+   | Source | Volume | Owner |
+   |---|---|---|
+   | `/opt/palworld/server` | `palworld-server` | 1000 |
+   | `/opt/palworld/server/Pal/Saved` | `palworld-saved` | 1000 |
+   | `/var/lib/palworld` | `palwarden-state` | 1000 |
+   | `/opt/palworld/config-backups` | `palwarden-config-backups` | 1000 |
+   | `/opt/palworld/backups` | `palwarden-backups` | root |
+   | `/opt/palworld/config-snapshots` | `palwarden-config-snapshots` | root |
+   | — (fresh) | `palwarden-ops` | — |
+
+3. `/etc/palworld/backup.env` → `backup.env` at the root of the
+   `palwarden-state` volume (compose pins `PALWORLD_BACKUP_SCHEDULE`
+   there). Do **not** copy lifecycle state or the knock cooldown —
+   the container must start from a fresh lifecycle state (§17).
+4. Secrets are never copied as files: `webui.env`/`notify.env`/
+   `settings.env` contents live in `.env` (18.3) instead.
+
+### 18.5 Bring up and verify
+
+`cd /opt/palwarden/docker && docker compose up -d`, then:
+
+- REST `palworld-api info` reports the migrated `worldguid` and your
+  servername (the ini travels with the save; the container's env
+  applies on top).
+- `ss` shows UDP 8211 published and 8088 bound as configured.
+- Telemetry logs `sampled ok`; the Backups page lists the migrated
+  archives (the first tick may immediately create one if the newest
+  migrated archive is older than the interval — that is the schedule
+  working, not a bug).
+- Boot-log noise to expect: REST `Connection refused` until the game
+  answers, and `[S_API FAIL]` Steam-interface warnings; both are
+  startup-order artifacts.
+- Join with a real client before trusting the cutover.
+
+### 18.6 Post-cutover
+
+- **Restart policy**: the shipped `restart: on-failure` covers crashes
+  but does *not* start the container after a VM reboot. Add a
+  deployment-local `compose.override.yaml` with
+  `restart: unless-stopped` and `up -d` again (~20 s save-on-stop).
+- **WebUI credentials**: `webui.env` is seeded at container *creation*
+  from `WEBUI_PASSWORD` (random when unset) and lives in the writable
+  layer — every recreate rotates it unless you pin it in `.env`
+  (18.3). It is a separate credential from `ADMIN_PASSWORD`.
+- **Routable WebUI bind**: publishing 8088 beyond loopback is an
+  operator opt-in via a `ports: !override` list (a plain override
+  *appends* a second mapping rather than replacing the loopback one).
+  Browser mutations are then refused by the loopback-only origin guard
+  unless `PALWARDEN_WEBUI_ORIGIN_HOSTS` lists the address operators
+  use — see issue #19. Plain HTTP + one password on a public address
+  is its own risk; prefer a tunnel or TLS proxy.
+- **Rollback**: re-enable the systemd units — the untouched bare-metal
+  save comes back. Once the container has booted the save on a newer
+  game version, rollback needs the pre-cutover tar instead. Keep both
+  the disabled units and the tar for at least a week.
+- **Then**: enable idle shutdown from the panel after ≥1 week of
+  healthy telemetry (§17), and treat the bare-metal tree as a frozen
+  snapshot, never a second source of truth.
+
 ## Short version
 
 The core service is simply:
