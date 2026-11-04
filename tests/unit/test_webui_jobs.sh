@@ -206,6 +206,28 @@ assert_eq "$(code -u "$CREDS" -H "$TOKHDR" -H "Origin: http://rebind.example:$PO
 assert_eq "$(code -u "$CREDS" -H "$TOKHDR" -H 'Origin: null' -X POST \
   -H 'Content-Type: application/json' -d '{"action":"backup"}' "$U/api/jobs")" "403" \
   "opaque (null) Origin refused"
+# --- issue #19: the refusal must be actionable, not token-shaped -----------
+# A routable bind: the page's own Origin equals the Host it was served from,
+# so the refusal is the loopback-only *policy*. It stays a 403 (fail-closed;
+# access needs the PALWARDEN_WEBUI_ORIGIN_HOSTS opt-in), but the detail names
+# the knob — the operator must not be left reading it as a token bug.
+routable_body="$(body -u "$CREDS" -H "$TOKHDR" -H 'Origin: http://10.0.0.5:8088' \
+  -H 'Host: 10.0.0.5:8088' -X POST -H 'Content-Type: application/json' \
+  -d '{"action":"backup"}' "$U/api/jobs")"
+assert_contains "$routable_body" "PALWARDEN_WEBUI_ORIGIN_HOSTS" \
+  "a same-origin (Origin == Host) refusal names the opt-in knob"
+assert_contains "$routable_body" "same origin the page was served from" \
+  "...and says the refusal is the origin policy, not the token"
+# A DNS-rebinding match also gets the hint (the request stays refused; the
+# hint reveals only a documented env-var name) — the status assertions above
+# pin the refusal; this pins that the hint never turns into an acceptance.
+# A genuinely foreign Origin must NOT advertise the knob (nothing to opt into
+# from the attacker's page; the message stays the plain named refusal).
+foreign_body="$(body -u "$CREDS" -H "$TOKHDR" -H 'Origin: http://evil.example' \
+  -X POST -H 'Content-Type: application/json' -d '{"action":"backup"}' "$U/api/jobs")"
+assert_contains "$foreign_body" "evil.example" "a foreign-Origin refusal names the Origin"
+assert_not_contains "$foreign_body" "PALWARDEN_WEBUI_ORIGIN_HOSTS" \
+  "a foreign-Origin refusal does not name the knob"
 # a loopback Origin on any port is fine: an SSH tunnel remaps the port, so
 # pinning it would break the documented access path.
 assert_eq "$(code -u "$CREDS" -H "$TOKHDR" \

@@ -408,6 +408,33 @@ def origin_ok(headers) -> bool:
     return origin_host_allowed(origin)
 
 
+def origin_is_request_host(headers) -> bool:
+    """Does the refused Origin name the very host the page was served from?
+
+    True when the Origin's host equals the request's Host header host (port
+    ignored — the Origin of a page always carries its own host, so a match
+    means the browser loaded the panel from the address it is posting to).
+    This is a *diagnostic* comparison only, never an authorization one: under
+    DNS rebinding the attacker's name matches its own Host, which is exactly
+    why mutations stay fail-closed here (the rebinding case is pinned by
+    tests/unit/test_webui_jobs.sh) and access needs the explicit
+    PALWARDEN_WEBUI_ORIGIN_HOSTS opt-in. What the match buys is a truthful 403:
+    a same-origin page refused by the loopback-only policy must be told about
+    the knob, not left reading the refusal as a token bug (issue #19).
+    """
+    origin = (headers.get("Origin") or "").strip()
+    host = (headers.get("Host") or "").strip()
+    if not origin or not host:
+        return False
+    try:
+        origin_host = urllib.parse.urlsplit(origin).hostname
+        host_host = urllib.parse.urlsplit("//" + host).hostname
+    except ValueError:
+        return False
+    return bool(origin_host and host_host
+                and origin_host.lower() == host_host.lower())
+
+
 _JOBD_MODULE = None
 
 
@@ -948,6 +975,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.close_connection = True
         self._send_json(status, {"ok": False, "error": error, **extra})
 
+    def _origin_refusal(self) -> None:
+        """403 for a failed origin_ok, with a detail an operator can act on.
+
+        Always names the refused Origin (a bare "refused" gives nothing to
+        correct). When that Origin is the very host the page was served from —
+        a routable bind, the issue #19 case — the refusal is the loopback-only
+        *policy*, not a token bug, so the message says so and names the
+        opt-in knob. The hint is safe to show on a DNS-rebinding match too:
+        the request stays refused, and the only thing revealed is the name of
+        an environment variable the docs already publish.
+        """
+        origin = (self.headers.get("Origin") or "").strip()
+        detail = f" (Origin {origin!r})" if origin else ""
+        if origin and origin_is_request_host(self.headers):
+            detail += (" — this is the same origin the page was served from; "
+                       "the origin guard accepts only loopback hosts unless "
+                       "PALWARDEN_WEBUI_ORIGIN_HOSTS lists this host "
+                       "(see docs/tools.md, palwarden-webui)")
+        self._reject(403, f"cross-origin request refused{detail}")
+
     def _send_token(self) -> None:
         """GET /api/token: hand the mutation token to our own authenticated page.
 
@@ -987,10 +1034,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not origin_ok(self.headers):
             # Named, like the mutation path's refusal, so an operator who bound
             # to a routable address can see why their page cannot save.
-            origin = (self.headers.get("Origin") or "").strip()
-            detail = f" (Origin {origin!r})" if origin else ""
-            self._send_json(403, {"ok": False,
-                                  "error": f"cross-origin request refused{detail}"})
+            self._origin_refusal()
             return
         # Wrapped in "data" like every other read endpoint, so one client helper
         # can unwrap them all rather than special-casing this one.
@@ -1047,9 +1091,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not origin_ok(self.headers):
             # Named, like the enqueue path's refusal, so an operator who bound to a
             # routable address can see why their page cannot upload.
-            origin = (self.headers.get("Origin") or "").strip()
-            detail = f" (Origin {origin!r})" if origin else ""
-            self._reject(403, f"cross-origin request refused{detail}")
+            self._origin_refusal()
             return
         names = self.headers.get_all(UPLOAD_HEADER) or []
         if len(names) != 1:
@@ -1317,12 +1359,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._reject(403, f"missing or invalid {TOKEN_HEADER} header")
             return
         if not origin_ok(self.headers):
-            # Name the Origin we refused: with a non-loopback bind (unsupported,
-            # but people try it) every mutation fails here, and a bare "refused"
-            # gives the operator nothing to correct.
-            origin = (self.headers.get("Origin") or "").strip()
-            detail = f" (Origin {origin!r})" if origin else ""
-            self._reject(403, f"cross-origin request refused{detail}")
+            # Name the Origin we refused: with a non-loopback bind (unsupported
+            # without PALWARDEN_WEBUI_ORIGIN_HOSTS) every mutation fails here,
+            # and a bare "refused" gives the operator nothing to correct.
+            self._origin_refusal()
             return
         if self.jobs_dir_error:
             self._reject(500, self.jobs_dir_error)
@@ -1588,7 +1628,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._reject(403, f"missing or invalid {TOKEN_HEADER} header")
             return
         if not origin_ok(self.headers):
-            self._reject(403, "cross-origin request refused")
+            self._origin_refusal()
             return
         if self.jobs_dir_error:
             self._reject(500, self.jobs_dir_error)
