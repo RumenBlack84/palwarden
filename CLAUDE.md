@@ -152,7 +152,8 @@ via env (as the existing scripts do). Fixtures live in `tests/fixtures/`.
 
 ## Commits
 
-SPDX headers on new scripts; clear messages; end with
-`Co-Authored-By: <the model that wrote the change> <noreply@anthropic.com>`
-(e.g. `Claude Fable 5`). Branch before
+SPDX headers on new scripts; clear messages. Do **not** add `Co-Authored-By`
+trailers (or any "generated with …" line): commit messages do not name the
+model or tool that produced the change. Note some agent tools add a Claude
+co-author line by default — strip it before committing. Branch before
 committing if on the default branch. Commit/push only when asked.
