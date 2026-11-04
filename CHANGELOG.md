@@ -10,7 +10,7 @@ workflow refuses to build a tag whose section is missing. GitHub's
 auto-generated per-release notes (PR list) are produced separately by the
 release pipeline; this file is the curated, in-repo history.
 
-## [Unreleased]
+## [0.2.1] - 2026-11-03
 
 ### Fixed
 - WebUI cross-origin 403s are now actionable (issue #19). When a panel loaded
