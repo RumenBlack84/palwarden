@@ -690,7 +690,10 @@ Three usual causes, in order of likelihood:
 ```text
 missing or invalid X-Palwarden-Token   -> WEBUI_TOKEN changed under a stale tab; click
                                           again (the page re-fetches) or reload
-cross-origin request refused           -> the UI was reached on a non-loopback address
+cross-origin request refused           -> the UI was reached on a non-loopback address;
+                                          if the named Origin is the address in your
+                                          URL bar, set PALWARDEN_WEBUI_ORIGIN_HOSTS to
+                                          it (see tools.md, palwarden-webui) and restart
 job queue directory ... not writable   -> /var/lib/palworld/jobs is not owned by the
                                           web UI's service account (it must be, 0700)
 ```
@@ -698,7 +701,8 @@ job queue directory ... not writable   -> /var/lib/palworld/jobs is not owned by
 A `403` from `GET /api/token` itself is always the second of these: the endpoint
 refuses any request whose `Sec-Fetch-Site` is not `same-origin` or whose `Origin`
 is not loopback, because that response carries the token. Reach the UI through the
-SSH tunnel (`http://127.0.0.1:<port>/`), not a routable address or hostname.
+SSH tunnel (`http://127.0.0.1:<port>/`), not a routable address or hostname — or
+publish deliberately and list the address in `PALWARDEN_WEBUI_ORIGIN_HOSTS`.
 
 The queue directory being owned by the service account rather than root is
 deliberate: the unprivileged server is the process that writes job files. The

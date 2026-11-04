@@ -714,7 +714,13 @@ async function opsMutate(method, path, body) {
   if (b) msg += " [blocked by " + b.action + " " + b.id + " (" + b.state + ")]";
   if (res.status === 403) {
     sessionStorage.removeItem(TOKEN_KEY);
-    msg += " — the API token was refused; it has been discarded, so retrying re-fetches it";
+    // Only blame the token when the server actually refused the token. An
+    // origin-policy 403 (issue #19) must not send the operator chasing token
+    // rotation; the server's own sentence already names the cause. Dropping
+    // the cached token stays right in both cases (stale token / harmless).
+    msg += (msg.indexOf("X-Palwarden-Token") !== -1)
+      ? " — the API token was refused; it has been discarded, so retrying re-fetches it"
+      : " — the request was refused; the cached API token has been discarded, so retrying re-fetches it";
   }
   throw new Error(msg);
 }

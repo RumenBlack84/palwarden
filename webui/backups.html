@@ -612,7 +612,11 @@ async function postJob(action, params){
     // Either the cached token is stale or the request was cross-origin. Dropping
     // the cache is right in the first case and harmless in the second.
     sessionStorage.removeItem(TOKEN_KEY);
-    msg += ' — the API token was refused; it has been discarded, so retrying re-fetches it';
+    // Only blame the token when the server actually refused the token; an
+    // origin-policy 403 (issue #19) names its own cause.
+    msg += (msg.indexOf('X-Palwarden-Token') !== -1)
+      ? ' — the API token was refused; it has been discarded, so retrying re-fetches it'
+      : ' — the request was refused; the cached API token has been discarded, so retrying re-fetches it';
   }
   throw new Error(msg);
 }
@@ -841,7 +845,11 @@ async function stageUpload(file){
     if(res.status!==202 || !json || json.ok===false){
       let msg=(json && json.error) ? json.error : ('upload: HTTP '+res.status);
       if(res.status===403){
-        msg += ' — the API token was refused; it has been discarded, so retrying re-fetches it';
+        // Only blame the token when the server actually refused the token; an
+        // origin-policy 403 (issue #19) names its own cause.
+        msg += (msg.indexOf('X-Palwarden-Token') !== -1)
+          ? ' — the API token was refused; it has been discarded, so retrying re-fetches it'
+          : ' — the request was refused; the cached API token has been discarded, so retrying re-fetches it';
       }
       throw new Error(msg);
     }

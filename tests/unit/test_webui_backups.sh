@@ -1430,7 +1430,8 @@ function reset(r) { logs.length = 0; toasts.length = 0; busy = []; seen = null; 
   res = await stageUpload(FILE);
   check("a 403 upload fails", res.ok === false);
   check("a 403 discards the cached token", !("palwarden-token" in store));
-  check("a 403 says the token was discarded", /discarded/.test(res.error));
+  check("an origin 403 reports the refusal without blaming the token",
+        /discarded/.test(res.error) && !/token was refused/.test(res.error));
 
   // a body that is not JSON at all must not throw past the caller
   reset(() => ({ status: 502, ok: false, json: async () => { throw new Error("not json"); } }));
@@ -1681,7 +1682,13 @@ function freed(where) {
   check("a 403 POST reports not-ok", res.ok === false);
   check("a 403 POST never polls", statusCalls === 0);
   check("a 403 discards the cached token", !("palwarden-token" in store));
-  check("a 403 says the token was discarded", /discarded/.test(res.error));
+  check("an origin 403 reports the refusal without blaming the token",
+        /discarded/.test(res.error) && !/token was refused/.test(res.error));
+  // a token refusal keeps the token-specific sentence (issue #19: the two
+  // 403 causes must not read the same)
+  reset(() => json(403, { ok: false, error: "missing or invalid X-Palwarden-Token header" }), ended("succeeded"));
+  res = await runJob("backup_delete", { backup: "a", confirm: true });
+  check("a token 403 still blames the token", /token was refused/.test(res.error));
   freed("403 POST");
 
   // 4. a POST body that is not JSON at all

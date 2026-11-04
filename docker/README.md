@@ -177,6 +177,16 @@ The config web UI is published to `127.0.0.1:8088` and **requires Basic auth on 
 docker compose exec palwarden cat /etc/palworld/webui.env
 ```
 
+**Publishing beyond loopback** (a `ports: !override` mapping to a routable
+address) is an operator opt-in, but the mutation origin guard is loopback-only
+by default: reads keep working while every save/button returns `403 cross-origin
+request refused`. Set `PALWARDEN_WEBUI_ORIGIN_HOSTS` in `.env` to a
+comma-separated list of the exact hostnames/IPs operators type in the URL (the
+same value as the browser's Origin host; ports and case are ignored) and
+recreate the container. The 403 detail names this knob when the refused Origin
+is the address the page was served from. Prefer a tunnel or a TLS proxy where
+possible — plain HTTP + one password on a public address is its own risk.
+
 There are two secrets in that file. `WEBUI_PASSWORD` gets you the page;
 `WEBUI_TOKEN` is the second factor every *mutating* request must send in the
 `X-Palwarden-Token` header (the editor's Save buttons prompt for it once per

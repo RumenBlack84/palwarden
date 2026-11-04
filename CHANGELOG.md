@@ -10,6 +10,17 @@ workflow refuses to build a tag whose section is missing. GitHub's
 auto-generated per-release notes (PR list) are produced separately by the
 release pipeline; this file is the curated, in-repo history.
 
+## [Unreleased]
+
+### Fixed
+- WebUI cross-origin 403s are now actionable (issue #19). When a panel loaded
+  from a routable bind is refused by the loopback-only origin guard, the 403
+  detail says the request *is* same-origin and names the
+  `PALWARDEN_WEBUI_ORIGIN_HOSTS` opt-in instead of reading like a token bug;
+  the pages' own 403 note only blames the API token when the server actually
+  refused the token. The guard itself is unchanged (fail-closed; DNS-rebinding
+  refusals pinned). Documented in docker/README and runbook §14.
+
 ## [0.2.0] - 2026-11-02
 
 ### Added
